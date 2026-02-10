@@ -1,4 +1,4 @@
-# aagent
+# aa (aagent)
 
 A Go-based autonomous AI coding agent that executes tasks in sessions.
 
@@ -8,36 +8,43 @@ A Go-based autonomous AI coding agent that executes tasks in sessions.
 - **Agentic Loop**: Receive task → call LLM with tools → execute tool calls → return results → repeat until complete
 - **Session Persistence**: SQLite-based session storage with resumption support
 - **Tool System**: Modular, extensible tools (bash, read, write, edit, glob, grep)
-- **Kimi K2.5**: Uses Kimi K2.5 by Moonshot AI as the LLM backend
+- **Kimi Code**: Uses Kimi Code API (Anthropic-compatible) as the LLM backend
 - **Live Metrics**: Token usage tracking and context window percentage display
+- **File Logging**: All operations logged to file for debugging
 
 ## Installation
 
 ```bash
 # Build from source
-make build
+just build
 
 # Or install to GOPATH/bin
-make install
+just install
 ```
 
 ## Usage
 
 ```bash
-# Set your API key
-export KIMI_API_KEY=sk-...
+# Set your API key (or add to .env file)
+export KIMI_API_KEY=sk-kimi-...
 
 # Launch TUI (interactive mode)
-./aagent
+aa
 
 # Run with an initial task
-./aagent "Create a hello world Go program"
+aa "Create a hello world Go program"
 
 # Resume a previous session
-./aagent --continue <session-id>
+aa --continue <session-id>
 
 # List sessions
-./aagent session list
+aa session list
+
+# View logs
+aa logs
+
+# Follow logs in real-time
+aa logs -f
 ```
 
 ## TUI Interface
@@ -60,9 +67,16 @@ Configuration is loaded from:
 1. `.aagent/config.json` (project-level)
 2. `~/.config/aagent/config.json` (user-level)
 
+Environment variables are loaded from `.env` files in:
+- Current directory
+- Home directory
+- `~/git/mind/.env`
+
 Environment variables:
-- `KIMI_API_KEY` - Kimi API key (required)
-- `AAGENT_MODEL` - Override default model
+- `KIMI_API_KEY` - Kimi Code API key (required)
+- `ANTHROPIC_API_KEY` - Alternative to KIMI_API_KEY
+- `ANTHROPIC_BASE_URL` - Override API endpoint (default: `https://api.kimi.com/coding/v1`)
+- `AAGENT_MODEL` - Override default model (default: `kimi-for-coding`)
 - `AAGENT_DATA_PATH` - Data storage directory
 
 ## Tools
@@ -85,30 +99,41 @@ aagent/
 │   ├── agent/          # Agent orchestrator and loop
 │   ├── config/         # Configuration management
 │   ├── llm/            # LLM client interfaces
-│   │   └── kimi/       # Kimi K2.5 implementation
+│   │   ├── anthropic/  # Anthropic/Kimi Code implementation
+│   │   └── kimi/       # Kimi K2.5 (OpenAI-compatible, legacy)
+│   ├── logging/        # File-based logging
 │   ├── session/        # Session management
 │   ├── storage/        # SQLite persistence
 │   ├── tools/          # Tool implementations
 │   └── tui/            # Terminal user interface (Bubble Tea)
 ├── go.mod
-├── Makefile
+├── justfile
 └── README.md
 ```
 
 ## Development
 
 ```bash
+# Run directly (faster for development)
+just run
+
 # Build
-make build
+just build
 
 # Run tests
-make test
+just test
 
 # Format code
-make fmt
+just fmt
 
 # Lint
-make lint
+just lint
+
+# View logs
+just logs
+
+# Follow logs
+just logs-follow
 ```
 
 ## License
