@@ -1,0 +1,186 @@
+package session
+
+import (
+	"encoding/json"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/gratheon/aagent/internal/storage"
+)
+
+// Status represents the session status
+type Status string
+
+const (
+	StatusRunning   Status = "running"
+	StatusPaused    Status = "paused"
+	StatusCompleted Status = "completed"
+	StatusFailed    Status = "failed"
+)
+
+// Session represents an agent session
+type Session struct {
+	ID        string                 `json:"id"`
+	AgentID   string                 `json:"agent_id"`
+	ParentID  *string                `json:"parent_id,omitempty"`
+	Status    Status                 `json:"status"`
+	Messages  []Message              `json:"messages"`
+	Metadata  map[string]interface{} `json:"metadata,omitempty"`
+	CreatedAt time.Time              `json:"created_at"`
+	UpdatedAt time.Time              `json:"updated_at"`
+}
+
+// Message represents a conversation message
+type Message struct {
+	ID          string       `json:"id"`
+	Role        string       `json:"role"` // "user", "assistant", "tool"
+	Content     string       `json:"content"`
+	ToolCalls   []ToolCall   `json:"tool_calls,omitempty"`
+	ToolResults []ToolResult `json:"tool_results,omitempty"`
+	Timestamp   time.Time    `json:"timestamp"`
+}
+
+// ToolCall represents a tool invocation request
+type ToolCall struct {
+	ID    string          `json:"id"`
+	Name  string          `json:"name"`
+	Input json.RawMessage `json:"input"`
+}
+
+// ToolResult represents the result of a tool execution
+type ToolResult struct {
+	ToolCallID string `json:"tool_call_id"`
+	Content    string `json:"content"`
+	IsError    bool   `json:"is_error,omitempty"`
+}
+
+// New creates a new session
+func New(agentID string) *Session {
+	now := time.Now()
+	return &Session{
+		ID:        uuid.New().String(),
+		AgentID:   agentID,
+		Status:    StatusRunning,
+		Messages:  make([]Message, 0),
+		Metadata:  make(map[string]interface{}),
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+}
+
+// NewWithParent creates a new sub-session with a parent
+func NewWithParent(agentID string, parentID string) *Session {
+	sess := New(agentID)
+	sess.ParentID = &parentID
+	return sess
+}
+
+// AddMessage adds a message to the session
+func (s *Session) AddMessage(msg Message) {
+	if msg.ID == "" {
+		msg.ID = uuid.New().String()
+	}
+	if msg.Timestamp.IsZero() {
+		msg.Timestamp = time.Now()
+	}
+	s.Messages = append(s.Messages, msg)
+	s.UpdatedAt = time.Now()
+}
+
+// AddUserMessage adds a user message
+func (s *Session) AddUserMessage(content string) {
+	s.AddMessage(Message{
+		Role:    "user",
+		Content: content,
+	})
+}
+
+// AddAssistantMessage adds an assistant message
+func (s *Session) AddAssistantMessage(content string, toolCalls []ToolCall) {
+	s.AddMessage(Message{
+		Role:      "assistant",
+		Content:   content,
+		ToolCalls: toolCalls,
+	})
+}
+
+// AddToolResult adds tool results
+func (s *Session) AddToolResult(results []ToolResult) {
+	s.AddMessage(Message{
+		Role:        "tool",
+		ToolResults: results,
+	})
+}
+
+// GetLastMessage returns the last message
+func (s *Session) GetLastMessage() *Message {
+	if len(s.Messages) == 0 {
+		return nil
+	}
+	return &s.Messages[len(s.Messages)-1]
+}
+
+// SetStatus updates the session status
+func (s *Session) SetStatus(status Status) {
+	s.Status = status
+	s.UpdatedAt = time.Now()
+}
+
+// ToStorage converts to storage format
+func (s *Session) ToStorage() *storage.Session {
+	messages := make([]storage.Message, len(s.Messages))
+	for i, m := range s.Messages {
+		toolCalls, _ := json.Marshal(m.ToolCalls)
+		toolResults, _ := json.Marshal(m.ToolResults)
+		messages[i] = storage.Message{
+			ID:          m.ID,
+			Role:        m.Role,
+			Content:     m.Content,
+			ToolCalls:   toolCalls,
+			ToolResults: toolResults,
+			Timestamp:   m.Timestamp,
+		}
+	}
+
+	return &storage.Session{
+		ID:        s.ID,
+		AgentID:   s.AgentID,
+		ParentID:  s.ParentID,
+		Status:    string(s.Status),
+		Messages:  messages,
+		Metadata:  s.Metadata,
+		CreatedAt: s.CreatedAt,
+		UpdatedAt: s.UpdatedAt,
+	}
+}
+
+// FromStorage creates a Session from storage format
+func FromStorage(ss *storage.Session) *Session {
+	messages := make([]Message, len(ss.Messages))
+	for i, m := range ss.Messages {
+		var toolCalls []ToolCall
+		var toolResults []ToolResult
+		json.Unmarshal(m.ToolCalls, &toolCalls)
+		json.Unmarshal(m.ToolResults, &toolResults)
+
+		messages[i] = Message{
+			ID:          m.ID,
+			Role:        m.Role,
+			Content:     m.Content,
+			ToolCalls:   toolCalls,
+			ToolResults: toolResults,
+			Timestamp:   m.Timestamp,
+		}
+	}
+
+	return &Session{
+		ID:        ss.ID,
+		AgentID:   ss.AgentID,
+		ParentID:  ss.ParentID,
+		Status:    Status(ss.Status),
+		Messages:  messages,
+		Metadata:  ss.Metadata,
+		CreatedAt: ss.CreatedAt,
+		UpdatedAt: ss.UpdatedAt,
+	}
+}
