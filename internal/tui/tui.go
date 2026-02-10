@@ -82,6 +82,9 @@ var (
 
 	receivedStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#00AAFF"))
+
+	separatorStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#444444"))
 )
 
 // Message types for the tea program
@@ -219,13 +222,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 
+		// Height calculation: total - topBar(1) - separator(1) - textarea(3) - helpText(1) = total - 6
+		viewportHeight := msg.Height - 6
+		if viewportHeight < 1 {
+			viewportHeight = 1
+		}
+
 		if !m.ready {
-			m.viewport = viewport.New(msg.Width, msg.Height-6)
+			m.viewport = viewport.New(msg.Width, viewportHeight)
 			m.viewport.SetContent(m.renderMessages())
 			m.ready = true
 		} else {
 			m.viewport.Width = msg.Width
-			m.viewport.Height = msg.Height - 6
+			m.viewport.Height = viewportHeight
 		}
 
 		m.textarea.SetWidth(msg.Width)
@@ -312,14 +321,14 @@ func (m Model) View() string {
 		return "Initializing..."
 	}
 
-	// Top bar with task summary and stats
+	// Top bar with task summary, stats, session, and time
 	topBar := m.renderTopBar()
 
 	// Messages viewport
 	messagesView := m.viewport.View()
 
-	// Status line (loading indicator, timer)
-	statusLine := m.renderStatusLine()
+	// Separator line above input
+	separator := m.renderSeparator()
 
 	// Input area
 	inputView := m.textarea.View()
@@ -327,27 +336,64 @@ func (m Model) View() string {
 	// Help text
 	helpText := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#666666")).
-		Render("esc: quit • enter: send • shift+enter: new line")
+		Render("esc: quit • enter: send • alt+enter: new line")
 
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
 		topBar,
 		messagesView,
-		statusLine,
+		separator,
 		inputView,
 		helpText,
 	)
 }
 
-// renderTopBar renders the top bar with task summary and token stats
+// renderSeparator renders a horizontal line with optional processing indicator
+func (m Model) renderSeparator() string {
+	var leftPart string
+	if m.processing {
+		leftPart = loadingStyle.Render(m.loadingFrames[m.loadingIndex] + " Processing")
+	}
+
+	leftWidth := lipgloss.Width(leftPart)
+	lineWidth := m.width - leftWidth
+	if lineWidth < 0 {
+		lineWidth = 0
+	}
+
+	line := separatorStyle.Render(strings.Repeat("─", lineWidth))
+
+	if leftPart != "" {
+		return leftPart + " " + line
+	}
+	return line
+}
+
+// renderTopBar renders the top bar with task summary, token stats, session, and time
 func (m Model) renderTopBar() string {
 	// Task summary (truncated if too long)
 	summary := m.taskSummary
-	maxSummaryLen := m.width / 2
+	if summary == "" {
+		summary = "New Session"
+	}
+	maxSummaryLen := m.width / 3
 	if len(summary) > maxSummaryLen {
 		summary = summary[:maxSummaryLen-3] + "..."
 	}
 	taskText := taskStyle.Render(summary)
+
+	// Status indicator
+	var statusIcon string
+	switch m.session.Status {
+	case session.StatusRunning:
+		statusIcon = statusRunningStyle.Render("●")
+	case session.StatusPaused:
+		statusIcon = statusPausedStyle.Render("⏸")
+	case session.StatusCompleted:
+		statusIcon = statusCompletedStyle.Render("✓")
+	case session.StatusFailed:
+		statusIcon = statusFailedStyle.Render("✗")
+	}
 
 	// Token stats
 	totalTokens := m.totalInputTokens + m.totalOutputTokens
@@ -363,27 +409,24 @@ func (m Model) renderTopBar() string {
 		percentStyle = tokenStyle
 	}
 
-	stats := fmt.Sprintf("Tokens: %s | %s",
-		tokenStyle.Render(fmt.Sprintf("%d↓ %d↑", m.totalInputTokens, m.totalOutputTokens)),
-		percentStyle.Render(fmt.Sprintf("%.1f%%", contextPercent)),
-	)
-	statsText := statsStyle.Render(stats)
+	tokenStats := fmt.Sprintf("%d↓ %d↑",
+		m.totalInputTokens, m.totalOutputTokens)
+	percentText := fmt.Sprintf("%.1f%%", contextPercent)
 
-	// Status indicator
-	var statusText string
-	switch m.session.Status {
-	case session.StatusRunning:
-		statusText = statusRunningStyle.Render("●")
-	case session.StatusPaused:
-		statusText = statusPausedStyle.Render("⏸")
-	case session.StatusCompleted:
-		statusText = statusCompletedStyle.Render("✓")
-	case session.StatusFailed:
-		statusText = statusFailedStyle.Render("✗")
-	}
+	// Timer showing time since last user input
+	elapsed := time.Since(m.lastUserInputTime)
+	timer := m.formatDuration(elapsed)
 
-	// Combine right side
-	rightSide := lipgloss.JoinHorizontal(lipgloss.Right, statsText, " ", statusText)
+	// Session ID (truncated)
+	sessionID := m.session.ID[:8]
+
+	// Build right side: tokens | percent | time | session | status
+	rightSide := statsStyle.Render(fmt.Sprintf("%s │ %s │ ⏱%s │ %s ",
+		tokenStyle.Render(tokenStats),
+		percentStyle.Render(percentText),
+		timer,
+		sessionID,
+	)) + statusIcon
 
 	// Calculate space between
 	usedWidth := lipgloss.Width(taskText) + lipgloss.Width(rightSide)
@@ -398,33 +441,6 @@ func (m Model) renderTopBar() string {
 		strings.Repeat(" ", space),
 		rightSide,
 	)
-}
-
-// renderStatusLine renders the status line with loading indicator and timer
-func (m Model) renderStatusLine() string {
-	var parts []string
-
-	// Loading indicator
-	if m.processing {
-		loading := loadingStyle.Render(m.loadingFrames[m.loadingIndex] + " Processing...")
-		parts = append(parts, loading)
-		parts = append(parts, "  ") // Add spacing
-	}
-
-	// Timer showing time since last user input
-	elapsed := time.Since(m.lastUserInputTime)
-	timer := m.formatDuration(elapsed)
-	timerText := statsStyle.Render("⏱ " + timer)
-	parts = append(parts, timerText)
-
-	// Add separator between time and session
-	parts = append(parts, statsStyle.Render("  │  "))
-
-	// Session ID
-	sessionInfo := statsStyle.Render(fmt.Sprintf("Session: %s", m.session.ID[:8]))
-	parts = append(parts, sessionInfo)
-
-	return lipgloss.JoinHorizontal(lipgloss.Left, parts...)
 }
 
 // formatDuration formats a duration in a human-readable way
@@ -542,6 +558,10 @@ func (m *Model) SetSize(width, height int) {
 	m.textarea.SetWidth(width)
 	if m.ready {
 		m.viewport.Width = width
-		m.viewport.Height = height - 6
+		viewportHeight := height - 6
+		if viewportHeight < 1 {
+			viewportHeight = 1
+		}
+		m.viewport.Height = viewportHeight
 	}
 }
