@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/gratheon/aagent/internal/agent"
 	"github.com/gratheon/aagent/internal/llm"
+	"github.com/gratheon/aagent/internal/logging"
 	"github.com/gratheon/aagent/internal/session"
 	"github.com/gratheon/aagent/internal/tools"
 )
@@ -317,6 +318,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, tickCmd())
 
 	case agentResponseMsg:
+		logging.Debug("TUI received agentResponseMsg: done=%v err=%v tokens=%d/%d", msg.done, msg.err != nil, msg.inputTokens, msg.outputTokens)
+
 		// Update token counts
 		m.totalInputTokens += msg.inputTokens
 		m.totalOutputTokens += msg.outputTokens
@@ -332,6 +335,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.GotoBottom()
 		} else if msg.done {
 			m.processing = false
+			logging.Debug("TUI: Agent done, processing=%v queuedMessages=%d", m.processing, len(m.queuedMessages))
 			// Add assistant response message
 			if msg.content != "" {
 				m.messages = append(m.messages, message{
@@ -345,7 +349,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Track interaction and trigger title generation after 2 interactions
 			m.interactionCount++
-			if m.interactionCount >= 2 && !m.titleGenerated {
+			if m.interactionCount >= 2 && !m.titleGenerated && len(m.queuedMessages) == 0 {
+				// Only generate title if no queued messages to avoid interference
 				m.titleGenerated = true
 				cmds = append(cmds, m.generateTitle())
 			}

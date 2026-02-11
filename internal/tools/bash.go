@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	defaultBashTimeout = 2 * time.Minute
+	defaultBashTimeout = 30 * time.Second
 	maxOutputSize      = 50 * 1024 // 50KB
 )
 
