@@ -39,6 +39,7 @@ func (s *SQLiteStore) migrate() error {
 			id TEXT PRIMARY KEY,
 			agent_id TEXT NOT NULL,
 			parent_id TEXT,
+			title TEXT DEFAULT '',
 			status TEXT NOT NULL,
 			metadata TEXT,
 			created_at TIMESTAMP NOT NULL,
@@ -56,10 +57,14 @@ func (s *SQLiteStore) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_parent_id ON sessions(parent_id)`,
+		// Migration to add title column if it doesn't exist
+		`ALTER TABLE sessions ADD COLUMN title TEXT DEFAULT ''`,
 	}
 
 	for _, m := range migrations {
-		if _, err := s.db.Exec(m); err != nil {
+		// Ignore errors for ALTER TABLE (column may already exist)
+		_, err := s.db.Exec(m)
+		if err != nil && m[:5] != "ALTER" {
 			return fmt.Errorf("migration failed: %w", err)
 		}
 	}
@@ -79,13 +84,14 @@ func (s *SQLiteStore) SaveSession(sess *Session) error {
 
 	// Upsert session
 	_, err = tx.Exec(`
-		INSERT INTO sessions (id, agent_id, parent_id, status, metadata, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO sessions (id, agent_id, parent_id, title, status, metadata, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
+			title = excluded.title,
 			status = excluded.status,
 			metadata = excluded.metadata,
 			updated_at = excluded.updated_at
-	`, sess.ID, sess.AgentID, sess.ParentID, sess.Status, metadata, sess.CreatedAt, sess.UpdatedAt)
+	`, sess.ID, sess.AgentID, sess.ParentID, sess.Title, sess.Status, metadata, sess.CreatedAt, sess.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("failed to save session: %w", err)
 	}
@@ -115,11 +121,12 @@ func (s *SQLiteStore) GetSession(id string) (*Session, error) {
 	var sess Session
 	var metadata sql.NullString
 	var parentID sql.NullString
+	var title sql.NullString
 
 	err := s.db.QueryRow(`
-		SELECT id, agent_id, parent_id, status, metadata, created_at, updated_at
+		SELECT id, agent_id, parent_id, title, status, metadata, created_at, updated_at
 		FROM sessions WHERE id = ?
-	`, id).Scan(&sess.ID, &sess.AgentID, &parentID, &sess.Status, &metadata, &sess.CreatedAt, &sess.UpdatedAt)
+	`, id).Scan(&sess.ID, &sess.AgentID, &parentID, &title, &sess.Status, &metadata, &sess.CreatedAt, &sess.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("session not found: %s", id)
 	}
@@ -129,6 +136,9 @@ func (s *SQLiteStore) GetSession(id string) (*Session, error) {
 
 	if parentID.Valid {
 		sess.ParentID = &parentID.String
+	}
+	if title.Valid {
+		sess.Title = title.String
 	}
 	if metadata.Valid {
 		json.Unmarshal([]byte(metadata.String), &sess.Metadata)
@@ -169,7 +179,7 @@ func (s *SQLiteStore) GetSession(id string) (*Session, error) {
 // ListSessions lists all sessions
 func (s *SQLiteStore) ListSessions() ([]*Session, error) {
 	rows, err := s.db.Query(`
-		SELECT id, agent_id, parent_id, status, created_at, updated_at
+		SELECT id, agent_id, parent_id, title, status, created_at, updated_at
 		FROM sessions ORDER BY created_at DESC
 	`)
 	if err != nil {
@@ -181,14 +191,18 @@ func (s *SQLiteStore) ListSessions() ([]*Session, error) {
 	for rows.Next() {
 		var sess Session
 		var parentID sql.NullString
+		var title sql.NullString
 
-		err := rows.Scan(&sess.ID, &sess.AgentID, &parentID, &sess.Status, &sess.CreatedAt, &sess.UpdatedAt)
+		err := rows.Scan(&sess.ID, &sess.AgentID, &parentID, &title, &sess.Status, &sess.CreatedAt, &sess.UpdatedAt)
 		if err != nil {
 			return nil, err
 		}
 
 		if parentID.Valid {
 			sess.ParentID = &parentID.String
+		}
+		if title.Valid {
+			sess.Title = title.String
 		}
 
 		sessions = append(sessions, &sess)

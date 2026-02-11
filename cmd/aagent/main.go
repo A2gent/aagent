@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/gratheon/aagent/internal/agent"
@@ -268,10 +269,17 @@ func listSessions(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	fmt.Printf("%-36s  %-10s  %-20s  %s\n", "ID", "Agent", "Created", "Status")
-	fmt.Println("-------------------------------------------------------------------------------------")
+	fmt.Printf("%-8s  %-20s  %-10s  %-30s\n", "ID", "Created", "Status", "Title")
+	fmt.Println(strings.Repeat("-", 80))
 	for _, s := range sessions {
-		fmt.Printf("%-36s  %-10s  %-20s  %s\n", s.ID, s.AgentID, s.CreatedAt.Format("2006-01-02 15:04:05"), s.Status)
+		title := s.Title
+		if title == "" {
+			title = "(no title)"
+		}
+		if len(title) > 30 {
+			title = title[:27] + "..."
+		}
+		fmt.Printf("%-8s  %-20s  %-10s  %-30s\n", s.ID[:8], s.CreatedAt.Format("2006-01-02 15:04:05"), s.Status, title)
 	}
 
 	return nil

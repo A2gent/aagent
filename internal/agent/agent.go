@@ -66,6 +66,9 @@ func (a *Agent) loop(ctx context.Context, sess *session.Session) (string, llm.To
 	step := 0
 	totalUsage := llm.TokenUsage{}
 
+	// Clean up incomplete tool calls before starting
+	a.cleanupIncompleteToolCalls(sess)
+
 	for {
 		// Check context
 		if ctx.Err() != nil {
@@ -200,6 +203,35 @@ func (a *Agent) getLastAssistantContent(sess *session.Session) string {
 		}
 	}
 	return ""
+}
+
+// cleanupIncompleteToolCalls removes assistant messages with tool calls that don't have corresponding tool results
+// This can happen when the user interrupts a tool execution
+func (a *Agent) cleanupIncompleteToolCalls(sess *session.Session) {
+	if len(sess.Messages) == 0 {
+		return
+	}
+
+	// Find the last assistant message with tool calls
+	for i := len(sess.Messages) - 1; i >= 0; i-- {
+		msg := sess.Messages[i]
+
+		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+			// Check if there's a following tool message with results
+			hasResults := false
+			if i+1 < len(sess.Messages) && sess.Messages[i+1].Role == "tool" {
+				hasResults = true
+			}
+
+			if !hasResults {
+				// Remove this incomplete assistant message
+				logging.Warn("Removing incomplete tool call message (no results)")
+				sess.Messages = append(sess.Messages[:i], sess.Messages[i+1:]...)
+				// Continue checking in case there are more
+				continue
+			}
+		}
+	}
 }
 
 // defaultSystemPrompt is the default system prompt for the agent

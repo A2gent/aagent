@@ -45,6 +45,12 @@ var (
 			Bold(true).
 			Foreground(lipgloss.Color("#00AAFF"))
 
+	userContentStyle = lipgloss.NewStyle().
+				Background(lipgloss.Color("#1a1a3e")).
+				Padding(0, 1)
+
+	assistantContentStyle = lipgloss.NewStyle()
+
 	assistantStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("#00FF00"))
@@ -85,6 +91,15 @@ var (
 
 	separatorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#444444"))
+
+	queuedStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#888888")).
+			Italic(true)
+
+	queuedContentStyle = lipgloss.NewStyle().
+				Background(lipgloss.Color("#2a2a2a")).
+				Foreground(lipgloss.Color("#888888")).
+				Padding(0, 1)
 )
 
 // Message types for the tea program
@@ -100,6 +115,12 @@ type (
 	}
 
 	tokenUpdateMsg struct {
+		inputTokens  int
+		outputTokens int
+	}
+
+	titleUpdateMsg struct {
+		title        string
 		inputTokens  int
 		outputTokens int
 	}
@@ -129,6 +150,13 @@ type Model struct {
 	totalInputTokens  int
 	totalOutputTokens int
 	contextWindow     int // in tokens (default 128k for kimi-k2.5)
+
+	// Interaction tracking for auto-summarization
+	interactionCount int
+	titleGenerated   bool
+
+	// Message queue for when processing
+	queuedMessages []string
 
 	// Timing
 	lastUserInputTime time.Time
@@ -257,8 +285,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			input := m.textarea.Value()
 			if strings.TrimSpace(input) != "" {
-				m = m.handleUserInput(input)
 				m.textarea.Reset()
+
+				if m.processing {
+					// Queue the message if we're still processing
+					m.queuedMessages = append(m.queuedMessages, input)
+					// Show queued message in UI with pending indicator
+					m.messages = append(m.messages, message{
+						role:      "queued",
+						content:   input,
+						timestamp: time.Now(),
+					})
+					m.viewport.SetContent(m.renderMessages())
+					m.viewport.GotoBottom()
+					return m, nil
+				}
+
+				m = m.handleUserInput(input)
 				m.viewport.SetContent(m.renderMessages())
 				m.viewport.GotoBottom()
 				// Start the agent in background
@@ -299,7 +342,47 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewport.SetContent(m.renderMessages())
 				m.viewport.GotoBottom()
 			}
+
+			// Track interaction and trigger title generation after 2 interactions
+			m.interactionCount++
+			if m.interactionCount >= 2 && !m.titleGenerated {
+				m.titleGenerated = true
+				cmds = append(cmds, m.generateTitle())
+			}
+
+			// Process queued messages
+			if len(m.queuedMessages) > 0 {
+				// Get the first queued message
+				nextInput := m.queuedMessages[0]
+				m.queuedMessages = m.queuedMessages[1:]
+
+				// Convert queued message to sent message in display
+				for i := range m.messages {
+					if m.messages[i].role == "queued" && m.messages[i].content == nextInput {
+						m.messages[i].role = "user"
+						m.messages[i].timestamp = time.Now()
+						break
+					}
+				}
+
+				// Process the queued message
+				m.session.AddUserMessage(nextInput)
+				m.lastUserInputTime = time.Now()
+				m.processing = true
+				m.viewport.SetContent(m.renderMessages())
+				m.viewport.GotoBottom()
+				cmds = append(cmds, m.runAgent(nextInput))
+			}
 		}
+
+	case titleUpdateMsg:
+		// Update session title
+		m.session.SetTitle(msg.title)
+		m.taskSummary = msg.title
+		m.sessionManager.Save(m.session)
+		// Update token counts from title generation
+		m.totalInputTokens += msg.inputTokens
+		m.totalOutputTokens += msg.outputTokens
 
 	case tokenUpdateMsg:
 		m.totalInputTokens += msg.inputTokens
@@ -353,6 +436,9 @@ func (m Model) renderSeparator() string {
 	var leftPart string
 	if m.processing {
 		leftPart = loadingStyle.Render(m.loadingFrames[m.loadingIndex] + " Processing")
+		if len(m.queuedMessages) > 0 {
+			leftPart += queuedStyle.Render(fmt.Sprintf(" (%d queued)", len(m.queuedMessages)))
+		}
 	}
 
 	leftWidth := lipgloss.Width(leftPart)
@@ -371,8 +457,11 @@ func (m Model) renderSeparator() string {
 
 // renderTopBar renders the top bar with task summary, token stats, session, and time
 func (m Model) renderTopBar() string {
-	// Task summary (truncated if too long)
-	summary := m.taskSummary
+	// Use session title if available, otherwise task summary or default
+	summary := m.session.Title
+	if summary == "" {
+		summary = m.taskSummary
+	}
 	if summary == "" {
 		summary = "New Session"
 	}
@@ -443,6 +532,41 @@ func (m Model) renderTopBar() string {
 	)
 }
 
+// wrapText wraps text to fit within the given width
+func wrapText(text string, width int) string {
+	if width <= 0 {
+		return text
+	}
+
+	var result strings.Builder
+	lines := strings.Split(text, "\n")
+
+	for i, line := range lines {
+		if i > 0 {
+			result.WriteString("\n")
+		}
+
+		// Wrap each line
+		for len(line) > width {
+			// Find a good break point
+			breakPoint := width
+			for breakPoint > 0 && line[breakPoint] != ' ' {
+				breakPoint--
+			}
+			if breakPoint == 0 {
+				breakPoint = width // No space found, force break
+			}
+
+			result.WriteString(line[:breakPoint])
+			result.WriteString("\n")
+			line = strings.TrimLeft(line[breakPoint:], " ")
+		}
+		result.WriteString(line)
+	}
+
+	return result.String()
+}
+
 // formatDuration formats a duration in a human-readable way
 func (m Model) formatDuration(d time.Duration) string {
 	if d < time.Minute {
@@ -473,18 +597,29 @@ func (m Model) renderMessage(msg message) string {
 	// Timestamp
 	timestamp := timestampStyle.Render(msg.timestamp.Format("15:04:05"))
 
+	// Calculate wrap width (leave some margin)
+	wrapWidth := m.width - 4
+	if wrapWidth < 20 {
+		wrapWidth = 20
+	}
+
 	switch msg.role {
 	case "user":
 		header := userStyle.Render("You")
 		indicator := sentStyle.Render(" ✓")
 		sb.WriteString(fmt.Sprintf("%s %s%s\n", timestamp, header, indicator))
-		sb.WriteString(msg.content)
+		// Wrap and render user content with navy background
+		wrapped := wrapText(msg.content, wrapWidth-2) // -2 for padding
+		content := userContentStyle.Width(wrapWidth).Render(wrapped)
+		sb.WriteString(content)
 
 	case "assistant":
 		header := assistantStyle.Render("Assistant")
 		indicator := receivedStyle.Render(" ⬇")
 		sb.WriteString(fmt.Sprintf("%s %s%s\n", timestamp, header, indicator))
-		sb.WriteString(msg.content)
+		// Wrap assistant content
+		wrapped := wrapText(msg.content, wrapWidth)
+		sb.WriteString(wrapped)
 
 		// Render tool calls if any
 		for _, tc := range msg.toolCalls {
@@ -511,6 +646,15 @@ func (m Model) renderMessage(msg message) string {
 		header := errorStyle.Render("Error")
 		sb.WriteString(fmt.Sprintf("%s %s\n", timestamp, header))
 		sb.WriteString(errorStyle.Render(msg.content))
+
+	case "queued":
+		header := queuedStyle.Render("You (queued)")
+		indicator := queuedStyle.Render(" ⏳")
+		sb.WriteString(fmt.Sprintf("%s %s%s\n", timestamp, header, indicator))
+		// Wrap and render queued content with gray background
+		wrapped := wrapText(msg.content, wrapWidth-2)
+		content := queuedContentStyle.Width(wrapWidth).Render(wrapped)
+		sb.WriteString(content)
 	}
 
 	return sb.String()
@@ -547,6 +691,57 @@ func (m Model) runAgent(input string) tea.Cmd {
 			done:         true,
 			inputTokens:  usage.InputTokens,
 			outputTokens: usage.OutputTokens,
+		}
+	}
+}
+
+// generateTitle generates a session title from the conversation
+func (m Model) generateTitle() tea.Cmd {
+	return func() tea.Msg {
+		ctx := context.Background()
+
+		// Build a summary of the conversation for title generation
+		var conversationSummary string
+		for _, msg := range m.messages {
+			if msg.role == "user" || msg.role == "assistant" {
+				content := msg.content
+				if len(content) > 200 {
+					content = content[:200] + "..."
+				}
+				conversationSummary += fmt.Sprintf("%s: %s\n", msg.role, content)
+			}
+		}
+
+		// Create a simple request to generate title
+		request := &llm.ChatRequest{
+			Messages: []llm.Message{
+				{
+					Role:    "user",
+					Content: fmt.Sprintf("Summarize this conversation in a short title (max 50 chars, no quotes):\n\n%s", conversationSummary),
+				},
+			},
+			MaxTokens:   50,
+			Temperature: 0.3,
+		}
+
+		response, err := m.llmClient.Chat(ctx, request)
+		if err != nil {
+			// Silently fail - title generation is not critical
+			return titleUpdateMsg{title: "", inputTokens: 0, outputTokens: 0}
+		}
+
+		title := strings.TrimSpace(response.Content)
+		// Remove quotes if present
+		title = strings.Trim(title, "\"'")
+		// Limit length
+		if len(title) > 60 {
+			title = title[:57] + "..."
+		}
+
+		return titleUpdateMsg{
+			title:        title,
+			inputTokens:  response.Usage.InputTokens,
+			outputTokens: response.Usage.OutputTokens,
 		}
 	}
 }

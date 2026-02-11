@@ -23,6 +23,7 @@ type Session struct {
 	ID        string                 `json:"id"`
 	AgentID   string                 `json:"agent_id"`
 	ParentID  *string                `json:"parent_id,omitempty"`
+	Title     string                 `json:"title"`
 	Status    Status                 `json:"status"`
 	Messages  []Message              `json:"messages"`
 	Metadata  map[string]interface{} `json:"metadata,omitempty"`
@@ -126,6 +127,12 @@ func (s *Session) SetStatus(status Status) {
 	s.UpdatedAt = time.Now()
 }
 
+// SetTitle sets the session title
+func (s *Session) SetTitle(title string) {
+	s.Title = title
+	s.UpdatedAt = time.Now()
+}
+
 // ToStorage converts to storage format
 func (s *Session) ToStorage() *storage.Session {
 	messages := make([]storage.Message, len(s.Messages))
@@ -146,6 +153,7 @@ func (s *Session) ToStorage() *storage.Session {
 		ID:        s.ID,
 		AgentID:   s.AgentID,
 		ParentID:  s.ParentID,
+		Title:     s.Title,
 		Status:    string(s.Status),
 		Messages:  messages,
 		Metadata:  s.Metadata,
@@ -177,6 +185,7 @@ func FromStorage(ss *storage.Session) *Session {
 		ID:        ss.ID,
 		AgentID:   ss.AgentID,
 		ParentID:  ss.ParentID,
+		Title:     ss.Title,
 		Status:    Status(ss.Status),
 		Messages:  messages,
 		Metadata:  ss.Metadata,

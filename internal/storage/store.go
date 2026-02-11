@@ -10,6 +10,7 @@ type Session struct {
 	ID        string
 	AgentID   string
 	ParentID  *string
+	Title     string
 	Status    string
 	Messages  []Message
 	Metadata  map[string]interface{}
