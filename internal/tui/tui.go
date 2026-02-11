@@ -3,7 +3,9 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -64,6 +66,42 @@ var (
 	toolResultStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#A0A0A0"))
 
+	// Tool-specific styles
+	toolBashStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#98C379")) // Green for shell commands
+
+	toolReadStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#61AFEF")) // Blue for reading
+
+	toolWriteStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#E5C07B")) // Yellow for writing
+
+	toolEditStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#C678DD")) // Purple for editing
+
+	toolGlobStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#56B6C2")) // Cyan for file search
+
+	toolGrepStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#E06C75")) // Red for content search
+
+	toolTaskStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#D19A66")) // Orange for sub-agents
+
+	// Diff styles
+	diffAddStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#98C379")) // Green for additions
+
+	diffRemoveStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#E06C75")) // Red for deletions
+
+	diffContextStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#ABB2BF")) // Gray for context
+
+	diffHeaderStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#61AFEF")).
+			Bold(true) // Blue bold for file headers
+
 	errorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FF0000"))
 
@@ -121,6 +159,221 @@ var (
 	commandDescStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#888888"))
 )
+
+// Tool icons for visual distinction in the TUI
+var toolIcons = map[string]string{
+	"bash":  "", // Terminal icon
+	"read":  "", // File read icon
+	"write": "", // File write icon
+	"edit":  "", // Edit icon
+	"glob":  "", // Search files icon
+	"grep":  "", // Search content icon
+	"task":  "", // Sub-agent icon
+}
+
+// getToolIcon returns the icon for a tool, or a default arrow
+func getToolIcon(toolName string) string {
+	if icon, ok := toolIcons[toolName]; ok {
+		return icon
+	}
+	return "" // Default icon
+}
+
+// getToolStyle returns the style for a tool
+func getToolStyle(toolName string) lipgloss.Style {
+	switch toolName {
+	case "bash":
+		return toolBashStyle
+	case "read":
+		return toolReadStyle
+	case "write":
+		return toolWriteStyle
+	case "edit":
+		return toolEditStyle
+	case "glob":
+		return toolGlobStyle
+	case "grep":
+		return toolGrepStyle
+	case "task":
+		return toolTaskStyle
+	default:
+		return toolStyle
+	}
+}
+
+// ToolCallDisplay holds parsed tool call info for display
+type ToolCallDisplay struct {
+	Name    string
+	Icon    string
+	Summary string
+	Details []string
+}
+
+// parseToolCall extracts display info from a tool call
+func parseToolCall(tc session.ToolCall, maxWidth int) ToolCallDisplay {
+	display := ToolCallDisplay{
+		Name: tc.Name,
+		Icon: getToolIcon(tc.Name),
+	}
+
+	// Parse the input JSON to extract relevant info
+	var input map[string]interface{}
+	if err := json.Unmarshal(tc.Input, &input); err != nil {
+		display.Summary = tc.Name
+		return display
+	}
+
+	switch tc.Name {
+	case "bash":
+		if cmd, ok := input["command"].(string); ok {
+			// Truncate command if too long
+			if len(cmd) > maxWidth-10 {
+				cmd = cmd[:maxWidth-13] + "..."
+			}
+			display.Summary = cmd
+		}
+		if workdir, ok := input["workdir"].(string); ok && workdir != "" {
+			display.Details = append(display.Details, fmt.Sprintf("workdir: %s", workdir))
+		}
+
+	case "read":
+		if path, ok := input["path"].(string); ok {
+			display.Summary = shortenPath(path, maxWidth-10)
+		}
+
+	case "write":
+		if path, ok := input["path"].(string); ok {
+			display.Summary = shortenPath(path, maxWidth-10)
+		}
+		if content, ok := input["content"].(string); ok {
+			lines := strings.Count(content, "\n") + 1
+			display.Details = append(display.Details, fmt.Sprintf("%d lines", lines))
+		}
+
+	case "edit":
+		if path, ok := input["path"].(string); ok {
+			display.Summary = shortenPath(path, maxWidth-10)
+		}
+		// Add diff preview
+		if oldStr, ok := input["old_string"].(string); ok {
+			if newStr, ok := input["new_string"].(string); ok {
+				display.Details = append(display.Details, formatDiff(oldStr, newStr, maxWidth-4))
+			}
+		}
+
+	case "glob":
+		if pattern, ok := input["pattern"].(string); ok {
+			display.Summary = pattern
+		}
+		if path, ok := input["path"].(string); ok && path != "" {
+			display.Details = append(display.Details, fmt.Sprintf("in: %s", shortenPath(path, maxWidth-8)))
+		}
+
+	case "grep":
+		if pattern, ok := input["pattern"].(string); ok {
+			display.Summary = pattern
+		}
+		if path, ok := input["path"].(string); ok && path != "" {
+			display.Details = append(display.Details, fmt.Sprintf("in: %s", shortenPath(path, maxWidth-8)))
+		}
+
+	case "task":
+		if desc, ok := input["description"].(string); ok {
+			display.Summary = desc
+		}
+		if agentType, ok := input["subagent_type"].(string); ok {
+			display.Details = append(display.Details, fmt.Sprintf("agent: %s", agentType))
+		}
+
+	default:
+		display.Summary = tc.Name
+	}
+
+	return display
+}
+
+// shortenPath shortens a path to fit within maxLen
+func shortenPath(path string, maxLen int) string {
+	if len(path) <= maxLen {
+		return path
+	}
+	// Try to show the filename and as much of the path as possible
+	base := filepath.Base(path)
+	if len(base) >= maxLen-3 {
+		return base[:maxLen-3] + "..."
+	}
+	remaining := maxLen - len(base) - 4 // for ".../"
+	if remaining <= 0 {
+		return base
+	}
+	dir := filepath.Dir(path)
+	if len(dir) > remaining {
+		dir = "..." + dir[len(dir)-remaining:]
+	}
+	return dir + "/" + base
+}
+
+// findToolNameByCallID finds the tool name for a given tool call ID
+func findToolNameByCallID(toolCalls []session.ToolCall, callID string) string {
+	for _, tc := range toolCalls {
+		if tc.ID == callID {
+			return tc.Name
+		}
+	}
+	return "tool"
+}
+
+// formatDiff creates a simple diff display
+func formatDiff(oldStr, newStr string, maxWidth int) string {
+	var sb strings.Builder
+
+	// Split into lines for comparison
+	oldLines := strings.Split(oldStr, "\n")
+	newLines := strings.Split(newStr, "\n")
+
+	// Show at most 5 lines of diff
+	maxLines := 5
+
+	// Show removed lines (up to maxLines/2)
+	showCount := 0
+	for i, line := range oldLines {
+		if showCount >= (maxLines+1)/2 {
+			if i < len(oldLines)-1 {
+				sb.WriteString(diffRemoveStyle.Render(fmt.Sprintf("    ... (%d more removed)", len(oldLines)-i)))
+				sb.WriteString("\n")
+			}
+			break
+		}
+		line = strings.TrimRight(line, " \t")
+		if len(line) > maxWidth-6 {
+			line = line[:maxWidth-9] + "..."
+		}
+		sb.WriteString(diffRemoveStyle.Render(fmt.Sprintf("    - %s", line)))
+		sb.WriteString("\n")
+		showCount++
+	}
+
+	// Show added lines (up to maxLines/2)
+	showCount = 0
+	for i, line := range newLines {
+		if showCount >= maxLines/2 {
+			if i < len(newLines)-1 {
+				sb.WriteString(diffAddStyle.Render(fmt.Sprintf("    ... (%d more added)", len(newLines)-i)))
+				sb.WriteString("\n")
+			}
+			break
+		}
+		line = strings.TrimRight(line, " \t")
+		if len(line) > maxWidth-6 {
+			line = line[:maxWidth-9] + "..."
+		}
+		sb.WriteString(diffAddStyle.Render(fmt.Sprintf("    + %s", line)))
+		sb.WriteString("\n")
+		showCount++
+	}
+
+	return strings.TrimSuffix(sb.String(), "\n")
+}
 
 // Message types for the tea program
 type (
@@ -826,16 +1079,25 @@ func (m Model) formatDuration(d time.Duration) string {
 func (m Model) renderMessages() string {
 	var sb strings.Builder
 
-	for _, msg := range m.messages {
-		sb.WriteString(m.renderMessage(msg))
+	for i, msg := range m.messages {
+		var prevMsg *message
+		if i > 0 {
+			prevMsg = &m.messages[i-1]
+		}
+		sb.WriteString(m.renderMessageWithContext(msg, prevMsg))
 		sb.WriteString("\n\n")
 	}
 
 	return sb.String()
 }
 
-// renderMessage renders a single message
+// renderMessage renders a single message with optional previous message context
 func (m Model) renderMessage(msg message) string {
+	return m.renderMessageWithContext(msg, nil)
+}
+
+// renderMessageWithContext renders a message with context from previous message
+func (m Model) renderMessageWithContext(msg message, prevMsg *message) string {
 	var sb strings.Builder
 
 	// Timestamp
@@ -865,25 +1127,77 @@ func (m Model) renderMessage(msg message) string {
 		wrapped := wrapText(msg.content, wrapWidth)
 		sb.WriteString(wrapped)
 
-		// Render tool calls if any
+		// Render tool calls with icons and details
 		for _, tc := range msg.toolCalls {
-			toolLine := toolStyle.Render(fmt.Sprintf("  → %s", tc.Name))
-			sb.WriteString("\n" + toolLine)
+			display := parseToolCall(tc, wrapWidth)
+			style := getToolStyle(tc.Name)
+
+			// Tool header with icon and name
+			toolHeader := style.Render(fmt.Sprintf("  %s %s", display.Icon, tc.Name))
+			sb.WriteString("\n" + toolHeader)
+
+			// Tool summary (command, path, pattern, etc.)
+			if display.Summary != "" {
+				summaryLine := toolResultStyle.Render(fmt.Sprintf("    %s", display.Summary))
+				sb.WriteString("\n" + summaryLine)
+			}
+
+			// Additional details (diff, workdir, etc.)
+			for _, detail := range display.Details {
+				sb.WriteString("\n" + detail)
+			}
 		}
 
 	case "tool":
 		header := toolResultStyle.Render("Tool Results")
 		sb.WriteString(fmt.Sprintf("%s %s\n", timestamp, header))
+
+		// Get tool calls from previous assistant message (if available)
+		var prevToolCalls []session.ToolCall
+		if prevMsg != nil && prevMsg.role == "assistant" {
+			prevToolCalls = prevMsg.toolCalls
+		}
+
 		for _, tr := range msg.toolResults {
-			status := "✓"
+			// Find the matching tool call to get the tool name
+			toolName := findToolNameByCallID(prevToolCalls, tr.ToolCallID)
+			icon := getToolIcon(toolName)
+			style := getToolStyle(toolName)
+
+			var statusIcon string
+			var statusStyle lipgloss.Style
 			if tr.IsError {
-				status = "✗"
+				statusIcon = ""
+				statusStyle = errorStyle
+			} else {
+				statusIcon = ""
+				statusStyle = style
 			}
-			resultLine := fmt.Sprintf("  %s %s", status, tr.Content)
-			if len(resultLine) > m.width-4 {
-				resultLine = resultLine[:m.width-7] + "..."
+
+			// Format the result with icon and status
+			resultHeader := statusStyle.Render(fmt.Sprintf("  %s %s %s", icon, toolName, statusIcon))
+			sb.WriteString(resultHeader + "\n")
+
+			// Show content preview (truncated)
+			content := tr.Content
+			if len(content) > 0 {
+				// Limit to first few lines
+				lines := strings.SplitN(content, "\n", 6)
+				for i, line := range lines {
+					if i >= 5 {
+						remaining := len(strings.Split(content, "\n")) - 5
+						if remaining > 0 {
+							sb.WriteString(toolResultStyle.Render(fmt.Sprintf("    ... (%d more lines)", remaining)) + "\n")
+						}
+						break
+					}
+					line = strings.TrimRight(line, " \t\r")
+					if len(line) > m.width-8 {
+						line = line[:m.width-11] + "..."
+					}
+					sb.WriteString(toolResultStyle.Render(fmt.Sprintf("    %s", line)) + "\n")
+				}
 			}
-			sb.WriteString(resultLine + "\n")
 		}
 
 	case "error":
