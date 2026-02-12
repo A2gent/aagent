@@ -1,15 +1,19 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/gratheon/aagent/internal/agent"
 	"github.com/gratheon/aagent/internal/config"
+	httpserver "github.com/gratheon/aagent/internal/http"
 	"github.com/gratheon/aagent/internal/llm"
 	"github.com/gratheon/aagent/internal/llm/anthropic"
 	"github.com/gratheon/aagent/internal/logging"
@@ -26,22 +30,24 @@ var (
 	agentFlag    string
 	continueFlag string
 	verboseFlag  bool
+	portFlag     int
 )
 
 func main() {
 	rootCmd := &cobra.Command{
 		Use:   "aagent [task]",
-		Short: "A2gent - Autonomous AI coding agent with TUI",
+		Short: "A2gent - Autonomous AI coding agent",
 		Long: `A2gent is a Go-based autonomous AI coding agent that executes tasks in sessions.
-It features a TUI interface with scrollable history, multi-line input, and real-time status.`,
+Starts both the HTTP API server and the TUI interface simultaneously.`,
 		Args: cobra.ArbitraryArgs,
-		RunE: runAgent,
+		RunE: runAgentWithServer,
 	}
 
 	rootCmd.Flags().StringVarP(&modelFlag, "model", "m", "", "Override default model")
 	rootCmd.Flags().StringVarP(&agentFlag, "agent", "a", "build", "Select agent type (build, plan)")
 	rootCmd.Flags().StringVarP(&continueFlag, "continue", "c", "", "Resume previous session by ID")
 	rootCmd.Flags().BoolVarP(&verboseFlag, "verbose", "v", false, "Verbose output")
+	rootCmd.Flags().IntVarP(&portFlag, "port", "p", 8080, "HTTP API server port")
 
 	// Session management subcommand
 	sessionCmd := &cobra.Command{
@@ -72,6 +78,136 @@ It features a TUI interface with scrollable history, multi-line input, and real-
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func runAgentWithServer(cmd *cobra.Command, args []string) error {
+	// Load .env files from common locations (ignore errors if not found)
+	homeDir, _ := os.UserHomeDir()
+	godotenv.Load(".env")                                  // Current directory
+	godotenv.Load(filepath.Join(homeDir, ".env"))          // Home directory
+	godotenv.Load(filepath.Join(homeDir, "git/mind/.env")) // Common project location
+
+	// Load configuration
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	// Initialize logging
+	if err := logging.Init(cfg.DataPath); err != nil {
+		return fmt.Errorf("failed to initialize logging: %w", err)
+	}
+	defer logging.Close()
+
+	logging.Info("Starting aagent with HTTP server and TUI")
+
+	// Override model if specified
+	if modelFlag != "" {
+		cfg.DefaultModel = modelFlag
+	}
+
+	// Get API key (support both KIMI_API_KEY and ANTHROPIC_API_KEY)
+	apiKey := os.Getenv("KIMI_API_KEY")
+	if apiKey == "" {
+		apiKey = os.Getenv("ANTHROPIC_API_KEY")
+	}
+	if apiKey == "" {
+		logging.Error("KIMI_API_KEY or ANTHROPIC_API_KEY not set")
+		return fmt.Errorf("KIMI_API_KEY or ANTHROPIC_API_KEY environment variable is required")
+	}
+
+	// Initialize storage
+	store, err := storage.NewSQLiteStore(cfg.DataPath)
+	if err != nil {
+		return fmt.Errorf("failed to initialize storage: %w", err)
+	}
+	defer store.Close()
+
+	// Initialize LLM client
+	var llmClient llm.Client
+	baseURL := os.Getenv("ANTHROPIC_BASE_URL")
+	if baseURL == "" {
+		baseURL = "https://api.kimi.com/coding/v1" // Default to Kimi Code API
+	}
+	logging.Info("Using LLM API: %s model=%s", baseURL, cfg.DefaultModel)
+	llmClient = anthropic.NewClientWithBaseURL(apiKey, cfg.DefaultModel, baseURL)
+
+	// Initialize tool manager
+	toolManager := tools.NewManager(cfg.WorkDir)
+
+	// Initialize session manager
+	sessionManager := session.NewManager(store)
+
+	// Start HTTP server in background
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := httpserver.NewServer(cfg, llmClient, toolManager, sessionManager, portFlag)
+	go func() {
+		logging.Info("Starting HTTP server on port %d", portFlag)
+		if err := server.Run(ctx); err != nil && err.Error() != "http: Server closed" {
+			logging.Error("HTTP server error: %v", err)
+		}
+	}()
+
+	// Create or resume session for TUI
+	var sess *session.Session
+	if continueFlag != "" {
+		sess, err = sessionManager.Get(continueFlag)
+		if err != nil {
+			logging.Error("Failed to resume session %s: %v", continueFlag, err)
+			return fmt.Errorf("failed to resume session: %w", err)
+		}
+		logging.LogSession("resumed", sess.ID, fmt.Sprintf("agent=%s messages=%d", sess.AgentID, len(sess.Messages)))
+	} else {
+		sess, err = sessionManager.Create(agentFlag)
+		if err != nil {
+			logging.Error("Failed to create session: %v", err)
+			return fmt.Errorf("failed to create session: %w", err)
+		}
+		logging.LogSession("created", sess.ID, fmt.Sprintf("agent=%s", agentFlag))
+	}
+
+	// Get initial task from args if provided
+	var initialTask string
+	if len(args) > 0 {
+		initialTask = args[0]
+		sess.AddUserMessage(initialTask)
+	}
+
+	// Create agent config
+	agentConfig := agent.Config{
+		Name:        agentFlag,
+		Model:       cfg.DefaultModel,
+		MaxSteps:    cfg.MaxSteps,
+		Temperature: cfg.Temperature,
+	}
+
+	// Create TUI model
+	model := tui.New(
+		sess,
+		sessionManager,
+		agentConfig,
+		llmClient,
+		toolManager,
+		initialTask,
+	)
+
+	// Run the TUI
+	p := tea.NewProgram(
+		model,
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
+	)
+
+	if _, err := p.Run(); err != nil {
+		return fmt.Errorf("TUI error: %w", err)
+	}
+
+	// Cancel context to stop HTTP server
+	cancel()
+
+	return nil
 }
 
 func runAgent(cmd *cobra.Command, args []string) error {
@@ -186,6 +322,83 @@ func runAgent(cmd *cobra.Command, args []string) error {
 
 	if _, err := p.Run(); err != nil {
 		return fmt.Errorf("TUI error: %w", err)
+	}
+
+	return nil
+}
+
+func runServer(cmd *cobra.Command, args []string) error {
+	// Load .env files from common locations (ignore errors if not found)
+	homeDir, _ := os.UserHomeDir()
+	godotenv.Load(".env")                                  // Current directory
+	godotenv.Load(filepath.Join(homeDir, ".env"))          // Home directory
+	godotenv.Load(filepath.Join(homeDir, "git/mind/.env")) // Common project location
+
+	// Load configuration
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	// Initialize logging
+	if err := logging.Init(cfg.DataPath); err != nil {
+		return fmt.Errorf("failed to initialize logging: %w", err)
+	}
+	defer logging.Close()
+
+	logging.Info("Starting aagent HTTP server")
+
+	// Get API key (support both KIMI_API_KEY and ANTHROPIC_API_KEY)
+	apiKey := os.Getenv("KIMI_API_KEY")
+	if apiKey == "" {
+		apiKey = os.Getenv("ANTHROPIC_API_KEY")
+	}
+	if apiKey == "" {
+		logging.Error("KIMI_API_KEY or ANTHROPIC_API_KEY not set")
+		return fmt.Errorf("KIMI_API_KEY or ANTHROPIC_API_KEY environment variable is required")
+	}
+
+	// Initialize storage
+	store, err := storage.NewSQLiteStore(cfg.DataPath)
+	if err != nil {
+		return fmt.Errorf("failed to initialize storage: %w", err)
+	}
+	defer store.Close()
+
+	// Initialize LLM client
+	var llmClient llm.Client
+	baseURL := os.Getenv("ANTHROPIC_BASE_URL")
+	if baseURL == "" {
+		baseURL = "https://api.kimi.com/coding/v1" // Default to Kimi Code API
+	}
+	logging.Info("Using LLM API: %s model=%s", baseURL, cfg.DefaultModel)
+	llmClient = anthropic.NewClientWithBaseURL(apiKey, cfg.DefaultModel, baseURL)
+
+	// Initialize tool manager
+	toolManager := tools.NewManager(cfg.WorkDir)
+
+	// Initialize session manager
+	sessionManager := session.NewManager(store)
+
+	// Create HTTP server
+	server := httpserver.NewServer(cfg, llmClient, toolManager, sessionManager, portFlag)
+
+	// Setup graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		logging.Info("Received shutdown signal")
+		cancel()
+	}()
+
+	// Run server
+	if err := server.Run(ctx); err != nil && err.Error() != "http: Server closed" {
+		return fmt.Errorf("server error: %w", err)
 	}
 
 	return nil

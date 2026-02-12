@@ -401,6 +401,10 @@ type (
 	memoryUpdateMsg struct {
 		memoryMB float64
 	}
+
+	sessionSyncMsg struct {
+		session *session.Session
+	}
 )
 
 // Model represents the TUI state
@@ -459,6 +463,9 @@ type Model struct {
 
 	// Memory tracking
 	memoryMB float64
+
+	// Session sync tracking
+	lastSyncedMessageCount int
 
 	// Error state
 	err error
@@ -529,6 +536,7 @@ func (m Model) Init() tea.Cmd {
 		textarea.Blink,
 		tickCmd(),
 		updateMemoryCmd(),
+		sessionSyncCmd(m.sessionManager, m.session.ID),
 	)
 }
 
@@ -548,6 +556,17 @@ func updateMemoryCmd() tea.Cmd {
 		memoryMB := float64(memStats.Alloc) / 1024 / 1024
 		return memoryUpdateMsg{memoryMB: memoryMB}
 	}
+}
+
+// sessionSyncCmd returns a command that syncs the session from storage
+func sessionSyncCmd(sessionManager *session.Manager, sessionID string) tea.Cmd {
+	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
+		sess, err := sessionManager.Get(sessionID)
+		if err != nil {
+			return nil
+		}
+		return sessionSyncMsg{session: sess}
+	})
 }
 
 // Update handles messages and updates the model
@@ -773,6 +792,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case memoryUpdateMsg:
 		m.memoryMB = msg.memoryMB
 
+	case sessionSyncMsg:
+		if msg.session != nil && !m.processing {
+			// Check if there are new messages from external sources (e.g., web app)
+			if len(msg.session.Messages) > m.lastSyncedMessageCount {
+				// Reload messages from the synced session
+				m.session = msg.session
+				m.messages = make([]message, 0, len(msg.session.Messages))
+				for _, sessionMsg := range msg.session.Messages {
+					m.messages = append(m.messages, message{
+						role:        sessionMsg.Role,
+						content:     sessionMsg.Content,
+						timestamp:   sessionMsg.Timestamp,
+						toolCalls:   sessionMsg.ToolCalls,
+						toolResults: sessionMsg.ToolResults,
+					})
+				}
+				m.lastSyncedMessageCount = len(msg.session.Messages)
+				m.taskSummary = msg.session.Title
+				m.viewport.SetContent(m.renderMessages())
+				m.viewport.GotoBottom()
+			}
+		}
+		// Schedule next sync
+		cmds = append(cmds, sessionSyncCmd(m.sessionManager, m.session.ID))
+
 	case agentResponseMsg:
 		logging.Debug("TUI received agentResponseMsg: done=%v err=%v tokens=%d/%d", msg.done, msg.err != nil, msg.inputTokens, msg.outputTokens)
 
@@ -806,6 +850,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewport.SetContent(m.renderMessages())
 				m.viewport.GotoBottom()
 			}
+			// Update sync counter after agent completes
+			m.lastSyncedMessageCount = len(m.session.Messages)
 
 			// Track interaction and trigger title generation after 2 interactions
 			m.interactionCount++
@@ -1240,6 +1286,9 @@ func (m Model) handleUserInput(input string) Model {
 	m.session.AddUserMessage(input)
 	m.lastUserInputTime = time.Now()
 	m.processing = true
+
+	// Update sync counter to prevent duplicate messages
+	m.lastSyncedMessageCount = len(m.session.Messages)
 
 	// Start agent in background
 	return m
