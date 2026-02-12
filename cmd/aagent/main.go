@@ -18,6 +18,7 @@ import (
 	"github.com/gratheon/aagent/internal/llm/anthropic"
 	"github.com/gratheon/aagent/internal/llm/lmstudio"
 	"github.com/gratheon/aagent/internal/logging"
+	"github.com/gratheon/aagent/internal/scheduler"
 	"github.com/gratheon/aagent/internal/session"
 	"github.com/gratheon/aagent/internal/storage"
 	"github.com/gratheon/aagent/internal/tools"
@@ -133,13 +134,18 @@ func runAgentWithServer(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	server := httpserver.NewServer(cfg, llmClient, toolManager, sessionManager, portFlag)
+	server := httpserver.NewServer(cfg, llmClient, toolManager, sessionManager, store, portFlag)
 	go func() {
 		logging.Info("Starting HTTP server on port %d", portFlag)
 		if err := server.Run(ctx); err != nil && err.Error() != "http: Server closed" {
 			logging.Error("HTTP server error: %v", err)
 		}
 	}()
+
+	// Start scheduler for recurring jobs
+	jobScheduler := scheduler.NewScheduler(store, sessionManager, llmClient, toolManager, cfg)
+	jobScheduler.Start(ctx)
+	defer jobScheduler.Stop()
 
 	// Create or resume session for TUI
 	var sess *session.Session
@@ -374,7 +380,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	sessionManager := session.NewManager(store)
 
 	// Create HTTP server
-	server := httpserver.NewServer(cfg, llmClient, toolManager, sessionManager, portFlag)
+	server := httpserver.NewServer(cfg, llmClient, toolManager, sessionManager, store, portFlag)
 
 	// Setup graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -388,6 +394,11 @@ func runServer(cmd *cobra.Command, args []string) error {
 		logging.Info("Received shutdown signal")
 		cancel()
 	}()
+
+	// Start scheduler for recurring jobs
+	jobScheduler := scheduler.NewScheduler(store, sessionManager, llmClient, toolManager, cfg)
+	jobScheduler.Start(ctx)
+	defer jobScheduler.Stop()
 
 	// Run server
 	if err := server.Run(ctx); err != nil && err.Error() != "http: Server closed" {
