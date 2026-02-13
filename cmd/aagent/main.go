@@ -114,6 +114,11 @@ func runAgentWithServer(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to initialize storage: %w", err)
 	}
 	defer store.Close()
+	if settings, err := store.GetSettings(); err == nil {
+		applySettingsToEnv(settings)
+	} else {
+		logging.Warn("Failed to load persisted settings: %v", err)
+	}
 
 	// Initialize LLM client based on config
 	llmClient, err := initLLMClient(cfg)
@@ -250,6 +255,11 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to initialize storage: %w", err)
 	}
 	defer store.Close()
+	if settings, err := store.GetSettings(); err == nil {
+		applySettingsToEnv(settings)
+	} else {
+		logging.Warn("Failed to load persisted settings: %v", err)
+	}
 
 	// Initialize LLM client
 	// Use Kimi Code API (Anthropic-compatible) at https://api.kimi.com/coding/v1
@@ -363,6 +373,11 @@ func runServer(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to initialize storage: %w", err)
 	}
 	defer store.Close()
+	if settings, err := store.GetSettings(); err == nil {
+		applySettingsToEnv(settings)
+	} else {
+		logging.Warn("Failed to load persisted settings: %v", err)
+	}
 
 	// Initialize LLM client
 	var llmClient llm.Client
@@ -406,6 +421,18 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func applySettingsToEnv(settings map[string]string) {
+	for key, value := range settings {
+		k := strings.TrimSpace(key)
+		if k == "" {
+			continue
+		}
+		if err := os.Setenv(k, value); err != nil {
+			logging.Warn("Failed to set env var %q from settings: %v", k, err)
+		}
+	}
 }
 
 func viewLogs(cmd *cobra.Command, args []string) error {

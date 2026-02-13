@@ -55,6 +55,18 @@ type JobExecution struct {
 	FinishedAt *time.Time
 }
 
+// Integration represents an external channel integration configuration.
+type Integration struct {
+	ID        string
+	Provider  string
+	Name      string
+	Mode      string // "notify_only" | "duplex"
+	Enabled   bool
+	Config    map[string]string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
 // Store defines the interface for session storage
 type Store interface {
 	// Session operations
@@ -75,6 +87,16 @@ type Store interface {
 	SaveJobExecution(exec *JobExecution) error
 	GetJobExecution(id string) (*JobExecution, error)
 	ListJobExecutions(jobID string, limit int) ([]*JobExecution, error)
+
+	// Settings operations
+	GetSettings() (map[string]string, error)
+	SaveSettings(settings map[string]string) error
+
+	// Integrations operations
+	SaveIntegration(integration *Integration) error
+	GetIntegration(id string) (*Integration, error)
+	ListIntegrations() ([]*Integration, error)
+	DeleteIntegration(id string) error
 
 	// Close closes the store
 	Close() error

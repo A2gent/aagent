@@ -92,6 +92,24 @@ func (s *SQLiteStore) migrate() error {
 		// Migration: Add job_id column to sessions
 		`ALTER TABLE sessions ADD COLUMN job_id TEXT`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_job_id ON sessions(job_id)`,
+		// App settings key/value table (secrets/tokens and other runtime settings)
+		`CREATE TABLE IF NOT EXISTS app_settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL,
+			updated_at TIMESTAMP NOT NULL
+		)`,
+		// Channel integrations (Telegram/Slack/Discord/WhatsApp/Webhook)
+		`CREATE TABLE IF NOT EXISTS integrations (
+			id TEXT PRIMARY KEY,
+			provider TEXT NOT NULL,
+			name TEXT NOT NULL,
+			mode TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			config TEXT NOT NULL,
+			created_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_integrations_provider ON integrations(provider)`,
 	}
 
 	for _, m := range migrations {
@@ -531,6 +549,178 @@ func (s *SQLiteStore) ListJobExecutions(jobID string, limit int) ([]*JobExecutio
 	}
 
 	return executions, nil
+}
+
+// GetSettings returns all app settings as key/value pairs.
+func (s *SQLiteStore) GetSettings() (map[string]string, error) {
+	rows, err := s.db.Query(`
+		SELECT key, value
+		FROM app_settings
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	settings := make(map[string]string)
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return nil, err
+		}
+		settings[key] = value
+	}
+
+	return settings, nil
+}
+
+// SaveSettings replaces all app settings with the provided map.
+func (s *SQLiteStore) SaveSettings(settings map[string]string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM app_settings`); err != nil {
+		return fmt.Errorf("failed to clear settings: %w", err)
+	}
+
+	now := time.Now()
+	for key, value := range settings {
+		if key == "" {
+			continue
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO app_settings (key, value, updated_at)
+			VALUES (?, ?, ?)
+		`, key, value, now); err != nil {
+			return fmt.Errorf("failed to save setting %q: %w", key, err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// SaveIntegration saves an integration to the database.
+func (s *SQLiteStore) SaveIntegration(integration *Integration) error {
+	if integration.Config == nil {
+		integration.Config = map[string]string{}
+	}
+
+	configJSON, err := json.Marshal(integration.Config)
+	if err != nil {
+		return fmt.Errorf("failed to encode integration config: %w", err)
+	}
+
+	_, err = s.db.Exec(`
+		INSERT INTO integrations (id, provider, name, mode, enabled, config, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			provider = excluded.provider,
+			name = excluded.name,
+			mode = excluded.mode,
+			enabled = excluded.enabled,
+			config = excluded.config,
+			updated_at = excluded.updated_at
+	`, integration.ID, integration.Provider, integration.Name, integration.Mode, integration.Enabled, string(configJSON), integration.CreatedAt, integration.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("failed to save integration: %w", err)
+	}
+
+	return nil
+}
+
+// GetIntegration returns an integration by id.
+func (s *SQLiteStore) GetIntegration(id string) (*Integration, error) {
+	var integration Integration
+	var enabled int
+	var configJSON string
+
+	err := s.db.QueryRow(`
+		SELECT id, provider, name, mode, enabled, config, created_at, updated_at
+		FROM integrations
+		WHERE id = ?
+	`, id).Scan(
+		&integration.ID,
+		&integration.Provider,
+		&integration.Name,
+		&integration.Mode,
+		&enabled,
+		&configJSON,
+		&integration.CreatedAt,
+		&integration.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("integration not found: %s", id)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	integration.Enabled = enabled == 1
+	if configJSON != "" {
+		if err := json.Unmarshal([]byte(configJSON), &integration.Config); err != nil {
+			return nil, fmt.Errorf("failed to decode integration config: %w", err)
+		}
+	}
+	if integration.Config == nil {
+		integration.Config = map[string]string{}
+	}
+
+	return &integration, nil
+}
+
+// ListIntegrations returns all integrations ordered by creation date.
+func (s *SQLiteStore) ListIntegrations() ([]*Integration, error) {
+	rows, err := s.db.Query(`
+		SELECT id, provider, name, mode, enabled, config, created_at, updated_at
+		FROM integrations
+		ORDER BY created_at DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var integrations []*Integration
+	for rows.Next() {
+		var integration Integration
+		var enabled int
+		var configJSON string
+		if err := rows.Scan(
+			&integration.ID,
+			&integration.Provider,
+			&integration.Name,
+			&integration.Mode,
+			&enabled,
+			&configJSON,
+			&integration.CreatedAt,
+			&integration.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+
+		integration.Enabled = enabled == 1
+		if configJSON != "" {
+			if err := json.Unmarshal([]byte(configJSON), &integration.Config); err != nil {
+				return nil, fmt.Errorf("failed to decode integration config: %w", err)
+			}
+		}
+		if integration.Config == nil {
+			integration.Config = map[string]string{}
+		}
+
+		integrations = append(integrations, &integration)
+	}
+
+	return integrations, nil
+}
+
+// DeleteIntegration deletes an integration by id.
+func (s *SQLiteStore) DeleteIntegration(id string) error {
+	_, err := s.db.Exec(`DELETE FROM integrations WHERE id = ?`, id)
+	return err
 }
 
 // Ensure SQLiteStore implements Store

@@ -10,6 +10,7 @@ import (
 	"github.com/gratheon/aagent/internal/config"
 	"github.com/gratheon/aagent/internal/llm"
 	"github.com/gratheon/aagent/internal/logging"
+	"github.com/gratheon/aagent/internal/notify"
 	"github.com/gratheon/aagent/internal/session"
 	"github.com/gratheon/aagent/internal/storage"
 	"github.com/gratheon/aagent/internal/tools"
@@ -179,6 +180,7 @@ func (s *Scheduler) executeJob(ctx context.Context, job *storage.RecurringJob) {
 		logging.Error("Job %s failed: %v", job.ID, err)
 		exec.Status = "failed"
 		exec.Error = err.Error()
+		notify.SpeakCompletion(notify.BuildCompletionMessage("Scheduled job", "failed"))
 	} else {
 		logging.Info("Job %s completed successfully", job.ID)
 		exec.Status = "success"
@@ -188,6 +190,7 @@ func (s *Scheduler) executeJob(ctx context.Context, job *storage.RecurringJob) {
 		} else {
 			exec.Output = output
 		}
+		notify.SpeakCompletion(output)
 	}
 
 	// Update execution record

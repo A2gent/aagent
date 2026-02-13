@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/gratheon/aagent/internal/config"
 	"github.com/gratheon/aagent/internal/llm"
 	"github.com/gratheon/aagent/internal/logging"
+	"github.com/gratheon/aagent/internal/notify"
 	"github.com/gratheon/aagent/internal/session"
 	"github.com/gratheon/aagent/internal/storage"
 	"github.com/gratheon/aagent/internal/tools"
@@ -76,6 +78,20 @@ func (s *Server) setupRoutes() {
 
 	// Health check
 	r.Get("/health", s.handleHealth)
+
+	// App settings (tokens/secrets/runtime options)
+	r.Get("/settings", s.handleGetSettings)
+	r.Put("/settings", s.handleUpdateSettings)
+
+	// External channel integrations
+	r.Route("/integrations", func(r chi.Router) {
+		r.Get("/", s.handleListIntegrations)
+		r.Post("/", s.handleCreateIntegration)
+		r.Get("/{integrationID}", s.handleGetIntegration)
+		r.Put("/{integrationID}", s.handleUpdateIntegration)
+		r.Delete("/{integrationID}", s.handleDeleteIntegration)
+		r.Post("/{integrationID}/test", s.handleTestIntegration)
+	})
 
 	// Session endpoints
 	r.Route("/sessions", func(r chi.Router) {
@@ -248,11 +264,53 @@ type JobExecutionResponse struct {
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
 }
 
+type SettingsResponse struct {
+	Settings map[string]string `json:"settings"`
+}
+
+type UpdateSettingsRequest struct {
+	Settings map[string]string `json:"settings"`
+}
+
 // --- Handlers ---
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
+	settings, err := s.store.GetSettings()
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to load settings: "+err.Error())
+		return
+	}
+	s.jsonResponse(w, http.StatusOK, SettingsResponse{Settings: settings})
+}
+
+func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
+	var req UpdateSettingsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+	if req.Settings == nil {
+		req.Settings = map[string]string{}
+	}
+
+	oldSettings, err := s.store.GetSettings()
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to load existing settings: "+err.Error())
+		return
+	}
+
+	if err := s.store.SaveSettings(req.Settings); err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to save settings: "+err.Error())
+		return
+	}
+
+	syncSettingsToEnv(oldSettings, req.Settings)
+	s.jsonResponse(w, http.StatusOK, SettingsResponse{Settings: req.Settings})
 }
 
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
@@ -378,9 +436,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Save session state even on error
 		s.sessionManager.Save(sess)
+		notify.SpeakCompletion(notify.BuildCompletionMessage("Agent task", "failed"))
 		s.errorResponse(w, http.StatusInternalServerError, "Agent error: "+err.Error())
 		return
 	}
+	notify.SpeakCompletion(content)
 
 	// Build response with updated messages
 	resp := ChatResponse{
@@ -727,9 +787,11 @@ func (s *Server) executeJob(ctx context.Context, job *storage.RecurringJob) (*st
 	if err != nil {
 		exec.Status = "failed"
 		exec.Error = err.Error()
+		notify.SpeakCompletion(notify.BuildCompletionMessage("Scheduled job", "failed"))
 	} else {
 		exec.Status = "success"
 		exec.Output = output
+		notify.SpeakCompletion(output)
 	}
 
 	// Update execution record
@@ -846,4 +908,30 @@ func (s *Server) jsonResponse(w http.ResponseWriter, status int, data interface{
 func (s *Server) errorResponse(w http.ResponseWriter, status int, message string) {
 	logging.Error("HTTP error: %d - %s", status, message)
 	s.jsonResponse(w, status, map[string]string{"error": message})
+}
+
+func syncSettingsToEnv(previous map[string]string, next map[string]string) {
+	for key := range previous {
+		if _, ok := next[key]; ok {
+			continue
+		}
+		k := strings.TrimSpace(key)
+		if k == "" {
+			continue
+		}
+		if err := os.Unsetenv(k); err != nil {
+			logging.Warn("Failed to unset env var %q removed from settings: %v", k, err)
+		}
+	}
+
+	// Sync user-provided settings into process env so tools/CLI subprocesses can consume them.
+	for key, value := range next {
+		k := strings.TrimSpace(key)
+		if k == "" {
+			continue
+		}
+		if err := os.Setenv(k, value); err != nil {
+			logging.Warn("Failed to set env var %q from settings: %v", k, err)
+		}
+	}
 }

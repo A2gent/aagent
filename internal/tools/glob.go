@@ -77,12 +77,20 @@ func (t *GlobTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 		}
 	}
 
-	// Use filesystem for globbing
-	fsys := os.DirFS(basePath)
-
-	matches, err := doublestar.Glob(fsys, p.Pattern)
+	// Use filesystem for globbing (follows symlinks by default)
+	pattern := filepath.Join(basePath, p.Pattern)
+	matches, err := doublestar.FilepathGlob(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("glob error: %w", err)
+	}
+
+	// Convert absolute paths to relative paths from basePath
+	for i, match := range matches {
+		rel, err := filepath.Rel(basePath, match)
+		if err != nil {
+			rel = match
+		}
+		matches[i] = rel
 	}
 
 	if len(matches) == 0 {

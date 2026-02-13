@@ -106,9 +106,9 @@ func (t *GrepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 		filePattern = "**/" + p.Include
 	}
 
-	// Find files to search
-	fsys := os.DirFS(basePath)
-	files, err := doublestar.Glob(fsys, filePattern)
+	// Find files to search (follows symlinks by default)
+	pattern := filepath.Join(basePath, filePattern)
+	files, err := doublestar.FilepathGlob(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("glob error: %w", err)
 	}
@@ -121,7 +121,8 @@ func (t *GrepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 			return nil, ctx.Err()
 		}
 
-		fullPath := filepath.Join(basePath, file)
+		// FilepathGlob returns absolute paths
+		fullPath := file
 		info, err := os.Stat(fullPath)
 		if err != nil || info.IsDir() {
 			continue
@@ -132,7 +133,13 @@ func (t *GrepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 			continue
 		}
 
-		fileMatches := t.searchFile(fullPath, file, re, info.ModTime().UnixNano())
+		// Get relative path for display
+		relPath, err := filepath.Rel(basePath, fullPath)
+		if err != nil {
+			relPath = file
+		}
+
+		fileMatches := t.searchFile(fullPath, relPath, re, info.ModTime().UnixNano())
 		matches = append(matches, fileMatches...)
 
 		if len(matches) >= maxGrepResults {
