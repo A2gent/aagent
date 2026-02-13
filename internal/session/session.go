@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,6 +25,7 @@ type Session struct {
 	AgentID   string                 `json:"agent_id"`
 	ParentID  *string                `json:"parent_id,omitempty"`
 	JobID     *string                `json:"job_id,omitempty"` // Associated recurring job
+	ProjectID *string                `json:"project_id,omitempty"`
 	Title     string                 `json:"title"`
 	Status    Status                 `json:"status"`
 	Messages  []Message              `json:"messages"`
@@ -98,10 +100,29 @@ func (s *Session) AddMessage(msg Message) {
 
 // AddUserMessage adds a user message
 func (s *Session) AddUserMessage(content string) {
+	if s.Title == "" {
+		s.SetTitle(titleFromFirstPrompt(content))
+	}
+
 	s.AddMessage(Message{
 		Role:    "user",
 		Content: content,
 	})
+}
+
+func titleFromFirstPrompt(prompt string) string {
+	normalized := strings.Join(strings.Fields(strings.TrimSpace(prompt)), " ")
+	if normalized == "" {
+		return ""
+	}
+
+	const maxTitleLength = 60
+	runes := []rune(normalized)
+	if len(runes) <= maxTitleLength {
+		return normalized
+	}
+
+	return string(runes[:maxTitleLength-3]) + "..."
 }
 
 // AddAssistantMessage adds an assistant message
@@ -162,6 +183,7 @@ func (s *Session) ToStorage() *storage.Session {
 		AgentID:   s.AgentID,
 		ParentID:  s.ParentID,
 		JobID:     s.JobID,
+		ProjectID: s.ProjectID,
 		Title:     s.Title,
 		Status:    string(s.Status),
 		Messages:  messages,
@@ -195,6 +217,7 @@ func FromStorage(ss *storage.Session) *Session {
 		AgentID:   ss.AgentID,
 		ParentID:  ss.ParentID,
 		JobID:     ss.JobID,
+		ProjectID: ss.ProjectID,
 		Title:     ss.Title,
 		Status:    Status(ss.Status),
 		Messages:  messages,

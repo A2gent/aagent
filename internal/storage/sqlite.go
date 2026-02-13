@@ -40,6 +40,7 @@ func (s *SQLiteStore) migrate() error {
 			id TEXT PRIMARY KEY,
 			agent_id TEXT NOT NULL,
 			parent_id TEXT,
+			project_id TEXT,
 			title TEXT DEFAULT '',
 			status TEXT NOT NULL,
 			metadata TEXT,
@@ -60,6 +61,9 @@ func (s *SQLiteStore) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_sessions_parent_id ON sessions(parent_id)`,
 		// Migration to add title column if it doesn't exist
 		`ALTER TABLE sessions ADD COLUMN title TEXT DEFAULT ''`,
+		// Migration to add project_id column to sessions
+		`ALTER TABLE sessions ADD COLUMN project_id TEXT`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_project_id ON sessions(project_id)`,
 		// Recurring jobs table
 		`CREATE TABLE IF NOT EXISTS recurring_jobs (
 			id TEXT PRIMARY KEY,
@@ -110,6 +114,15 @@ func (s *SQLiteStore) migrate() error {
 			updated_at TIMESTAMP NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_integrations_provider ON integrations(provider)`,
+		// Projects for optional session grouping
+		`CREATE TABLE IF NOT EXISTS projects (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			folders TEXT NOT NULL DEFAULT '[]',
+			created_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_projects_name ON projects(name)`,
 	}
 
 	for _, m := range migrations {
@@ -135,14 +148,17 @@ func (s *SQLiteStore) SaveSession(sess *Session) error {
 
 	// Upsert session
 	_, err = tx.Exec(`
-		INSERT INTO sessions (id, agent_id, parent_id, job_id, title, status, metadata, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO sessions (id, agent_id, parent_id, job_id, project_id, title, status, metadata, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
+			parent_id = excluded.parent_id,
+			job_id = excluded.job_id,
+			project_id = excluded.project_id,
 			title = excluded.title,
 			status = excluded.status,
 			metadata = excluded.metadata,
 			updated_at = excluded.updated_at
-	`, sess.ID, sess.AgentID, sess.ParentID, sess.JobID, sess.Title, sess.Status, metadata, sess.CreatedAt, sess.UpdatedAt)
+	`, sess.ID, sess.AgentID, sess.ParentID, sess.JobID, sess.ProjectID, sess.Title, sess.Status, metadata, sess.CreatedAt, sess.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("failed to save session: %w", err)
 	}
@@ -173,12 +189,13 @@ func (s *SQLiteStore) GetSession(id string) (*Session, error) {
 	var metadata sql.NullString
 	var parentID sql.NullString
 	var jobID sql.NullString
+	var projectID sql.NullString
 	var title sql.NullString
 
 	err := s.db.QueryRow(`
-		SELECT id, agent_id, parent_id, job_id, title, status, metadata, created_at, updated_at
+		SELECT id, agent_id, parent_id, job_id, project_id, title, status, metadata, created_at, updated_at
 		FROM sessions WHERE id = ?
-	`, id).Scan(&sess.ID, &sess.AgentID, &parentID, &jobID, &title, &sess.Status, &metadata, &sess.CreatedAt, &sess.UpdatedAt)
+	`, id).Scan(&sess.ID, &sess.AgentID, &parentID, &jobID, &projectID, &title, &sess.Status, &metadata, &sess.CreatedAt, &sess.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("session not found: %s", id)
 	}
@@ -191,6 +208,9 @@ func (s *SQLiteStore) GetSession(id string) (*Session, error) {
 	}
 	if jobID.Valid {
 		sess.JobID = &jobID.String
+	}
+	if projectID.Valid {
+		sess.ProjectID = &projectID.String
 	}
 	if title.Valid {
 		sess.Title = title.String
@@ -234,7 +254,7 @@ func (s *SQLiteStore) GetSession(id string) (*Session, error) {
 // ListSessions lists all non-job sessions (regular user sessions)
 func (s *SQLiteStore) ListSessions() ([]*Session, error) {
 	rows, err := s.db.Query(`
-		SELECT id, agent_id, parent_id, job_id, title, status, created_at, updated_at
+		SELECT id, agent_id, parent_id, job_id, project_id, title, status, created_at, updated_at
 		FROM sessions 
 		WHERE job_id IS NULL
 		ORDER BY created_at DESC
@@ -247,10 +267,10 @@ func (s *SQLiteStore) ListSessions() ([]*Session, error) {
 	var sessions []*Session
 	for rows.Next() {
 		var sess Session
-		var parentID, jobID sql.NullString
+		var parentID, jobID, projectID sql.NullString
 		var title sql.NullString
 
-		err := rows.Scan(&sess.ID, &sess.AgentID, &parentID, &jobID, &title, &sess.Status, &sess.CreatedAt, &sess.UpdatedAt)
+		err := rows.Scan(&sess.ID, &sess.AgentID, &parentID, &jobID, &projectID, &title, &sess.Status, &sess.CreatedAt, &sess.UpdatedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -260,6 +280,9 @@ func (s *SQLiteStore) ListSessions() ([]*Session, error) {
 		}
 		if jobID.Valid {
 			sess.JobID = &jobID.String
+		}
+		if projectID.Valid {
+			sess.ProjectID = &projectID.String
 		}
 		if title.Valid {
 			sess.Title = title.String
@@ -274,7 +297,7 @@ func (s *SQLiteStore) ListSessions() ([]*Session, error) {
 // ListSessionsByJob returns all sessions associated with a specific job
 func (s *SQLiteStore) ListSessionsByJob(jobID string) ([]*Session, error) {
 	rows, err := s.db.Query(`
-		SELECT id, agent_id, parent_id, job_id, title, status, created_at, updated_at
+		SELECT id, agent_id, parent_id, job_id, project_id, title, status, created_at, updated_at
 		FROM sessions 
 		WHERE job_id = ?
 		ORDER BY created_at DESC
@@ -287,10 +310,10 @@ func (s *SQLiteStore) ListSessionsByJob(jobID string) ([]*Session, error) {
 	var sessions []*Session
 	for rows.Next() {
 		var sess Session
-		var parentID, jobID sql.NullString
+		var parentID, jobID, projectID sql.NullString
 		var title sql.NullString
 
-		err := rows.Scan(&sess.ID, &sess.AgentID, &parentID, &jobID, &title, &sess.Status, &sess.CreatedAt, &sess.UpdatedAt)
+		err := rows.Scan(&sess.ID, &sess.AgentID, &parentID, &jobID, &projectID, &title, &sess.Status, &sess.CreatedAt, &sess.UpdatedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -300,6 +323,9 @@ func (s *SQLiteStore) ListSessionsByJob(jobID string) ([]*Session, error) {
 		}
 		if jobID.Valid {
 			sess.JobID = &jobID.String
+		}
+		if projectID.Valid {
+			sess.ProjectID = &projectID.String
 		}
 		if title.Valid {
 			sess.Title = title.String
@@ -315,6 +341,114 @@ func (s *SQLiteStore) ListSessionsByJob(jobID string) ([]*Session, error) {
 func (s *SQLiteStore) DeleteSession(id string) error {
 	_, err := s.db.Exec("DELETE FROM sessions WHERE id = ?", id)
 	return err
+}
+
+// SaveProject saves a project to the database.
+func (s *SQLiteStore) SaveProject(project *Project) error {
+	if project.Folders == nil {
+		project.Folders = []string{}
+	}
+
+	foldersJSON, err := json.Marshal(project.Folders)
+	if err != nil {
+		return fmt.Errorf("failed to encode project folders: %w", err)
+	}
+
+	_, err = s.db.Exec(`
+		INSERT INTO projects (id, name, folders, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			name = excluded.name,
+			folders = excluded.folders,
+			updated_at = excluded.updated_at
+	`, project.ID, project.Name, string(foldersJSON), project.CreatedAt, project.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("failed to save project: %w", err)
+	}
+
+	return nil
+}
+
+// GetProject retrieves a project by ID.
+func (s *SQLiteStore) GetProject(id string) (*Project, error) {
+	var project Project
+	var foldersJSON string
+
+	err := s.db.QueryRow(`
+		SELECT id, name, folders, created_at, updated_at
+		FROM projects
+		WHERE id = ?
+	`, id).Scan(&project.ID, &project.Name, &foldersJSON, &project.CreatedAt, &project.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("project not found: %s", id)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if foldersJSON != "" {
+		if err := json.Unmarshal([]byte(foldersJSON), &project.Folders); err != nil {
+			return nil, fmt.Errorf("failed to decode project folders: %w", err)
+		}
+	}
+	if project.Folders == nil {
+		project.Folders = []string{}
+	}
+
+	return &project, nil
+}
+
+// ListProjects returns all projects ordered by name.
+func (s *SQLiteStore) ListProjects() ([]*Project, error) {
+	rows, err := s.db.Query(`
+		SELECT id, name, folders, created_at, updated_at
+		FROM projects
+		ORDER BY name COLLATE NOCASE ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var projects []*Project
+	for rows.Next() {
+		var project Project
+		var foldersJSON string
+		if err := rows.Scan(&project.ID, &project.Name, &foldersJSON, &project.CreatedAt, &project.UpdatedAt); err != nil {
+			return nil, err
+		}
+
+		if foldersJSON != "" {
+			if err := json.Unmarshal([]byte(foldersJSON), &project.Folders); err != nil {
+				return nil, fmt.Errorf("failed to decode project folders: %w", err)
+			}
+		}
+		if project.Folders == nil {
+			project.Folders = []string{}
+		}
+
+		projects = append(projects, &project)
+	}
+
+	return projects, nil
+}
+
+// DeleteProject deletes a project and unassigns sessions that referenced it.
+func (s *SQLiteStore) DeleteProject(id string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`UPDATE sessions SET project_id = NULL WHERE project_id = ?`, id); err != nil {
+		return fmt.Errorf("failed to unassign sessions from project: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM projects WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("failed to delete project: %w", err)
+	}
+
+	return tx.Commit()
 }
 
 // Close closes the database connection

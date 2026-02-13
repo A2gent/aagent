@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -969,14 +970,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Update sync counter after agent completes
 			m.lastSyncedMessageCount = len(m.session.Messages)
 
-			// Track interaction and trigger title generation after 2 interactions
-			m.interactionCount++
-			if m.interactionCount >= 2 && !m.titleGenerated && len(m.queuedMessages) == 0 {
-				// Only generate title if no queued messages to avoid interference
-				m.titleGenerated = true
-				cmds = append(cmds, m.generateTitle())
-			}
-
 			// Process queued messages
 			if len(m.queuedMessages) > 0 {
 				// Get the first queued message
@@ -1438,6 +1431,13 @@ func (m Model) runAgent(input string) (tea.Cmd, context.CancelFunc) {
 	sess := m.session
 
 	cmd := func() tea.Msg {
+		if err := m.validateActiveProviderConfig(); err != nil {
+			sess.AddAssistantMessage(fmt.Sprintf("Unable to start request: %s", err.Error()), nil)
+			sess.SetStatus(session.StatusFailed)
+			_ = m.sessionManager.Save(sess)
+			return agentResponseMsg{err: err}
+		}
+
 		result, usage, err := agent.Run(ctx, sess, input)
 		if err != nil {
 			return agentResponseMsg{err: err}
@@ -1571,8 +1571,6 @@ func (m Model) createNewSession() (tea.Model, tea.Cmd) {
 	m.taskSummary = ""
 	m.totalInputTokens = 0
 	m.totalOutputTokens = 0
-	m.interactionCount = 0
-	m.titleGenerated = false
 	m.queuedMessages = nil
 	m.lastUserInputTime = time.Now()
 
@@ -1641,8 +1639,6 @@ func (m Model) switchToSession(sessionID string) Model {
 	m.taskSummary = newSess.Title
 	m.totalInputTokens = 0
 	m.totalOutputTokens = 0
-	m.interactionCount = len(newSess.Messages) / 2 // Rough estimate
-	m.titleGenerated = newSess.Title != ""
 	m.queuedMessages = nil
 	m.lastUserInputTime = time.Now()
 
@@ -1668,8 +1664,6 @@ func (m Model) clearConversation() (tea.Model, tea.Cmd) {
 	m.session.Messages = nil
 	m.totalInputTokens = 0
 	m.totalOutputTokens = 0
-	m.interactionCount = 0
-	m.titleGenerated = false
 	m.queuedMessages = nil
 	m.sessionManager.Save(m.session)
 
@@ -1974,6 +1968,10 @@ func (m Model) activateProvider(providerType config.ProviderType) (tea.Model, te
 func (m Model) createLLMClient(providerType config.ProviderType) llm.Client {
 	provider := m.appConfig.Providers[string(providerType)]
 	providerDef := config.GetProviderDefinition(providerType)
+	apiKey := strings.TrimSpace(provider.APIKey)
+	if apiKey == "" {
+		apiKey = providerAPIKeyFromEnv(providerType)
+	}
 
 	switch providerType {
 	case config.ProviderLMStudio:
@@ -1981,7 +1979,7 @@ func (m Model) createLLMClient(providerType config.ProviderType) llm.Client {
 		if baseURL == "" {
 			baseURL = providerDef.DefaultURL
 		}
-		return lmstudio.NewClient(provider.APIKey, provider.Model, baseURL)
+		return lmstudio.NewClient(apiKey, provider.Model, baseURL)
 	default:
 		// For Anthropic-compatible providers (Kimi, Anthropic)
 		baseURL := provider.BaseURL
@@ -1989,7 +1987,54 @@ func (m Model) createLLMClient(providerType config.ProviderType) llm.Client {
 			baseURL = providerDef.DefaultURL
 		}
 		// Import and use anthropic client
-		return anthropic.NewClientWithBaseURL(provider.APIKey, provider.Model, baseURL)
+		return anthropic.NewClientWithBaseURL(apiKey, provider.Model, baseURL)
+	}
+}
+
+func (m Model) validateActiveProviderConfig() error {
+	if m.appConfig == nil {
+		return nil
+	}
+	providerType := config.ProviderType(strings.TrimSpace(m.appConfig.ActiveProvider))
+	def := config.GetProviderDefinition(providerType)
+	if def == nil {
+		return fmt.Errorf("unknown active provider: %s", providerType)
+	}
+	if !def.RequiresKey {
+		return nil
+	}
+
+	provider := m.appConfig.Providers[string(providerType)]
+	apiKey := strings.TrimSpace(provider.APIKey)
+	if apiKey == "" {
+		apiKey = providerAPIKeyFromEnv(providerType)
+	}
+	if apiKey == "" {
+		envName := providerAPIKeyEnvName(providerType)
+		if envName != "" {
+			return fmt.Errorf("%s API key is missing. Configure provider settings (/provider) or set %s", def.DisplayName, envName)
+		}
+		return fmt.Errorf("%s API key is missing. Configure provider settings with /provider", def.DisplayName)
+	}
+	return nil
+}
+
+func providerAPIKeyFromEnv(providerType config.ProviderType) string {
+	envName := providerAPIKeyEnvName(providerType)
+	if envName == "" {
+		return ""
+	}
+	return strings.TrimSpace(os.Getenv(envName))
+}
+
+func providerAPIKeyEnvName(providerType config.ProviderType) string {
+	switch providerType {
+	case config.ProviderKimi:
+		return "KIMI_API_KEY"
+	case config.ProviderAnthropic:
+		return "ANTHROPIC_API_KEY"
+	default:
+		return ""
 	}
 }
 

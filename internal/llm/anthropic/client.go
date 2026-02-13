@@ -1,12 +1,14 @@
 package anthropic
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gratheon/aagent/internal/llm"
@@ -59,6 +61,7 @@ type anthropicRequest struct {
 	MaxTokens   int                `json:"max_tokens"`
 	Temperature float64            `json:"temperature,omitempty"`
 	Tools       []anthropicTool    `json:"tools,omitempty"`
+	Stream      bool               `json:"stream,omitempty"`
 }
 
 type anthropicMessage struct {
@@ -100,6 +103,27 @@ type anthropicResponse struct {
 type anthropicError struct {
 	Type    string `json:"type"`
 	Message string `json:"message"`
+}
+
+type anthropicStreamEvent struct {
+	Type  string `json:"type"`
+	Index int    `json:"index"`
+	Usage struct {
+		InputTokens  int `json:"input_tokens"`
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage"`
+	ContentBlock struct {
+		Type string `json:"type"`
+		ID   string `json:"id"`
+		Name string `json:"name"`
+		Text string `json:"text"`
+	} `json:"content_block"`
+	Delta struct {
+		Type        string `json:"type"`
+		Text        string `json:"text"`
+		PartialJSON string `json:"partial_json"`
+		StopReason  string `json:"stop_reason"`
+	} `json:"delta"`
 }
 
 // Chat sends a chat request to Anthropic
@@ -232,6 +256,187 @@ func (c *Client) Chat(ctx context.Context, request *llm.ChatRequest) (*llm.ChatR
 	return response, nil
 }
 
+// ChatStream sends a streaming chat request to Anthropic.
+func (c *Client) ChatStream(ctx context.Context, request *llm.ChatRequest, onEvent func(llm.StreamEvent) error) (*llm.ChatResponse, error) {
+	model := request.Model
+	if model == "" {
+		model = c.model
+	}
+
+	maxTokens := request.MaxTokens
+	if maxTokens == 0 {
+		maxTokens = defaultMaxTokens
+	}
+
+	lastMsg := ""
+	if len(request.Messages) > 0 {
+		lastMsg = request.Messages[len(request.Messages)-1].Content
+	}
+	logging.LogRequestWithContent(model, len(request.Messages), len(request.Tools) > 0, lastMsg)
+
+	messages := make([]anthropicMessage, 0, len(request.Messages))
+	for _, msg := range request.Messages {
+		messages = append(messages, c.convertMessage(msg))
+	}
+
+	tools := make([]anthropicTool, 0, len(request.Tools))
+	for _, t := range request.Tools {
+		tools = append(tools, anthropicTool{
+			Name:        t.Name,
+			Description: t.Description,
+			InputSchema: t.InputSchema,
+		})
+	}
+
+	reqBody := anthropicRequest{
+		Model:       model,
+		Messages:    messages,
+		System:      request.SystemPrompt,
+		MaxTokens:   maxTokens,
+		Temperature: request.Temperature,
+		Tools:       tools,
+		Stream:      true,
+	}
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/messages", bytes.NewReader(jsonBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-api-key", c.apiKey)
+	httpReq.Header.Set("anthropic-version", defaultAPIVersion)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		var errResp struct {
+			Error anthropicError `json:"error"`
+		}
+		_ = json.Unmarshal(body, &errResp)
+		err := fmt.Errorf("API error (%d): %s", resp.StatusCode, errResp.Error.Message)
+		logging.LogResponse(0, 0, 0, err)
+		logging.Debug("Response body: %s", string(body))
+		return nil, err
+	}
+
+	result := &llm.ChatResponse{}
+	toolByBlockIndex := map[int]int{}
+	currentEvent := ""
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			currentEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+
+		if currentEvent == "ping" {
+			continue
+		}
+
+		var ev anthropicStreamEvent
+		if err := json.Unmarshal([]byte(payload), &ev); err != nil {
+			return nil, fmt.Errorf("failed to parse stream event %q: %w", currentEvent, err)
+		}
+
+		switch currentEvent {
+		case "message_start":
+			result.Usage.InputTokens = ev.Usage.InputTokens
+			result.Usage.OutputTokens = ev.Usage.OutputTokens
+			if onEvent != nil {
+				if err := onEvent(llm.StreamEvent{Type: llm.StreamEventUsage, Usage: result.Usage}); err != nil {
+					return nil, err
+				}
+			}
+		case "content_block_start":
+			if ev.ContentBlock.Type == "tool_use" {
+				result.ToolCalls = append(result.ToolCalls, llm.ToolCall{
+					ID:   ev.ContentBlock.ID,
+					Name: ev.ContentBlock.Name,
+				})
+				toolByBlockIndex[ev.Index] = len(result.ToolCalls) - 1
+			}
+		case "content_block_delta":
+			if ev.Delta.Type == "text_delta" && ev.Delta.Text != "" {
+				result.Content += ev.Delta.Text
+				if onEvent != nil {
+					if err := onEvent(llm.StreamEvent{
+						Type:         llm.StreamEventContentDelta,
+						ContentDelta: ev.Delta.Text,
+					}); err != nil {
+						return nil, err
+					}
+				}
+			}
+			if ev.Delta.Type == "input_json_delta" && ev.Delta.PartialJSON != "" {
+				if tcIdx, ok := toolByBlockIndex[ev.Index]; ok {
+					result.ToolCalls[tcIdx].Input += ev.Delta.PartialJSON
+					if onEvent != nil {
+						tc := result.ToolCalls[tcIdx]
+						if err := onEvent(llm.StreamEvent{
+							Type:           llm.StreamEventToolCallDelta,
+							ToolCallIndex:  ev.Index,
+							ToolCallID:     tc.ID,
+							ToolCallName:   tc.Name,
+							ToolInputDelta: ev.Delta.PartialJSON,
+						}); err != nil {
+							return nil, err
+						}
+					}
+				}
+			}
+		case "message_delta":
+			if ev.Delta.StopReason != "" {
+				result.StopReason = ev.Delta.StopReason
+			}
+			if ev.Usage.OutputTokens > 0 || ev.Usage.InputTokens > 0 {
+				if ev.Usage.InputTokens > 0 {
+					result.Usage.InputTokens = ev.Usage.InputTokens
+				}
+				result.Usage.OutputTokens = ev.Usage.OutputTokens
+				if onEvent != nil {
+					if err := onEvent(llm.StreamEvent{Type: llm.StreamEventUsage, Usage: result.Usage}); err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("stream read error: %w", err)
+	}
+
+	toolNames := make([]string, len(result.ToolCalls))
+	for i, tc := range result.ToolCalls {
+		toolNames[i] = tc.Name
+	}
+	logging.LogResponseWithContent(result.Usage.InputTokens, result.Usage.OutputTokens, len(result.ToolCalls), result.Content, toolNames)
+	return result, nil
+}
+
 // convertMessage converts an LLM message to Anthropic format
 func (c *Client) convertMessage(msg llm.Message) anthropicMessage {
 	if msg.Role == "tool" {
@@ -285,3 +490,4 @@ func (c *Client) convertMessage(msg llm.Message) anthropicMessage {
 
 // Ensure Client implements llm.Client
 var _ llm.Client = (*Client)(nil)
+var _ llm.StreamingClient = (*Client)(nil)

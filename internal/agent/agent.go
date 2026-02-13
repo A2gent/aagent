@@ -28,6 +28,23 @@ type Agent struct {
 	sessionManager *session.Manager
 }
 
+// EventType is emitted while the agent executes a run.
+type EventType string
+
+const (
+	EventAssistantDelta EventType = "assistant_delta"
+	EventStepCompleted  EventType = "step_completed"
+	EventToolExecuting  EventType = "tool_executing"
+	EventToolCompleted  EventType = "tool_completed"
+)
+
+// Event describes a streaming update from the agent.
+type Event struct {
+	Type  EventType
+	Step  int
+	Delta string
+}
+
 // New creates a new agent
 func New(config Config, llmClient llm.Client, toolManager *tools.Manager, sessionManager *session.Manager) *Agent {
 	if config.MaxSteps == 0 {
@@ -48,10 +65,15 @@ func New(config Config, llmClient llm.Client, toolManager *tools.Manager, sessio
 // Run executes the agent with the given task
 // Returns the response content and total token usage
 func (a *Agent) Run(ctx context.Context, sess *session.Session, task string) (string, llm.TokenUsage, error) {
+	return a.RunWithEvents(ctx, sess, task, nil)
+}
+
+// RunWithEvents executes the agent and emits streaming events when available.
+func (a *Agent) RunWithEvents(ctx context.Context, sess *session.Session, task string, onEvent func(Event)) (string, llm.TokenUsage, error) {
 	logging.Info("Agent run started: session=%s", sess.ID)
 	// Note: User message is already added by the TUI before calling Run
 	// Run the agentic loop
-	result, usage, err := a.loop(ctx, sess)
+	result, usage, err := a.loop(ctx, sess, onEvent)
 	if err != nil {
 		logging.Error("Agent run failed: %v", err)
 	} else {
@@ -62,7 +84,7 @@ func (a *Agent) Run(ctx context.Context, sess *session.Session, task string) (st
 
 // loop implements the main agentic loop
 // Returns the response content and total token usage
-func (a *Agent) loop(ctx context.Context, sess *session.Session) (string, llm.TokenUsage, error) {
+func (a *Agent) loop(ctx context.Context, sess *session.Session, onEvent func(Event)) (string, llm.TokenUsage, error) {
 	step := 0
 	totalUsage := llm.TokenUsage{}
 
@@ -90,8 +112,8 @@ func (a *Agent) loop(ctx context.Context, sess *session.Session) (string, llm.To
 		// Build chat request
 		request := a.buildRequest(sess)
 
-		// Call LLM
-		response, err := a.llmClient.Chat(ctx, request)
+		// Call LLM (streaming when supported)
+		response, err := a.callLLM(ctx, request, step, onEvent)
 		if err != nil {
 			sess.SetStatus(session.StatusFailed)
 			a.sessionManager.Save(sess)
@@ -108,6 +130,9 @@ func (a *Agent) loop(ctx context.Context, sess *session.Session) (string, llm.To
 			sess.AddAssistantMessage(response.Content, nil)
 			sess.SetStatus(session.StatusCompleted)
 			a.sessionManager.Save(sess)
+			if onEvent != nil {
+				onEvent(Event{Type: EventStepCompleted, Step: step})
+			}
 			return response.Content, totalUsage, nil
 		}
 
@@ -125,6 +150,9 @@ func (a *Agent) loop(ctx context.Context, sess *session.Session) (string, llm.To
 		sess.AddAssistantMessage(response.Content, sessionToolCalls)
 
 		// Execute tools
+		if onEvent != nil {
+			onEvent(Event{Type: EventToolExecuting, Step: step})
+		}
 		toolResults := a.toolManager.ExecuteParallel(ctx, response.ToolCalls)
 
 		// Convert results
@@ -145,7 +173,32 @@ func (a *Agent) loop(ctx context.Context, sess *session.Session) (string, llm.To
 			// Silently continue on save errors
 			_ = err
 		}
+		if onEvent != nil {
+			onEvent(Event{Type: EventToolCompleted, Step: step})
+			onEvent(Event{Type: EventStepCompleted, Step: step})
+		}
 	}
+}
+
+func (a *Agent) callLLM(ctx context.Context, request *llm.ChatRequest, step int, onEvent func(Event)) (*llm.ChatResponse, error) {
+	streamClient, ok := a.llmClient.(llm.StreamingClient)
+	if !ok {
+		return a.llmClient.Chat(ctx, request)
+	}
+
+	return streamClient.ChatStream(ctx, request, func(ev llm.StreamEvent) error {
+		if onEvent == nil {
+			return nil
+		}
+		if ev.Type == llm.StreamEventContentDelta && ev.ContentDelta != "" {
+			onEvent(Event{
+				Type:  EventAssistantDelta,
+				Step:  step,
+				Delta: ev.ContentDelta,
+			})
+		}
+		return nil
+	})
 }
 
 // buildRequest builds a chat request from the session

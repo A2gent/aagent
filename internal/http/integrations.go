@@ -13,11 +13,13 @@ import (
 )
 
 var supportedIntegrationProviders = map[string]struct{}{
-	"telegram": {},
-	"slack":    {},
-	"discord":  {},
-	"whatsapp": {},
-	"webhook":  {},
+	"telegram":        {},
+	"slack":           {},
+	"discord":         {},
+	"whatsapp":        {},
+	"webhook":         {},
+	"elevenlabs":      {},
+	"google_calendar": {},
 }
 
 var supportedIntegrationModes = map[string]struct{}{
@@ -26,11 +28,13 @@ var supportedIntegrationModes = map[string]struct{}{
 }
 
 var requiredConfigFields = map[string][]string{
-	"telegram": {"bot_token", "chat_id"},
-	"slack":    {"bot_token", "channel_id"},
-	"discord":  {"bot_token", "channel_id"},
-	"whatsapp": {"access_token", "phone_number_id", "recipient"},
-	"webhook":  {"url"},
+	"telegram":        {"bot_token", "chat_id"},
+	"slack":           {"bot_token", "channel_id"},
+	"discord":         {"bot_token", "channel_id"},
+	"whatsapp":        {"access_token", "phone_number_id", "recipient"},
+	"webhook":         {"url"},
+	"elevenlabs":      {"api_key"},
+	"google_calendar": {"client_id", "client_secret", "refresh_token"},
 }
 
 type IntegrationRequest struct {
@@ -278,6 +282,10 @@ func defaultIntegrationName(provider string) string {
 		return "WhatsApp"
 	case "webhook":
 		return "Webhook"
+	case "google_calendar":
+		return "Google Calendar"
+	case "elevenlabs":
+		return "ElevenLabs"
 	default:
 		return provider
 	}

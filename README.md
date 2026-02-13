@@ -7,10 +7,22 @@ A Go-based autonomous AI coding agent that executes tasks in sessions.
 - **TUI Interface**: Beautiful terminal UI with scrollable history, multi-line input, and real-time status
 - **Agentic Loop**: Receive task → call LLM with tools → execute tool calls → return results → repeat until complete
 - **Session Persistence**: SQLite-based session storage with resumption support
+- **Session Relationships**: Supports parent/child sessions (`parent_id`) and recurring-job sessions (`job_id`)
 - **Tool System**: Modular, extensible tools (bash, read, write, edit, glob, grep)
 - **Kimi Code**: Uses Kimi Code API (Anthropic-compatible) as the LLM backend
 - **Live Metrics**: Token usage tracking and context window percentage display
 - **File Logging**: All operations logged to file for debugging
+
+## Session Model (Important)
+
+- Sessions are persisted in a single SQLite store (`AAGENT_DATA_PATH` / `config.data_path`).
+- A session has `id`, `agent_id`, `title`, `status`, timestamps, and optional `parent_id` / `job_id`.
+- Session metadata exists internally, but there is currently no first-class `project` or `folder` field in the HTTP session API.
+- The HTTP `/sessions` list endpoint does not support grouping or filtering by project/folder today.
+
+Current scope:
+- Supported grouping: sub-sessions via `parent_id`, job-related sessions via `job_id`.
+- Not currently implemented: project-based session grouping tied to filesystem folders in the frontend/API.
 
 ## Installation
 

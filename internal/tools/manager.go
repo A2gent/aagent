@@ -9,6 +9,7 @@ import (
 
 	"github.com/gratheon/aagent/internal/llm"
 	"github.com/gratheon/aagent/internal/logging"
+	"github.com/gratheon/aagent/internal/storage"
 )
 
 // Tool defines the interface for executable tools
@@ -48,6 +49,15 @@ func NewManager(workDir string) *Manager {
 	m.Register(NewGlobTool(workDir))
 	m.Register(NewGrepTool(workDir))
 
+	return m
+}
+
+// NewManagerWithStore creates a tool manager and registers store-backed tools.
+func NewManagerWithStore(workDir string, store storage.Store) *Manager {
+	m := NewManager(workDir)
+	if store != nil {
+		m.Register(NewGoogleCalendarQueryTool(store))
+	}
 	return m
 }
 

@@ -14,13 +14,20 @@ import (
 
 const speechTimeout = 10 * time.Second
 
+const (
+	completionAudioModeOff       = "off"
+	completionAudioModeSystem    = "system"
+	completionAudioModeElevenLab = "elevenlabs"
+)
+
 // SpeakCompletion announces task completion via sag, then falls back to macOS say.
 func SpeakCompletion(message string) {
 	if strings.TrimSpace(message) == "" {
 		message = "Task complete"
 	}
 
-	if !speechEnabled() {
+	mode := completionAudioMode()
+	if mode == completionAudioModeOff {
 		return
 	}
 
@@ -39,12 +46,22 @@ func SpeakCompletion(message string) {
 	}(message)
 }
 
-func speechEnabled() bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv("AAGENT_SPEECH_ENABLED")))
-	if v == "" {
-		return false
+func completionAudioMode() string {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("AAGENT_COMPLETION_AUDIO_MODE")))
+	switch mode {
+	case completionAudioModeOff, completionAudioModeSystem, completionAudioModeElevenLab:
+		return mode
+	case "":
+		// Backward compatibility for existing boolean setting.
+		v := strings.ToLower(strings.TrimSpace(os.Getenv("AAGENT_SPEECH_ENABLED")))
+		if v == "1" || v == "true" || v == "yes" || v == "on" {
+			return completionAudioModeSystem
+		}
+		return completionAudioModeOff
+	default:
+		// Fail-safe: unknown mode defaults to off.
+		return completionAudioModeOff
 	}
-	return v == "1" || v == "true" || v == "yes" || v == "on"
 }
 
 func trySag(ctx context.Context, message string) bool {

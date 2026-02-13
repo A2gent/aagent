@@ -130,7 +130,7 @@ func runAgentWithServer(cmd *cobra.Command, args []string) error {
 	}
 
 	// Initialize tool manager
-	toolManager := tools.NewManager(cfg.WorkDir)
+	toolManager := tools.NewManagerWithStore(cfg.WorkDir, store)
 
 	// Initialize session manager
 	sessionManager := session.NewManager(store)
@@ -272,7 +272,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	llmClient = anthropic.NewClientWithBaseURL(apiKey, cfg.DefaultModel, baseURL)
 
 	// Initialize tool manager
-	toolManager := tools.NewManager(cfg.WorkDir)
+	toolManager := tools.NewManagerWithStore(cfg.WorkDir, store)
 
 	// Initialize session manager
 	sessionManager := session.NewManager(store)
@@ -389,7 +389,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	llmClient = anthropic.NewClientWithBaseURL(apiKey, cfg.DefaultModel, baseURL)
 
 	// Initialize tool manager
-	toolManager := tools.NewManager(cfg.WorkDir)
+	toolManager := tools.NewManagerWithStore(cfg.WorkDir, store)
 
 	// Initialize session manager
 	sessionManager := session.NewManager(store)

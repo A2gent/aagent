@@ -9,6 +9,11 @@ type Client interface {
 	Chat(ctx context.Context, request *ChatRequest) (*ChatResponse, error)
 }
 
+// StreamingClient defines optional streaming support for LLM providers.
+type StreamingClient interface {
+	ChatStream(ctx context.Context, request *ChatRequest, onEvent func(StreamEvent) error) (*ChatResponse, error)
+}
+
 // ChatRequest represents a chat completion request
 type ChatRequest struct {
 	Model        string
@@ -54,6 +59,29 @@ type ChatResponse struct {
 	ToolCalls  []ToolCall
 	Usage      TokenUsage
 	StopReason string
+}
+
+// StreamEventType is the type of a streaming event.
+type StreamEventType string
+
+const (
+	StreamEventContentDelta  StreamEventType = "content_delta"
+	StreamEventToolCallDelta StreamEventType = "tool_call_delta"
+	StreamEventUsage         StreamEventType = "usage"
+)
+
+// StreamEvent is emitted during a streaming LLM response.
+type StreamEvent struct {
+	Type StreamEventType
+
+	ContentDelta string
+
+	ToolCallIndex  int
+	ToolCallID     string
+	ToolCallName   string
+	ToolInputDelta string
+
+	Usage TokenUsage
 }
 
 // TokenUsage tracks token consumption

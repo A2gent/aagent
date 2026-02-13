@@ -11,6 +11,7 @@ type Session struct {
 	AgentID   string
 	ParentID  *string
 	JobID     *string // Associated recurring job (nil for regular sessions)
+	ProjectID *string // Associated project (nil for ungrouped sessions)
 	Title     string
 	Status    string
 	Messages  []Message
@@ -67,6 +68,15 @@ type Integration struct {
 	UpdatedAt time.Time
 }
 
+// Project represents a session grouping container optionally tied to one or more folders.
+type Project struct {
+	ID        string
+	Name      string
+	Folders   []string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
 // Store defines the interface for session storage
 type Store interface {
 	// Session operations
@@ -75,6 +85,12 @@ type Store interface {
 	ListSessions() ([]*Session, error)                  // Returns only non-job sessions
 	ListSessionsByJob(jobID string) ([]*Session, error) // Returns sessions for a specific job
 	DeleteSession(id string) error
+
+	// Project operations
+	SaveProject(project *Project) error
+	GetProject(id string) (*Project, error)
+	ListProjects() ([]*Project, error)
+	DeleteProject(id string) error
 
 	// Recurring job operations
 	SaveJob(job *RecurringJob) error
