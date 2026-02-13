@@ -95,6 +95,7 @@ func (s *Server) setupRoutes() {
 		r.Delete("/{jobID}", s.handleDeleteJob)
 		r.Post("/{jobID}/run", s.handleRunJobNow)
 		r.Get("/{jobID}/executions", s.handleListJobExecutions)
+		r.Get("/{jobID}/sessions", s.handleListJobSessions)
 	})
 
 	s.router = r
@@ -583,6 +584,37 @@ func (s *Server) handleListJobExecutions(w http.ResponseWriter, r *http.Request)
 	resp := make([]JobExecutionResponse, len(executions))
 	for i, exec := range executions {
 		resp[i] = s.executionToResponse(exec)
+	}
+
+	s.jsonResponse(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleListJobSessions(w http.ResponseWriter, r *http.Request) {
+	jobID := chi.URLParam(r, "jobID")
+
+	// First verify the job exists
+	_, err := s.store.GetJob(jobID)
+	if err != nil {
+		s.errorResponse(w, http.StatusNotFound, "Job not found: "+err.Error())
+		return
+	}
+
+	sessions, err := s.store.ListSessionsByJob(jobID)
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to list sessions: "+err.Error())
+		return
+	}
+
+	resp := make([]SessionListItem, len(sessions))
+	for i, sess := range sessions {
+		resp[i] = SessionListItem{
+			ID:        sess.ID,
+			AgentID:   sess.AgentID,
+			Title:     sess.Title,
+			Status:    sess.Status,
+			CreatedAt: sess.CreatedAt,
+			UpdatedAt: sess.UpdatedAt,
+		}
 	}
 
 	s.jsonResponse(w, http.StatusOK, resp)

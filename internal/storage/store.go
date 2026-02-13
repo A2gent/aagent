@@ -10,6 +10,7 @@ type Session struct {
 	ID        string
 	AgentID   string
 	ParentID  *string
+	JobID     *string // Associated recurring job (nil for regular sessions)
 	Title     string
 	Status    string
 	Messages  []Message
@@ -59,7 +60,8 @@ type Store interface {
 	// Session operations
 	SaveSession(sess *Session) error
 	GetSession(id string) (*Session, error)
-	ListSessions() ([]*Session, error)
+	ListSessions() ([]*Session, error)                  // Returns only non-job sessions
+	ListSessionsByJob(jobID string) ([]*Session, error) // Returns sessions for a specific job
 	DeleteSession(id string) error
 
 	// Recurring job operations

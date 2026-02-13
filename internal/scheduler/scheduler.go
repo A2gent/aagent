@@ -143,7 +143,7 @@ func (s *Scheduler) executeJob(ctx context.Context, job *storage.RecurringJob) {
 	}
 
 	// Create a session for this job execution
-	sess, err := s.sessionManager.Create("job-runner")
+	sess, err := s.sessionManager.CreateWithJob("job-runner", job.ID)
 	if err != nil {
 		logging.Error("Failed to create session for job %s: %v", job.ID, err)
 		exec.Status = "failed"

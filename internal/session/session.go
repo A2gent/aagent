@@ -23,6 +23,7 @@ type Session struct {
 	ID        string                 `json:"id"`
 	AgentID   string                 `json:"agent_id"`
 	ParentID  *string                `json:"parent_id,omitempty"`
+	JobID     *string                `json:"job_id,omitempty"` // Associated recurring job
 	Title     string                 `json:"title"`
 	Status    Status                 `json:"status"`
 	Messages  []Message              `json:"messages"`
@@ -73,6 +74,13 @@ func New(agentID string) *Session {
 func NewWithParent(agentID string, parentID string) *Session {
 	sess := New(agentID)
 	sess.ParentID = &parentID
+	return sess
+}
+
+// NewWithJob creates a new session associated with a recurring job
+func NewWithJob(agentID string, jobID string) *Session {
+	sess := New(agentID)
+	sess.JobID = &jobID
 	return sess
 }
 
@@ -153,6 +161,7 @@ func (s *Session) ToStorage() *storage.Session {
 		ID:        s.ID,
 		AgentID:   s.AgentID,
 		ParentID:  s.ParentID,
+		JobID:     s.JobID,
 		Title:     s.Title,
 		Status:    string(s.Status),
 		Messages:  messages,
@@ -185,6 +194,7 @@ func FromStorage(ss *storage.Session) *Session {
 		ID:        ss.ID,
 		AgentID:   ss.AgentID,
 		ParentID:  ss.ParentID,
+		JobID:     ss.JobID,
 		Title:     ss.Title,
 		Status:    Status(ss.Status),
 		Messages:  messages,

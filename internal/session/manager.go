@@ -34,6 +34,15 @@ func (m *Manager) CreateWithParent(agentID, parentID string) (*Session, error) {
 	return sess, nil
 }
 
+// CreateWithJob creates a new session associated with a recurring job
+func (m *Manager) CreateWithJob(agentID, jobID string) (*Session, error) {
+	sess := NewWithJob(agentID, jobID)
+	if err := m.store.SaveSession(sess.ToStorage()); err != nil {
+		return nil, fmt.Errorf("failed to save session: %w", err)
+	}
+	return sess, nil
+}
+
 // Get retrieves a session by ID
 func (m *Manager) Get(id string) (*Session, error) {
 	ss, err := m.store.GetSession(id)

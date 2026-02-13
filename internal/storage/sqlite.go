@@ -89,6 +89,9 @@ func (s *SQLiteStore) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_job_executions_job_id ON job_executions(job_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_job_executions_started_at ON job_executions(started_at)`,
+		// Migration: Add job_id column to sessions
+		`ALTER TABLE sessions ADD COLUMN job_id TEXT`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_job_id ON sessions(job_id)`,
 	}
 
 	for _, m := range migrations {
@@ -114,14 +117,14 @@ func (s *SQLiteStore) SaveSession(sess *Session) error {
 
 	// Upsert session
 	_, err = tx.Exec(`
-		INSERT INTO sessions (id, agent_id, parent_id, title, status, metadata, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO sessions (id, agent_id, parent_id, job_id, title, status, metadata, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			title = excluded.title,
 			status = excluded.status,
 			metadata = excluded.metadata,
 			updated_at = excluded.updated_at
-	`, sess.ID, sess.AgentID, sess.ParentID, sess.Title, sess.Status, metadata, sess.CreatedAt, sess.UpdatedAt)
+	`, sess.ID, sess.AgentID, sess.ParentID, sess.JobID, sess.Title, sess.Status, metadata, sess.CreatedAt, sess.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("failed to save session: %w", err)
 	}
@@ -151,12 +154,13 @@ func (s *SQLiteStore) GetSession(id string) (*Session, error) {
 	var sess Session
 	var metadata sql.NullString
 	var parentID sql.NullString
+	var jobID sql.NullString
 	var title sql.NullString
 
 	err := s.db.QueryRow(`
-		SELECT id, agent_id, parent_id, title, status, metadata, created_at, updated_at
+		SELECT id, agent_id, parent_id, job_id, title, status, metadata, created_at, updated_at
 		FROM sessions WHERE id = ?
-	`, id).Scan(&sess.ID, &sess.AgentID, &parentID, &title, &sess.Status, &metadata, &sess.CreatedAt, &sess.UpdatedAt)
+	`, id).Scan(&sess.ID, &sess.AgentID, &parentID, &jobID, &title, &sess.Status, &metadata, &sess.CreatedAt, &sess.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("session not found: %s", id)
 	}
@@ -166,6 +170,9 @@ func (s *SQLiteStore) GetSession(id string) (*Session, error) {
 
 	if parentID.Valid {
 		sess.ParentID = &parentID.String
+	}
+	if jobID.Valid {
+		sess.JobID = &jobID.String
 	}
 	if title.Valid {
 		sess.Title = title.String
@@ -206,11 +213,13 @@ func (s *SQLiteStore) GetSession(id string) (*Session, error) {
 	return &sess, nil
 }
 
-// ListSessions lists all sessions
+// ListSessions lists all non-job sessions (regular user sessions)
 func (s *SQLiteStore) ListSessions() ([]*Session, error) {
 	rows, err := s.db.Query(`
-		SELECT id, agent_id, parent_id, title, status, created_at, updated_at
-		FROM sessions ORDER BY created_at DESC
+		SELECT id, agent_id, parent_id, job_id, title, status, created_at, updated_at
+		FROM sessions 
+		WHERE job_id IS NULL
+		ORDER BY created_at DESC
 	`)
 	if err != nil {
 		return nil, err
@@ -220,16 +229,59 @@ func (s *SQLiteStore) ListSessions() ([]*Session, error) {
 	var sessions []*Session
 	for rows.Next() {
 		var sess Session
-		var parentID sql.NullString
+		var parentID, jobID sql.NullString
 		var title sql.NullString
 
-		err := rows.Scan(&sess.ID, &sess.AgentID, &parentID, &title, &sess.Status, &sess.CreatedAt, &sess.UpdatedAt)
+		err := rows.Scan(&sess.ID, &sess.AgentID, &parentID, &jobID, &title, &sess.Status, &sess.CreatedAt, &sess.UpdatedAt)
 		if err != nil {
 			return nil, err
 		}
 
 		if parentID.Valid {
 			sess.ParentID = &parentID.String
+		}
+		if jobID.Valid {
+			sess.JobID = &jobID.String
+		}
+		if title.Valid {
+			sess.Title = title.String
+		}
+
+		sessions = append(sessions, &sess)
+	}
+
+	return sessions, nil
+}
+
+// ListSessionsByJob returns all sessions associated with a specific job
+func (s *SQLiteStore) ListSessionsByJob(jobID string) ([]*Session, error) {
+	rows, err := s.db.Query(`
+		SELECT id, agent_id, parent_id, job_id, title, status, created_at, updated_at
+		FROM sessions 
+		WHERE job_id = ?
+		ORDER BY created_at DESC
+	`, jobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sessions []*Session
+	for rows.Next() {
+		var sess Session
+		var parentID, jobID sql.NullString
+		var title sql.NullString
+
+		err := rows.Scan(&sess.ID, &sess.AgentID, &parentID, &jobID, &title, &sess.Status, &sess.CreatedAt, &sess.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+
+		if parentID.Valid {
+			sess.ParentID = &parentID.String
+		}
+		if jobID.Valid {
+			sess.JobID = &jobID.String
 		}
 		if title.Valid {
 			sess.Title = title.String
