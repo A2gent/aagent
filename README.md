@@ -7,6 +7,9 @@ A Go-based autonomous AI coding agent that executes tasks in sessions with a bea
 
 > **Note:** This project uses the Kimi Code API (Anthropic-compatible) as its LLM backend. You will need an API key to use it.
 
+<img width="1415" height="483" alt="Screenshot 2026-02-16 at 01 01 04" src="https://github.com/user-attachments/assets/0b472db5-8a78-4f39-8e28-65d50211cc68" />
+
+
 ## Features
 
 - **TUI Interface**: Beautiful terminal UI with scrollable history, multi-line input, and real-time status
