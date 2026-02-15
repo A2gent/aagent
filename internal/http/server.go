@@ -3,6 +3,7 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -44,6 +46,8 @@ type Server struct {
 	router         chi.Router
 	port           int
 	speechClips    *speechcache.Store
+	activeRunsMu   sync.Mutex
+	activeRuns     map[string]map[string]context.CancelFunc
 }
 
 func (s *Server) resolveSessionWorkDir(sess *session.Session) string {
@@ -144,6 +148,7 @@ func NewServer(
 		store:          store,
 		port:           port,
 		speechClips:    speechClips,
+		activeRuns:     make(map[string]map[string]context.CancelFunc),
 	}
 
 	s.registerServerBackedTools(s.toolManager)
@@ -224,6 +229,7 @@ func (s *Server) setupRoutes() {
 		r.Post("/", s.handleCreateSession)
 		r.Get("/{sessionID}", s.handleGetSession)
 		r.Delete("/{sessionID}", s.handleDeleteSession)
+		r.Post("/{sessionID}/cancel", s.handleCancelSession)
 		r.Put("/{sessionID}/project", s.handleUpdateSessionProject)
 		r.Post("/{sessionID}/chat", s.handleChat)
 		r.Post("/{sessionID}/chat/stream", s.handleChatStream)
@@ -1233,6 +1239,8 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	sessionID := chi.URLParam(r, "sessionID")
 
+	s.cancelActiveSessionRuns(sessionID)
+
 	if err := s.sessionManager.Delete(sessionID); err != nil {
 		s.errorResponse(w, http.StatusInternalServerError, "Failed to delete session: "+err.Error())
 		return
@@ -1240,6 +1248,91 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 
 	logging.LogSession("deleted", sessionID, "via HTTP")
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleCancelSession(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "sessionID")
+
+	sess, err := s.sessionManager.Get(sessionID)
+	if err != nil {
+		s.errorResponse(w, http.StatusNotFound, "Session not found: "+err.Error())
+		return
+	}
+
+	cancelledRuns := s.cancelActiveSessionRuns(sessionID)
+	if cancelledRuns > 0 || strings.EqualFold(string(sess.Status), string(session.StatusRunning)) {
+		sess.SetStatus(session.StatusPaused)
+		if saveErr := s.sessionManager.Save(sess); saveErr != nil {
+			s.errorResponse(w, http.StatusInternalServerError, "Failed to update session status: "+saveErr.Error())
+			return
+		}
+	}
+
+	s.jsonResponse(w, http.StatusOK, map[string]interface{}{
+		"session_id":      sessionID,
+		"cancelled_runs":  cancelledRuns,
+		"session_status":  string(sess.Status),
+		"session_updated": sess.UpdatedAt,
+	})
+}
+
+func (s *Server) registerActiveSessionRun(sessionID string, cancel context.CancelFunc) string {
+	runID := uuid.New().String()
+	s.activeRunsMu.Lock()
+	defer s.activeRunsMu.Unlock()
+
+	runs, ok := s.activeRuns[sessionID]
+	if !ok {
+		runs = make(map[string]context.CancelFunc)
+		s.activeRuns[sessionID] = runs
+	}
+	runs[runID] = cancel
+	return runID
+}
+
+func (s *Server) unregisterActiveSessionRun(sessionID, runID string) {
+	s.activeRunsMu.Lock()
+	defer s.activeRunsMu.Unlock()
+
+	runs, ok := s.activeRuns[sessionID]
+	if !ok {
+		return
+	}
+	delete(runs, runID)
+	if len(runs) == 0 {
+		delete(s.activeRuns, sessionID)
+	}
+}
+
+func (s *Server) cancelActiveSessionRuns(sessionID string) int {
+	s.activeRunsMu.Lock()
+	runs, ok := s.activeRuns[sessionID]
+	if !ok || len(runs) == 0 {
+		s.activeRunsMu.Unlock()
+		return 0
+	}
+	cancels := make([]context.CancelFunc, 0, len(runs))
+	for _, cancel := range runs {
+		cancels = append(cancels, cancel)
+	}
+	delete(s.activeRuns, sessionID)
+	s.activeRunsMu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+	return len(cancels)
+}
+
+func isCancellationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "context canceled") || strings.Contains(lower, "cancelled")
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -1265,10 +1358,22 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	// Add user message to session
 	sess.AddUserMessage(req.Message)
+	sess.SetStatus(session.StatusRunning)
+	if err := s.sessionManager.Save(sess); err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to update session: "+err.Error())
+		return
+	}
+
+	runCtx, cancelRun := context.WithCancel(r.Context())
+	runID := s.registerActiveSessionRun(sessionID, cancelRun)
+	defer func() {
+		cancelRun()
+		s.unregisterActiveSessionRun(sessionID, runID)
+	}()
 
 	providerType := s.resolveSessionProviderType(sess)
 	model := s.resolveSessionModel(sess, providerType)
-	target, err := s.resolveExecutionTarget(r.Context(), providerType, model, req.Message)
+	target, err := s.resolveExecutionTarget(runCtx, providerType, model, req.Message)
 	if err != nil {
 		sess.AddAssistantMessage(fmt.Sprintf("Unable to start request: %s", err.Error()), nil)
 		sess.SetStatus(session.StatusFailed)
@@ -1296,9 +1401,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	ag := agent.New(agentConfig, target.Client, s.toolManagerForSession(sess), s.sessionManager)
 
 	// Run the agent (this is synchronous for now)
-	ctx := r.Context()
-	content, usage, err := ag.Run(ctx, sess, req.Message)
+	content, usage, err := ag.Run(runCtx, sess, req.Message)
 	if err != nil {
+		if isCancellationError(err) {
+			sess.SetStatus(session.StatusPaused)
+			_ = s.sessionManager.Save(sess)
+			s.errorResponse(w, http.StatusConflict, "Request was canceled before completion")
+			return
+		}
 		sess.AddAssistantMessage(fmt.Sprintf("Request failed: %s", err.Error()), nil)
 		sess.SetStatus(session.StatusFailed)
 		// Save session state even on error
@@ -1343,10 +1453,22 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 
 	// Add user message before streaming begins.
 	sess.AddUserMessage(req.Message)
+	sess.SetStatus(session.StatusRunning)
+	if err := s.sessionManager.Save(sess); err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to update session: "+err.Error())
+		return
+	}
+
+	runCtx, cancelRun := context.WithCancel(r.Context())
+	runID := s.registerActiveSessionRun(sessionID, cancelRun)
+	defer func() {
+		cancelRun()
+		s.unregisterActiveSessionRun(sessionID, runID)
+	}()
 
 	providerType := s.resolveSessionProviderType(sess)
 	model := s.resolveSessionModel(sess, providerType)
-	target, err := s.resolveExecutionTarget(r.Context(), providerType, model, req.Message)
+	target, err := s.resolveExecutionTarget(runCtx, providerType, model, req.Message)
 	if err != nil {
 		sess.AddAssistantMessage(fmt.Sprintf("Unable to start request: %s", err.Error()), nil)
 		sess.SetStatus(session.StatusFailed)
@@ -1392,8 +1514,7 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	}
 	ag := agent.New(agentConfig, target.Client, s.toolManagerForSession(sess), s.sessionManager)
 
-	ctx := r.Context()
-	content, usage, err := ag.RunWithEvents(ctx, sess, req.Message, func(ev agent.Event) {
+	content, usage, err := ag.RunWithEvents(runCtx, sess, req.Message, func(ev agent.Event) {
 		if ev.Type == agent.EventAssistantDelta {
 			_ = writeEvent(ChatStreamEvent{
 				Type:  "assistant_delta",
@@ -1403,6 +1524,16 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	})
 
 	if err != nil {
+		if isCancellationError(err) {
+			sess.SetStatus(session.StatusPaused)
+			s.sessionManager.Save(sess)
+			_ = writeEvent(ChatStreamEvent{
+				Type:   "error",
+				Error:  "Request was canceled before completion.",
+				Status: string(sess.Status),
+			})
+			return
+		}
 		sess.AddAssistantMessage(fmt.Sprintf("Request failed: %s", err.Error()), nil)
 		sess.SetStatus(session.StatusFailed)
 		s.sessionManager.Save(sess)

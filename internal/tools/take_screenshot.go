@@ -55,8 +55,7 @@ func (t *TakeScreenshotTool) Description() string {
 	return `Capture a screenshot of the current display setup.
 Supports: main display, all displays, a specific display index, or a rectangular area.
 You can control where the screenshot file is stored via output_path/output_dir/filename.
-If not provided, it stores screenshots in AAGENT_SCREENSHOT_OUTPUT_DIR (default: /tmp).
-You can also set AAGENT_SCREENSHOT_DISPLAY_INDEX to pick a default monitor in multi-display setups.`
+If not provided, it uses the default screenshot settings configured in the Tools UI.`
 }
 
 func (t *TakeScreenshotTool) Schema() map[string]interface{} {
@@ -87,7 +86,7 @@ func (t *TakeScreenshotTool) Schema() map[string]interface{} {
 			},
 			"display_index": map[string]interface{}{
 				"type":        "integer",
-				"description": "1-based display index. Used when target=display (falls back to AAGENT_SCREENSHOT_DISPLAY_INDEX when configured).",
+				"description": "1-based display index. Used when target=display (falls back to the configured default display when available).",
 			},
 			"area": map[string]interface{}{
 				"type":        "object",

@@ -104,11 +104,7 @@ Environment variables:
 | `glob` | Find files by pattern |
 | `find_files` | Find files with include/exclude filters |
 | `grep` | Search file contents with regex |
-| `take_screenshot_tool` | Capture screenshots (main/all/specific display/area) with configurable output path (defaults to `/tmp`) |
-
-Screenshot tool defaults can be configured via settings/env:
-- `AAGENT_SCREENSHOT_OUTPUT_DIR` (default output directory, default `/tmp`)
-- `AAGENT_SCREENSHOT_DISPLAY_INDEX` (optional 1-based default monitor index)
+| `take_screenshot_tool` | Capture screenshots (main/all/specific display/area) with configurable output path and Tools UI defaults |
 
 ## Project Structure
 
