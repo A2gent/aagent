@@ -1,6 +1,11 @@
 # A² Brute / aagent
 
-A Go-based autonomous AI coding agent that executes tasks in sessions.
+[![Go Version](https://img.shields.io/badge/go-1.21+-00ADD8.svg)](https://golang.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+A Go-based autonomous AI coding agent that executes tasks in sessions with a beautiful TUI interface.
+
+> **Note:** This project uses the Kimi Code API (Anthropic-compatible) as its LLM backend. You will need an API key to use it.
 
 ## Features
 
@@ -12,6 +17,21 @@ A Go-based autonomous AI coding agent that executes tasks in sessions.
 - **Kimi Code**: Uses Kimi Code API (Anthropic-compatible) as the LLM backend
 - **Live Metrics**: Token usage tracking and context window percentage display
 - **File Logging**: All operations logged to file for debugging
+
+## Quick Start
+
+```bash
+# 1. Clone and build
+git clone <repo-url>
+cd aagent
+just build
+
+# 2. Set your API key
+export KIMI_API_KEY=sk-kimi-...
+
+# 3. Launch and start coding!
+aa "Create a hello world Go program"
+```
 
 ## Session Model (Important)
 
@@ -26,37 +46,59 @@ Current scope:
 
 ## Installation
 
+### Prerequisites
+
+- **Go 1.21+** - [Download Go](https://golang.org/dl/)
+- **just** (command runner) - `cargo install just` or [other install methods](https://github.com/casey/just#installation)
+- **API Key** - Get your Kimi Code API key from [kimi.com](https://kimi.com)
+
+### Build from Source
+
 ```bash
-# Build from source
+# Clone the repository
+git clone <repo-url>
+cd aagent
+
+# Build binary
 just build
 
-# Or install to GOPATH/bin
+# Install to GOPATH/bin
 just install
 ```
 
 ## Usage
 
-```bash
-# Set your API key (or add to .env file)
-export KIMI_API_KEY=sk-kimi-...
+### Environment Setup
 
-# Launch TUI (interactive mode)
+Set your API key (or add to `.env` file in your project or home directory):
+
+```bash
+export KIMI_API_KEY=sk-kimi-...
+```
+
+### Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `aa` | Launch interactive TUI mode |
+| `aa "<task>"` | Run with an initial task |
+| `aa --continue <session-id>` | Resume a previous session |
+| `aa session list` | List all sessions |
+| `aa logs` | View session logs |
+| `aa logs -f` | Follow logs in real-time |
+
+### Examples
+
+```bash
+# Interactive mode
 aa
 
-# Run with an initial task
-aa "Create a hello world Go program"
+# Run a specific task
+aa "Refactor the auth module to use JWT tokens"
 
-# Resume a previous session
-aa --continue <session-id>
-
-# List sessions
-aa session list
-
-# View logs
-aa logs
-
-# Follow logs in real-time
-aa logs -f
+# Continue previous work
+aa session list                    # Find your session ID
+aa --continue abc123-def456-789   # Resume from where you left off
 ```
 
 ## TUI Interface
@@ -75,30 +117,51 @@ The TUI provides an interactive interface with:
 
 ## Configuration
 
-Configuration is loaded from:
-1. `.aagent/config.json` (project-level)
-2. `~/.config/aagent/config.json` (user-level)
+### Config Files
 
-Environment variables are loaded from `.env` files in:
+Configuration is loaded in order (later overrides earlier):
+
+| Location | Scope |
+|----------|-------|
+| `.aagent/config.json` | Project-level |
+| `~/.config/aagent/config.json` | User-level |
+
+### Environment Files
+
+`.env` files are loaded from:
 - Current directory
-- Home directory
+- Home directory (`~/.env`)
 - `~/git/mind/.env`
 
-Environment variables:
-- `KIMI_API_KEY` - Kimi Code API key (required)
-- `ANTHROPIC_API_KEY` - Alternative to KIMI_API_KEY
-- `OPENAI_API_KEY` - OpenAI API key (for `openai` provider)
-- `ANTHROPIC_BASE_URL` - Override API endpoint (default: `https://api.kimi.com/coding/v1`)
-- `AAGENT_MODEL` - Override default model (default: `kimi-for-coding`)
-- `AAGENT_DATA_PATH` - Data storage directory
-- `AAGENT_WHISPER_BIN` - Optional path to `whisper-cli` binary for speech-to-text (if omitted, backend can auto-build it on first STT request)
-- `AAGENT_WHISPER_MODEL` - Path to Whisper model file (for example `ggml-base.bin` or faster `ggml-tiny.bin`)
-- `AAGENT_WHISPER_LANGUAGE` - Optional default STT language (`auto`, `en`, `ru`, etc.)
-- `AAGENT_WHISPER_TRANSLATE` - Optional default translation mode (`true` to translate to English, default `false` to keep original language)
-- `AAGENT_WHISPER_THREADS` - Optional thread count for whisper transcription
-- `AAGENT_WHISPER_AUTO_SETUP` - Enable/disable automatic `whisper-cli` build on demand (default: enabled)
-- `AAGENT_WHISPER_AUTO_DOWNLOAD` - Enable/disable automatic Whisper model download on demand (default: enabled)
-- `AAGENT_WHISPER_SOURCE` - Optional local path to whisper.cpp source root (contains `CMakeLists.txt`)
+### Environment Variables
+
+#### Required
+
+| Variable | Description |
+|----------|-------------|
+| `KIMI_API_KEY` | Kimi Code API key |
+| `ANTHROPIC_API_KEY` | Alternative to KIMI_API_KEY |
+
+#### Optional
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ANTHROPIC_BASE_URL` | `https://api.kimi.com/coding/v1` | API endpoint |
+| `AAGENT_MODEL` | `kimi-for-coding` | Default model |
+| `AAGENT_DATA_PATH` | - | Data storage directory |
+
+#### Speech-to-Text (Whisper)
+
+| Variable | Description |
+|----------|-------------|
+| `AAGENT_WHISPER_BIN` | Path to `whisper-cli` binary |
+| `AAGENT_WHISPER_MODEL` | Model file (e.g., `ggml-base.bin`) |
+| `AAGENT_WHISPER_LANGUAGE` | STT language: `auto`, `en`, `ru`, etc. |
+| `AAGENT_WHISPER_TRANSLATE` | `true` to translate to English |
+| `AAGENT_WHISPER_THREADS` | Thread count for transcription |
+| `AAGENT_WHISPER_AUTO_SETUP` | Auto-build whisper-cli (default: enabled) |
+| `AAGENT_WHISPER_AUTO_DOWNLOAD` | Auto-download model (default: enabled) |
+| `AAGENT_WHISPER_SOURCE` | Path to whisper.cpp source |
 
 ## Tools
 
@@ -135,6 +198,16 @@ aagent/
 ├── justfile
 └── README.md
 ```
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
 ## Development
 
@@ -174,6 +247,53 @@ Hot reload details:
 - Uses `air` with project config at `.air.toml`.
 - `stop_on_error = false` keeps the previous healthy process running when a code change fails to compile.
 - The server restarts only after a successful `go build`, which avoids replacing a working backend with a broken one during self-edits.
+
+## Troubleshooting
+
+### API Key Issues
+
+**Error:** `KIMI_API_KEY not set`
+
+**Solution:** 
+```bash
+export KIMI_API_KEY=sk-kimi-your-key-here
+```
+Or create a `.env` file in your project directory with:
+```
+KIMI_API_KEY=sk-kimi-your-key-here
+```
+
+### Build Issues
+
+**Error:** `command not found: just`
+
+**Solution:** Install `just` command runner:
+```bash
+cargo install just
+```
+
+**Error:** Build fails with Go version error
+
+**Solution:** Ensure you have Go 1.21+ installed:
+```bash
+go version
+```
+
+### Session Issues
+
+**Error:** Cannot resume session
+
+**Solution:** List available sessions and check the ID:
+```bash
+aa session list
+```
+
+### Logs
+
+View detailed logs for debugging:
+```bash
+aa logs -f
+```
 
 ## License
 
