@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,6 +29,8 @@ var supportedIntegrationProviders = map[string]struct{}{
 	"webhook":         {},
 	"elevenlabs":      {},
 	"google_calendar": {},
+	"perplexity":      {},
+	"brave_search":    {},
 }
 
 var supportedIntegrationModes = map[string]struct{}{
@@ -43,6 +46,8 @@ var requiredConfigFields = map[string][]string{
 	"webhook":         {"url"},
 	"elevenlabs":      {"api_key"},
 	"google_calendar": {"client_id", "client_secret", "refresh_token"},
+	"perplexity":      {"api_key"},
+	"brave_search":    {"api_key"},
 }
 
 type IntegrationRequest struct {
@@ -88,8 +93,10 @@ type TelegramChatCandidate struct {
 }
 
 const telegramLastUpdateIDConfigKey = "last_update_id"
-const telegramProjectMapConfigKey = "group_project_map"
 const telegramNextPollAtConfigKey = "next_poll_at_unix"
+const myMindProjectName = "My Mind"
+
+var telegramBotTokenPattern = regexp.MustCompile(`bot[0-9]{5,}:[A-Za-z0-9_-]{20,}`)
 
 type telegramMessageAuthor struct {
 	IsBot bool `json:"is_bot"`
@@ -124,6 +131,37 @@ type telegramGetUpdatesPayload struct {
 	OK          bool                    `json:"ok"`
 	Description string                  `json:"description"`
 	Result      []telegramUpdatePayload `json:"result"`
+}
+
+type telegramGetMePayload struct {
+	OK          bool   `json:"ok"`
+	Description string `json:"description"`
+	Result      struct {
+		ID       int64  `json:"id"`
+		Username string `json:"username"`
+		IsBot    bool   `json:"is_bot"`
+	} `json:"result"`
+}
+
+type telegramWebhookInfoPayload struct {
+	OK          bool   `json:"ok"`
+	Description string `json:"description"`
+	Result      struct {
+		URL                string `json:"url"`
+		HasCustomCert      bool   `json:"has_custom_certificate"`
+		PendingUpdateCount int    `json:"pending_update_count"`
+		LastErrorDate      int64  `json:"last_error_date"`
+		LastErrorMessage   string `json:"last_error_message"`
+		MaxConnections     int    `json:"max_connections"`
+	} `json:"result"`
+}
+
+type telegramCreateForumTopicPayload struct {
+	OK          bool   `json:"ok"`
+	Description string `json:"description"`
+	Result      struct {
+		MessageThreadID int64 `json:"message_thread_id"`
+	} `json:"result"`
 }
 
 func (s *Server) handleListIntegrations(w http.ResponseWriter, r *http.Request) {
@@ -237,7 +275,147 @@ func (s *Server) handleTestIntegration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if integration.Provider == "telegram" {
+		ok, message := s.testTelegramIntegration(r.Context(), integration)
+		status := http.StatusOK
+		if !ok {
+			status = http.StatusBadGateway
+		}
+		s.jsonResponse(w, status, IntegrationTestResponse{Success: ok, Message: message})
+		return
+	}
+
 	s.jsonResponse(w, http.StatusOK, IntegrationTestResponse{Success: true, Message: "Configuration is valid. Live provider connectivity checks are not yet implemented."})
+}
+
+func (s *Server) testTelegramIntegration(ctx context.Context, integration *storage.Integration) (bool, string) {
+	if integration == nil {
+		return false, "integration is nil"
+	}
+	botToken := strings.TrimSpace(integration.Config["bot_token"])
+	if botToken == "" {
+		return false, "missing bot_token"
+	}
+
+	client := &http.Client{Timeout: 15 * time.Second}
+
+	getMeReq, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		fmt.Sprintf("https://api.telegram.org/bot%s/getMe", botToken),
+		nil,
+	)
+	if err != nil {
+		return false, "failed to build Telegram getMe request: " + err.Error()
+	}
+	getMeResp, err := client.Do(getMeReq)
+	if err != nil {
+		return false, "failed to call Telegram getMe: " + sanitizeTelegramError(err)
+	}
+	defer getMeResp.Body.Close()
+
+	var getMe telegramGetMePayload
+	if err := json.NewDecoder(getMeResp.Body).Decode(&getMe); err != nil {
+		return false, "failed to decode Telegram getMe response: " + err.Error()
+	}
+	if getMeResp.StatusCode != http.StatusOK || !getMe.OK {
+		msg := strings.TrimSpace(getMe.Description)
+		if msg == "" {
+			msg = getMeResp.Status
+		}
+		return false, "Telegram getMe failed: " + msg
+	}
+
+	webhookReq, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		fmt.Sprintf("https://api.telegram.org/bot%s/getWebhookInfo", botToken),
+		nil,
+	)
+	if err != nil {
+		return false, "failed to build Telegram getWebhookInfo request: " + err.Error()
+	}
+	webhookResp, err := client.Do(webhookReq)
+	if err != nil {
+		return false, "failed to call Telegram getWebhookInfo: " + sanitizeTelegramError(err)
+	}
+	defer webhookResp.Body.Close()
+
+	var webhookInfo telegramWebhookInfoPayload
+	if err := json.NewDecoder(webhookResp.Body).Decode(&webhookInfo); err != nil {
+		return false, "failed to decode Telegram webhook response: " + err.Error()
+	}
+	if webhookResp.StatusCode != http.StatusOK || !webhookInfo.OK {
+		msg := strings.TrimSpace(webhookInfo.Description)
+		if msg == "" {
+			msg = webhookResp.Status
+		}
+		return false, "Telegram getWebhookInfo failed: " + msg
+	}
+
+	username := strings.TrimSpace(getMe.Result.Username)
+	if username == "" {
+		username = fmt.Sprintf("%d", getMe.Result.ID)
+	}
+	webhookURL := strings.TrimSpace(webhookInfo.Result.URL)
+	if webhookURL != "" {
+		return true, fmt.Sprintf(
+			"Telegram reachable as @%s, but webhook is set (%s). This backend uses getUpdates polling, so clear webhook with Bot API deleteWebhook.",
+			username,
+			webhookURL,
+		)
+	}
+
+	updates, _, err := s.fetchTelegramUpdates(ctx, botToken, 0)
+	if err != nil {
+		return false, fmt.Sprintf(
+			"Telegram reachable as @%s, webhook disabled, but failed to inspect recent chats for outbound test: %s",
+			username,
+			sanitizeTelegramError(err),
+		)
+	}
+
+	privateChatID := ""
+	for i := len(updates) - 1; i >= 0; i-- {
+		msg := primaryTelegramMessage(updates[i])
+		if msg == nil || msg.Chat.ID == 0 || msg.From.IsBot {
+			continue
+		}
+		chatType := strings.ToLower(strings.TrimSpace(msg.Chat.Type))
+		if chatType != "private" {
+			continue
+		}
+		privateChatID = strconv.FormatInt(msg.Chat.ID, 10)
+		break
+	}
+
+	if privateChatID == "" {
+		lastUpdateID := strings.TrimSpace(integration.Config[telegramLastUpdateIDConfigKey])
+		return false, fmt.Sprintf(
+			"Telegram reachable as @%s and webhook is disabled, but no private chat was found for direct-message test. Open a private chat with the bot, send /start, then click Test again. last_update_id=%s",
+			username,
+			lastUpdateID,
+		)
+	}
+
+	testText := "✅ Telegram test message from A2gent WebApp integration check."
+	if err := s.sendTelegramMessage(ctx, botToken, privateChatID, 0, testText); err != nil {
+		return false, fmt.Sprintf(
+			"Telegram reachable as @%s, but direct-message test failed for private chat %s: %s",
+			username,
+			privateChatID,
+			sanitizeTelegramError(err),
+		)
+	}
+
+	lastUpdateID := strings.TrimSpace(integration.Config[telegramLastUpdateIDConfigKey])
+	return true, fmt.Sprintf(
+		"Telegram reachable as @%s. Webhook is disabled. Polling should work. Direct-message test sent to private chat %s. last_update_id=%s pending_webhook_updates=%d",
+		username,
+		privateChatID,
+		lastUpdateID,
+		webhookInfo.Result.PendingUpdateCount,
+	)
 }
 
 func (s *Server) handleDiscoverTelegramChats(w http.ResponseWriter, r *http.Request) {
@@ -364,9 +542,7 @@ func (s *Server) processTelegramDuplexIntegrations(ctx context.Context) {
 		}
 
 		botToken := strings.TrimSpace(integration.Config["bot_token"])
-		configuredChatID := strings.TrimSpace(integration.Config["chat_id"])
-		allowAllGroups := telegramAllowAllGroupChats(integration)
-		if botToken == "" || (!allowAllGroups && configuredChatID == "") {
+		if botToken == "" {
 			continue
 		}
 
@@ -395,8 +571,16 @@ func (s *Server) processTelegramDuplexIntegrations(ctx context.Context) {
 					logging.Warn("Failed to persist Telegram retry-after for integration %s: %v", integration.ID, saveErr)
 				}
 			}
-			logging.Warn("Telegram poll failed for integration %s: %v", integration.ID, err)
+			logging.Warn("Telegram poll failed for integration %s: %s", integration.ID, sanitizeTelegramError(err))
 			continue
+		}
+		if len(updates) == 0 {
+			logging.Debug(
+				"Telegram poll no updates: integration=%s offset=%d next_offset=%d",
+				integration.ID,
+				offset,
+				nextOffset,
+			)
 		}
 		if len(updates) > 0 {
 			logging.Info(
@@ -444,24 +628,13 @@ func (s *Server) processTelegramDuplexIntegrations(ctx context.Context) {
 			}
 
 			messageChatID := strconv.FormatInt(message.Chat.ID, 10)
-			if allowAllGroups {
-				chatType := strings.ToLower(strings.TrimSpace(message.Chat.Type))
-				if chatType != "group" && chatType != "supergroup" {
-					logging.Debug(
-						"Telegram update skipped for integration %s: chat type filter (chat=%s type=%s update=%d)",
-						integration.ID,
-						messageChatID,
-						chatType,
-						update.UpdateID,
-					)
-					continue
-				}
-			} else if messageChatID != configuredChatID {
+			chatType := strings.ToLower(strings.TrimSpace(message.Chat.Type))
+			if chatType != "group" && chatType != "supergroup" {
 				logging.Debug(
-					"Telegram update skipped for integration %s: chat_id mismatch (got=%s want=%s update=%d)",
+					"Telegram update skipped for integration %s: chat type filter (chat=%s type=%s update=%d)",
 					integration.ID,
 					messageChatID,
-					configuredChatID,
+					chatType,
 					update.UpdateID,
 				)
 				continue
@@ -484,7 +657,11 @@ func (s *Server) processTelegramDuplexIntegrations(ctx context.Context) {
 				text,
 			)
 			if err != nil {
-				logging.Warn("Telegram duplex handling failed for integration %s: %v", integration.ID, err)
+				logging.Warn("Telegram duplex handling failed for integration %s: %s", integration.ID, sanitizeTelegramError(err))
+				failureReply := telegramInboundFailureReply(err)
+				if sendErr := s.sendTelegramMessage(ctx, botToken, messageChatID, message.MessageThreadID, failureReply); sendErr != nil {
+					logging.Warn("Telegram failure reply send failed for integration %s: %s", integration.ID, sanitizeTelegramError(sendErr))
+				}
 				continue
 			}
 
@@ -494,7 +671,7 @@ func (s *Server) processTelegramDuplexIntegrations(ctx context.Context) {
 				continue
 			}
 			if err := s.sendTelegramMessage(ctx, botToken, messageChatID, message.MessageThreadID, reply); err != nil {
-				logging.Warn("Telegram reply send failed for integration %s: %v", integration.ID, err)
+				logging.Warn("Telegram reply send failed for integration %s: %s", integration.ID, sanitizeTelegramError(err))
 				continue
 			}
 			logging.Info(
@@ -636,8 +813,8 @@ func (s *Server) handleTelegramInboundMessage(
 			logging.Warn("Failed to persist new Telegram session metadata: %v", err)
 		}
 	}
-	if err := s.assignTelegramProject(sess, integration, chat); err != nil {
-		logging.Warn("Failed to assign Telegram project for session %s: %v", sess.ID, err)
+	if err := s.assignTelegramSessionToMyMindProject(sess); err != nil {
+		logging.Warn("Failed to assign My Mind project for Telegram session %s: %v", sess.ID, err)
 	}
 
 	sess.AddUserMessage(userMessage)
@@ -655,11 +832,12 @@ func (s *Server) handleTelegramInboundMessage(
 	agentConfig := agent.Config{
 		Name:          sess.AgentID,
 		Model:         target.Model,
+		SystemPrompt:  s.buildSystemPromptForSession(sess),
 		MaxSteps:      s.config.MaxSteps,
 		Temperature:   s.config.Temperature,
 		ContextWindow: target.ContextWindow,
 	}
-	ag := agent.New(agentConfig, target.Client, s.toolManager, s.sessionManager)
+	ag := agent.New(agentConfig, target.Client, s.toolManagerForSession(sess), s.sessionManager)
 
 	response, _, err := ag.Run(ctx, sess, userMessage)
 	if err != nil {
@@ -751,64 +929,78 @@ func telegramSessionScopeKey(integration *storage.Integration, chatID string, th
 	return fmt.Sprintf("%s:%d", chatID, threadID)
 }
 
-func telegramAllowAllGroupChats(integration *storage.Integration) bool {
-	raw := strings.ToLower(strings.TrimSpace(integration.Config["allow_all_group_chats"]))
-	return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
-}
-
-func (s *Server) assignTelegramProject(sess *session.Session, integration *storage.Integration, chat telegramChatPayload) error {
-	scope := strings.ToLower(strings.TrimSpace(integration.Config["project_scope"]))
-	if scope != "group" {
-		return nil
-	}
-
-	chatType := strings.ToLower(strings.TrimSpace(chat.Type))
-	if chatType != "group" && chatType != "supergroup" {
-		return nil
-	}
-
-	chatID := strconv.FormatInt(chat.ID, 10)
-	projectMap := map[string]string{}
-	if raw := strings.TrimSpace(integration.Config[telegramProjectMapConfigKey]); raw != "" {
-		_ = json.Unmarshal([]byte(raw), &projectMap)
-	}
-
-	projectID := strings.TrimSpace(projectMap[chatID])
-	if projectID != "" {
-		if _, err := s.store.GetProject(projectID); err == nil {
-			sess.ProjectID = &projectID
-			return s.sessionManager.Save(sess)
-		}
-	}
-
-	name := strings.TrimSpace(chat.Title)
-	if name == "" {
-		name = "Telegram Group " + chatID
-	}
-	project := &storage.Project{
-		ID:        uuid.New().String(),
-		Name:      name,
-		Folders:   []string{},
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-	if err := s.store.SaveProject(project); err != nil {
+func (s *Server) assignTelegramSessionToMyMindProject(sess *session.Session) error {
+	project, err := s.ensureMyMindProject()
+	if err != nil {
 		return err
 	}
-	projectMap[chatID] = project.ID
-	encoded, err := json.Marshal(projectMap)
-	if err == nil {
-		if integration.Config == nil {
-			integration.Config = map[string]string{}
-		}
-		integration.Config[telegramProjectMapConfigKey] = string(encoded)
-		integration.UpdatedAt = time.Now()
-		if saveErr := s.store.SaveIntegration(integration); saveErr != nil {
-			logging.Warn("Failed to save Telegram project map for integration %s: %v", integration.ID, saveErr)
-		}
+	if project == nil {
+		return nil
 	}
 	sess.ProjectID = &project.ID
 	return s.sessionManager.Save(sess)
+}
+
+func (s *Server) ensureMyMindProject() (*storage.Project, error) {
+	settings, err := s.store.GetSettings()
+	if err != nil {
+		return nil, err
+	}
+
+	expectedFolders := []string{}
+	if root := strings.TrimSpace(settings[mindRootFolderSettingKey]); root != "" {
+		expectedFolders = []string{root}
+	}
+
+	projects, err := s.store.ListProjects()
+	if err != nil {
+		return nil, err
+	}
+	for _, project := range projects {
+		if project == nil {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(project.Name), myMindProjectName) {
+			continue
+		}
+		if !sameStringSets(project.Folders, expectedFolders) {
+			project.Folders = expectedFolders
+			project.UpdatedAt = time.Now()
+			if err := s.store.SaveProject(project); err != nil {
+				return nil, err
+			}
+		}
+		return project, nil
+	}
+
+	now := time.Now()
+	project := &storage.Project{
+		ID:        uuid.New().String(),
+		Name:      myMindProjectName,
+		Folders:   expectedFolders,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := s.store.SaveProject(project); err != nil {
+		return nil, err
+	}
+	return project, nil
+}
+
+func sameStringSets(a []string, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	left := append([]string(nil), a...)
+	right := append([]string(nil), b...)
+	sort.Strings(left)
+	sort.Strings(right)
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) sendTelegramMessage(ctx context.Context, botToken string, chatID string, threadID int64, text string) error {
@@ -860,6 +1052,256 @@ func (s *Server) sendTelegramMessage(ctx context.Context, botToken string, chatI
 	return nil
 }
 
+func (s *Server) createTelegramForumTopic(ctx context.Context, botToken string, chatID string, name string) (int64, error) {
+	payload := map[string]interface{}{
+		"chat_id": chatID,
+		"name":    name,
+	}
+	jsonBody, err := json.Marshal(payload)
+	if err != nil {
+		return 0, fmt.Errorf("failed to encode createForumTopic payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		fmt.Sprintf("https://api.telegram.org/bot%s/createForumTopic", botToken),
+		bytes.NewReader(jsonBody),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("failed to build createForumTopic request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("createForumTopic request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result telegramCreateForumTopicPayload
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, fmt.Errorf("failed to decode createForumTopic response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK || !result.OK {
+		msg := strings.TrimSpace(result.Description)
+		if msg == "" {
+			msg = resp.Status
+		}
+		return 0, fmt.Errorf("telegram createForumTopic failed: %s", msg)
+	}
+	if result.Result.MessageThreadID <= 0 {
+		return 0, fmt.Errorf("telegram createForumTopic succeeded but returned empty message_thread_id")
+	}
+	return result.Result.MessageThreadID, nil
+}
+
+func (s *Server) syncHTTPCreatedSessionToTelegram(ctx context.Context, sessionID string, initialTask string) {
+	sess, err := s.sessionManager.Get(sessionID)
+	if err != nil {
+		logging.Warn("Telegram outbound sync skipped: failed to load session %s: %v", sessionID, err)
+		return
+	}
+
+	integrations, err := s.store.ListIntegrations()
+	if err != nil {
+		logging.Warn("Telegram outbound sync skipped: failed to list integrations: %v", err)
+		return
+	}
+
+	var selected *storage.Integration
+	for _, integration := range integrations {
+		if integration == nil || !integration.Enabled || integration.Provider != "telegram" || integration.Mode != "duplex" {
+			continue
+		}
+		selected = integration
+		break
+	}
+	if selected == nil {
+		return
+	}
+
+	botToken := strings.TrimSpace(selected.Config["bot_token"])
+	if botToken == "" {
+		logging.Warn("Telegram outbound sync skipped for session %s: integration %s missing bot_token", sessionID, selected.ID)
+		return
+	}
+
+	chatID := strings.TrimSpace(selected.Config["default_chat_id"])
+	if chatID == "" {
+		chatID = s.inferTelegramChatIDForIntegration(selected.ID)
+	}
+	if chatID == "" {
+		logging.Info("Telegram outbound sync skipped for session %s: no default_chat_id and no inferred chat for integration %s", sessionID, selected.ID)
+		return
+	}
+
+	threadID := int64(0)
+	scope := strings.ToLower(strings.TrimSpace(selected.Config["session_scope"]))
+	if scope != "chat" {
+		topicName := telegramTopicNameForSession(sess, initialTask)
+		createdThreadID, createErr := s.createTelegramForumTopic(ctx, botToken, chatID, topicName)
+		if createErr != nil {
+			logging.Warn("Telegram topic create failed for session %s: %s", sessionID, sanitizeTelegramError(createErr))
+		} else {
+			threadID = createdThreadID
+		}
+	}
+
+	announce := telegramSessionAnnouncement(sess, initialTask, threadID > 0)
+	sendErr := s.sendTelegramMessage(ctx, botToken, chatID, threadID, announce)
+	if sendErr != nil && threadID > 0 {
+		logging.Warn("Telegram topic send failed for session %s (thread=%d): %s", sessionID, threadID, sanitizeTelegramError(sendErr))
+		sendErr = s.sendTelegramMessage(ctx, botToken, chatID, 0, announce)
+		threadID = 0
+	}
+	if sendErr != nil {
+		logging.Warn("Telegram outbound sync failed for session %s: %s", sessionID, sanitizeTelegramError(sendErr))
+		return
+	}
+
+	if sess.Metadata == nil {
+		sess.Metadata = map[string]interface{}{}
+	}
+	scopeKey := telegramSessionScopeKey(selected, chatID, threadID)
+	sess.Metadata["integration_provider"] = "telegram"
+	sess.Metadata["integration_id"] = selected.ID
+	sess.Metadata["telegram_chat_id"] = chatID
+	sess.Metadata["telegram_scope_key"] = scopeKey
+	if threadID > 0 {
+		sess.Metadata["telegram_thread_id"] = strconv.FormatInt(threadID, 10)
+	} else {
+		delete(sess.Metadata, "telegram_thread_id")
+	}
+	if err := s.sessionManager.Save(sess); err != nil {
+		logging.Warn("Failed to persist Telegram outbound metadata for session %s: %v", sessionID, err)
+	}
+}
+
+func (s *Server) inferTelegramChatIDForIntegration(integrationID string) string {
+	sessions, err := s.sessionManager.List()
+	if err != nil {
+		return ""
+	}
+	latest := time.Time{}
+	chatID := ""
+	for _, sess := range sessions {
+		if sess == nil || sess.Metadata == nil {
+			continue
+		}
+		if metadataString(sess.Metadata["integration_provider"]) != "telegram" {
+			continue
+		}
+		if metadataString(sess.Metadata["integration_id"]) != integrationID {
+			continue
+		}
+		candidate := metadataString(sess.Metadata["telegram_chat_id"])
+		if candidate == "" {
+			continue
+		}
+		if chatID == "" || sess.UpdatedAt.After(latest) {
+			chatID = candidate
+			latest = sess.UpdatedAt
+		}
+	}
+	return chatID
+}
+
+func telegramTopicNameForSession(sess *session.Session, initialTask string) string {
+	if sess == nil {
+		return "Session"
+	}
+
+	base := strings.TrimSpace(sess.Title)
+	if base == "" {
+		base = strings.TrimSpace(initialTask)
+	}
+	if base == "" {
+		id := strings.TrimSpace(sess.ID)
+		if len(id) >= 8 {
+			base = "Session " + id[:8]
+		} else if id != "" {
+			base = "Session " + id
+		} else {
+			base = "Session"
+		}
+	}
+
+	base = strings.Join(strings.Fields(base), " ")
+	if base == "" {
+		base = "Session"
+	}
+	runes := []rune(base)
+	if len(runes) > 120 {
+		base = strings.TrimSpace(string(runes[:120]))
+	}
+	if base == "" {
+		base = "Session"
+	}
+	return base
+}
+
+func telegramSessionAnnouncement(sess *session.Session, initialTask string, inTopic bool) string {
+	title := ""
+	if sess != nil {
+		title = strings.TrimSpace(sess.Title)
+	}
+	if title == "" {
+		title = strings.TrimSpace(initialTask)
+	}
+	title = strings.Join(strings.Fields(title), " ")
+	if title == "" {
+		title = "New session"
+	}
+	if runes := []rune(title); len(runes) > 180 {
+		title = strings.TrimSpace(string(runes[:180])) + "..."
+	}
+
+	sessionID := ""
+	if sess != nil {
+		sessionID = strings.TrimSpace(sess.ID)
+	}
+	if sessionID == "" {
+		return fmt.Sprintf("Web App started: %s", title)
+	}
+	if inTopic {
+		return fmt.Sprintf("Web App started: %s\nSession ID: %s\nReply in this topic to continue.", title, sessionID)
+	}
+	return fmt.Sprintf("Web App started: %s\nSession ID: %s\nReply here to continue.", title, sessionID)
+}
+
+func telegramInboundFailureReply(err error) string {
+	base := "I couldn't process that request."
+	if err == nil {
+		return base + " Check integration and provider setup in WebApp."
+	}
+
+	msg := sanitizeTelegramError(err)
+	if msg == "" {
+		return base + " Check integration and provider setup in WebApp."
+	}
+
+	const maxErrChars = 350
+	runes := []rune(msg)
+	if len(runes) > maxErrChars {
+		msg = string(runes[:maxErrChars]) + "..."
+	}
+	return fmt.Sprintf("%s %s", base, msg)
+}
+
+func sanitizeTelegramError(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := strings.TrimSpace(err.Error())
+	if text == "" {
+		return ""
+	}
+	return telegramBotTokenPattern.ReplaceAllString(text, "bot<redacted>")
+}
+
 func newIntegrationFromRequest(req IntegrationRequest) (*storage.Integration, error) {
 	provider := strings.ToLower(strings.TrimSpace(req.Provider))
 	mode := strings.ToLower(strings.TrimSpace(req.Mode))
@@ -874,6 +1316,16 @@ func newIntegrationFromRequest(req IntegrationRequest) (*storage.Integration, er
 		Mode:     mode,
 		Enabled:  true,
 		Config:   trimConfig(req.Config),
+	}
+	if integration.Provider == "telegram" {
+		if integration.Config == nil {
+			integration.Config = map[string]string{}
+		}
+		// Telegram integration now always operates in all-groups mode.
+		integration.Config["allow_all_group_chats"] = "true"
+		delete(integration.Config, "chat_id")
+		delete(integration.Config, "project_scope")
+		delete(integration.Config, "group_project_map")
 	}
 	if req.Enabled != nil {
 		integration.Enabled = *req.Enabled
@@ -914,10 +1366,6 @@ func validateIntegration(integration storage.Integration) error {
 			return fmt.Errorf("missing required config field: %s", field)
 		}
 	}
-	if integration.Provider == "telegram" && !telegramAllowAllGroupChats(&integration) && strings.TrimSpace(integration.Config["chat_id"]) == "" {
-		return fmt.Errorf("missing required config field: chat_id (or enable allow_all_group_chats)")
-	}
-
 	if integration.Provider == "webhook" {
 		url := strings.ToLower(strings.TrimSpace(integration.Config["url"]))
 		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
@@ -974,6 +1422,10 @@ func defaultIntegrationName(provider string) string {
 		return "Google Calendar"
 	case "elevenlabs":
 		return "ElevenLabs"
+	case "perplexity":
+		return "Perplexity"
+	case "brave_search":
+		return "Brave Search"
 	default:
 		return provider
 	}

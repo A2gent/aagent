@@ -26,9 +26,13 @@ type GrepTool struct {
 
 // GrepParams defines parameters for the grep tool
 type GrepParams struct {
-	Pattern string `json:"pattern"`
-	Path    string `json:"path,omitempty"`
-	Include string `json:"include,omitempty"` // File pattern filter
+	Pattern           string   `json:"pattern"`
+	Path              string   `json:"path,omitempty"`
+	Include           string   `json:"include,omitempty"` // File pattern filter
+	Exclude           []string `json:"exclude,omitempty"` // Relative path filters
+	MaxResults        int      `json:"max_results,omitempty"`
+	MaxMatchesPerFile int      `json:"max_matches_per_file,omitempty"`
+	Mode              string   `json:"mode,omitempty"` // lines|files|count
 }
 
 // NewGrepTool creates a new grep tool
@@ -42,8 +46,8 @@ func (t *GrepTool) Name() string {
 
 func (t *GrepTool) Description() string {
 	return `Search file contents using regular expressions.
-Returns file paths and line numbers with at least one match.
-Use the include parameter to filter files by pattern (e.g., "*.go", "*.{ts,tsx}").`
+Use mode=files or mode=count for compact outputs.
+Use include/exclude and limits to reduce context usage.`
 }
 
 func (t *GrepTool) Schema() map[string]interface{} {
@@ -61,6 +65,26 @@ func (t *GrepTool) Schema() map[string]interface{} {
 			"include": map[string]interface{}{
 				"type":        "string",
 				"description": "File pattern to include (e.g., '*.go', '*.{ts,tsx}')",
+			},
+			"exclude": map[string]interface{}{
+				"type":        "array",
+				"description": "Exclude glob patterns matched against relative paths",
+				"items": map[string]interface{}{
+					"type": "string",
+				},
+			},
+			"max_results": map[string]interface{}{
+				"type":        "integer",
+				"description": "Maximum output rows (default: 500)",
+			},
+			"max_matches_per_file": map[string]interface{}{
+				"type":        "integer",
+				"description": "Maximum matches to emit per file (default: unlimited)",
+			},
+			"mode": map[string]interface{}{
+				"type":        "string",
+				"description": "Output mode: lines (default), files, count",
+				"enum":        []string{"lines", "files", "count"},
 			},
 		},
 		"required": []string{"pattern"},
@@ -82,6 +106,13 @@ func (t *GrepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 
 	if p.Pattern == "" {
 		return &Result{Success: false, Error: "pattern is required"}, nil
+	}
+	mode := strings.ToLower(strings.TrimSpace(p.Mode))
+	if mode == "" {
+		mode = "lines"
+	}
+	if mode != "lines" && mode != "files" && mode != "count" {
+		return &Result{Success: false, Error: "mode must be one of: lines, files, count"}, nil
 	}
 
 	// Compile regex
@@ -115,6 +146,15 @@ func (t *GrepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 
 	// Search files
 	var matches []grepMatch
+	fileCounts := make(map[string]int)
+	maxResults := p.MaxResults
+	if maxResults <= 0 {
+		maxResults = maxGrepResults
+	}
+	if maxResults > maxGrepResults {
+		maxResults = maxGrepResults
+	}
+	maxPerFile := p.MaxMatchesPerFile
 
 	for _, file := range files {
 		if ctx.Err() != nil {
@@ -138,16 +178,22 @@ func (t *GrepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 		if err != nil {
 			relPath = file
 		}
+		if isExcluded(relPath, p.Exclude) {
+			continue
+		}
 
-		fileMatches := t.searchFile(fullPath, relPath, re, info.ModTime().UnixNano())
+		fileMatches, totalCount := t.searchFile(fullPath, relPath, re, info.ModTime().UnixNano(), maxPerFile, mode == "files")
+		if totalCount > 0 {
+			fileCounts[relPath] = totalCount
+		}
 		matches = append(matches, fileMatches...)
 
-		if len(matches) >= maxGrepResults {
+		if len(matches) >= maxResults {
 			break
 		}
 	}
 
-	if len(matches) == 0 {
+	if len(matches) == 0 && len(fileCounts) == 0 {
 		return &Result{
 			Success: true,
 			Output:  "No matches found",
@@ -160,18 +206,39 @@ func (t *GrepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 	})
 
 	// Limit results
-	if len(matches) > maxGrepResults {
-		matches = matches[:maxGrepResults]
+	if len(matches) > maxResults {
+		matches = matches[:maxResults]
 	}
 
 	// Format output
 	var lines []string
-	for _, m := range matches {
-		content := m.content
-		if len(content) > maxGrepLineLength {
-			content = content[:maxGrepLineLength] + "..."
+	switch mode {
+	case "files":
+		seen := make(map[string]struct{})
+		for _, m := range matches {
+			if _, ok := seen[m.file]; ok {
+				continue
+			}
+			seen[m.file] = struct{}{}
+			lines = append(lines, m.file)
 		}
-		lines = append(lines, fmt.Sprintf("%s:%d: %s", m.file, m.line, content))
+	case "count":
+		paths := make([]string, 0, len(fileCounts))
+		for path := range fileCounts {
+			paths = append(paths, path)
+		}
+		sort.Strings(paths)
+		for _, path := range paths {
+			lines = append(lines, fmt.Sprintf("%s: %d", path, fileCounts[path]))
+		}
+	default:
+		for _, m := range matches {
+			content := m.content
+			if len(content) > maxGrepLineLength {
+				content = content[:maxGrepLineLength] + "..."
+			}
+			lines = append(lines, fmt.Sprintf("%s:%d: %s", m.file, m.line, content))
+		}
 	}
 
 	output := strings.Join(lines, "\n")
@@ -182,32 +249,40 @@ func (t *GrepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 	}, nil
 }
 
-func (t *GrepTool) searchFile(fullPath, relPath string, re *regexp.Regexp, modTime int64) []grepMatch {
+func (t *GrepTool) searchFile(fullPath, relPath string, re *regexp.Regexp, modTime int64, maxMatches int, stopAtFirst bool) ([]grepMatch, int) {
 	file, err := os.Open(fullPath)
 	if err != nil {
-		return nil
+		return nil, 0
 	}
 	defer file.Close()
 
 	var matches []grepMatch
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	lineNum := 0
+	totalCount := 0
 
 	for scanner.Scan() {
 		lineNum++
 		line := scanner.Text()
 
 		if re.MatchString(line) {
-			matches = append(matches, grepMatch{
-				file:    relPath,
-				line:    lineNum,
-				content: strings.TrimSpace(line),
-				modTime: modTime,
-			})
+			totalCount++
+			if maxMatches <= 0 || len(matches) < maxMatches {
+				matches = append(matches, grepMatch{
+					file:    relPath,
+					line:    lineNum,
+					content: strings.TrimSpace(line),
+					modTime: modTime,
+				})
+			}
+			if stopAtFirst {
+				break
+			}
 		}
 	}
 
-	return matches
+	return matches, totalCount
 }
 
 // isBinaryFile checks if a file appears to be binary

@@ -171,13 +171,15 @@ var (
 
 // Tool icons for visual distinction in the TUI
 var toolIcons = map[string]string{
-	"bash":  "", // Terminal icon
-	"read":  "", // File read icon
-	"write": "", // File write icon
-	"edit":  "", // Edit icon
-	"glob":  "", // Search files icon
-	"grep":  "", // Search content icon
-	"task":  "", // Sub-agent icon
+	"bash":          "", // Terminal icon
+	"read":          "", // File read icon
+	"write":         "", // File write icon
+	"edit":          "", // Edit icon
+	"replace_lines": "",
+	"glob":          "", // Search files icon
+	"find_files":    "",
+	"grep":          "", // Search content icon
+	"task":          "", // Sub-agent icon
 }
 
 // getToolIcon returns the icon for a tool, or a default arrow
@@ -199,7 +201,11 @@ func getToolStyle(toolName string) lipgloss.Style {
 		return toolWriteStyle
 	case "edit":
 		return toolEditStyle
+	case "replace_lines":
+		return toolEditStyle
 	case "glob":
+		return toolGlobStyle
+	case "find_files":
 		return toolGlobStyle
 	case "grep":
 		return toolGrepStyle
@@ -270,9 +276,29 @@ func parseToolCall(tc session.ToolCall, maxWidth int) ToolCallDisplay {
 			}
 		}
 
+	case "replace_lines":
+		if path, ok := input["path"].(string); ok {
+			display.Summary = shortenPath(path, maxWidth-10)
+		}
+		start, hasStart := input["start_line"].(float64)
+		end, hasEnd := input["end_line"].(float64)
+		if hasStart && hasEnd {
+			display.Details = append(display.Details, fmt.Sprintf("lines %.0f-%.0f", start, end))
+		}
+
 	case "glob":
 		if pattern, ok := input["pattern"].(string); ok {
 			display.Summary = pattern
+		}
+		if path, ok := input["path"].(string); ok && path != "" {
+			display.Details = append(display.Details, fmt.Sprintf("in: %s", shortenPath(path, maxWidth-8)))
+		}
+
+	case "find_files":
+		if pattern, ok := input["pattern"].(string); ok && pattern != "" {
+			display.Summary = pattern
+		} else {
+			display.Summary = "**/*"
 		}
 		if path, ok := input["path"].(string); ok && path != "" {
 			display.Details = append(display.Details, fmt.Sprintf("in: %s", shortenPath(path, maxWidth-8)))
@@ -470,6 +496,12 @@ type Model struct {
 	sessionsListIndex int
 	availableSessions []*session.Session
 
+	// Logs view state
+	showLogsView bool
+	logLines     []string
+	logTop       int
+	logFollow    bool
+
 	// Provider selection state
 	showProviderMenu     bool
 	providerMenuIndex    int
@@ -652,6 +684,57 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.SetContent(m.renderMessages())
 
 	case tea.KeyMsg:
+		// Handle logs view first
+		if m.showLogsView {
+			switch msg.Type {
+			case tea.KeyEsc:
+				m.showLogsView = false
+				m.viewport.SetContent(m.renderMessages())
+				return m, nil
+			case tea.KeyUp:
+				if m.logTop > 0 {
+					m.logTop--
+				}
+				m.logFollow = false
+				return m, nil
+			case tea.KeyDown:
+				maxTop := m.maxLogsTop()
+				if m.logTop < maxTop {
+					m.logTop++
+				}
+				if m.logTop >= maxTop {
+					m.logFollow = true
+				}
+				return m, nil
+			case tea.KeyPgUp:
+				m.logTop -= m.logsPageStep()
+				if m.logTop < 0 {
+					m.logTop = 0
+				}
+				m.logFollow = false
+				return m, nil
+			case tea.KeyPgDown:
+				m.logTop += m.logsPageStep()
+				maxTop := m.maxLogsTop()
+				if m.logTop > maxTop {
+					m.logTop = maxTop
+				}
+				if m.logTop >= maxTop {
+					m.logFollow = true
+				}
+				return m, nil
+			case tea.KeyHome:
+				m.logTop = 0
+				m.logFollow = false
+				return m, nil
+			case tea.KeyEnd:
+				m.logTop = m.maxLogsTop()
+				m.logFollow = true
+				return m, nil
+			}
+			return m, nil
+		}
+
 		// Handle sessions list view first
 		if m.showSessionsList {
 			switch msg.Type {
@@ -926,6 +1009,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.processing {
 			m.loadingIndex = (m.loadingIndex + 1) % len(m.loadingFrames)
 		}
+		if m.showLogsView {
+			m.refreshLogsView()
+		}
 		cmds = append(cmds, tickCmd(), updateMemoryCmd())
 
 	case memoryUpdateMsg:
@@ -1056,6 +1142,16 @@ func (m Model) View() string {
 
 	// Messages viewport
 	messagesView := m.viewport.View()
+
+	// Check if we should show sessions list overlay
+	if m.showLogsView {
+		logsView := m.renderLogsView()
+		return lipgloss.JoinVertical(
+			lipgloss.Left,
+			topBar,
+			logsView,
+		)
+	}
 
 	// Check if we should show sessions list overlay
 	if m.showSessionsList {
@@ -1633,6 +1729,8 @@ func (m Model) executeCommand(cmdName string) (tea.Model, tea.Cmd) {
 		return m.clearConversation()
 	case "help":
 		return m.showHelp()
+	case "logs":
+		return m.showLogs()
 	default:
 		m.messages = append(m.messages, message{
 			role:      "error",
@@ -1800,6 +1898,149 @@ func (m Model) showHelp() (tea.Model, tea.Cmd) {
 	m.viewport.GotoBottom()
 
 	return m, nil
+}
+
+func (m Model) showLogs() (tea.Model, tea.Cmd) {
+	m.showLogsView = true
+	m.logFollow = true
+	m.refreshLogsView()
+	return m, nil
+}
+
+func (m *Model) refreshLogsView() {
+	lines := logging.RecentLines(600)
+	if len(lines) == 0 {
+		filePath := strings.TrimSpace(logging.GetLogPath())
+		if filePath != "" {
+			if tailed := tailLogFile(filePath, 600); len(tailed) > 0 {
+				lines = tailed
+			}
+		}
+	}
+	if len(lines) == 0 {
+		lines = []string{"No logs available yet. Start activity, then reopen /logs."}
+	}
+	m.logLines = lines
+	maxTop := m.maxLogsTop()
+	if m.logFollow {
+		m.logTop = maxTop
+	} else if m.logTop > maxTop {
+		m.logTop = maxTop
+	}
+	if m.logTop < 0 {
+		m.logTop = 0
+	}
+}
+
+func tailLogFile(path string, maxLines int) []string {
+	if strings.TrimSpace(path) == "" || maxLines <= 0 {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	raw := strings.Split(string(data), "\n")
+	lines := make([]string, 0, len(raw))
+	for _, line := range raw {
+		line = strings.TrimRight(line, "\r")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	if len(lines) <= maxLines {
+		return lines
+	}
+	return lines[len(lines)-maxLines:]
+}
+
+func (m Model) logsVisibleLines() int {
+	visible := m.height - 10
+	if visible < 6 {
+		visible = 6
+	}
+	return visible
+}
+
+func (m Model) logsPageStep() int {
+	step := m.logsVisibleLines() - 2
+	if step < 1 {
+		step = 1
+	}
+	return step
+}
+
+func (m Model) maxLogsTop() int {
+	visible := m.logsVisibleLines()
+	if len(m.logLines) <= visible {
+		return 0
+	}
+	return len(m.logLines) - visible
+}
+
+func truncateLine(line string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
+	runes := []rune(line)
+	if len(runes) <= maxLen {
+		return line
+	}
+	if maxLen <= 3 {
+		return string(runes[:maxLen])
+	}
+	return string(runes[:maxLen-3]) + "..."
+}
+
+func (m Model) renderLogsView() string {
+	lines := m.logLines
+	if len(lines) == 0 {
+		lines = []string{"No logs captured in this process yet."}
+	}
+
+	visible := m.logsVisibleLines()
+	start := m.logTop
+	if start < 0 {
+		start = 0
+	}
+	if start > len(lines)-1 {
+		start = len(lines) - 1
+	}
+	end := start + visible
+	if end > len(lines) {
+		end = len(lines)
+	}
+
+	width := m.width - 6
+	if width < 20 {
+		width = 20
+	}
+
+	var out []string
+	header := fmt.Sprintf(
+		"Logs (live)  file: %s",
+		logging.GetLogPath(),
+	)
+	out = append(out, lipgloss.NewStyle().Bold(true).Render(truncateLine(header, width)))
+	out = append(out, "")
+
+	for _, line := range lines[start:end] {
+		out = append(out, truncateLine(line, width))
+	}
+
+	help := "↑/↓: scroll  pgup/pgdn: page  home/end: start/end  esc: close"
+	follow := "paused"
+	if m.logFollow {
+		follow = "following"
+	}
+	position := fmt.Sprintf("lines %d-%d/%d (%s)", start+1, end, len(lines), follow)
+	out = append(out, "")
+	out = append(out, lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Render(truncateLine(position, width)))
+	out = append(out, lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Render(truncateLine(help, width)))
+
+	content := strings.Join(out, "\n")
+	return commandMenuStyle.Width(m.width - 4).Render(content)
 }
 
 // renderCommandMenu renders the command menu popup

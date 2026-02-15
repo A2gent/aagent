@@ -20,9 +20,11 @@ import (
 	"github.com/gratheon/aagent/internal/llm/lmstudio"
 	"github.com/gratheon/aagent/internal/logging"
 	"github.com/gratheon/aagent/internal/scheduler"
+	"github.com/gratheon/aagent/internal/speechcache"
 	"github.com/gratheon/aagent/internal/session"
 	"github.com/gratheon/aagent/internal/storage"
 	"github.com/gratheon/aagent/internal/tools"
+	"github.com/gratheon/aagent/internal/tools/integrationtools"
 	"github.com/gratheon/aagent/internal/tui"
 	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
@@ -131,7 +133,9 @@ func runAgentWithServer(cmd *cobra.Command, args []string) error {
 	}
 
 	// Initialize tool manager
-	toolManager := tools.NewManagerWithStore(cfg.WorkDir, store)
+	toolManager := tools.NewManager(cfg.WorkDir)
+	clipStore := speechcache.New(0)
+	integrationtools.Register(toolManager, store, clipStore)
 
 	// Initialize session manager
 	sessionManager := session.NewManager(store)
@@ -140,7 +144,7 @@ func runAgentWithServer(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	server := httpserver.NewServer(cfg, llmClient, toolManager, sessionManager, store, portFlag)
+	server := httpserver.NewServer(cfg, llmClient, toolManager, sessionManager, store, clipStore, portFlag)
 	go func() {
 		logging.Info("Starting HTTP server on port %d", portFlag)
 		if err := server.Run(ctx); err != nil && err.Error() != "http: Server closed" {
@@ -285,7 +289,9 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	llmClient = anthropic.NewClientWithBaseURL(apiKey, cfg.DefaultModel, baseURL)
 
 	// Initialize tool manager
-	toolManager := tools.NewManagerWithStore(cfg.WorkDir, store)
+	toolManager := tools.NewManager(cfg.WorkDir)
+	clipStore := speechcache.New(0)
+	integrationtools.Register(toolManager, store, clipStore)
 
 	// Initialize session manager
 	sessionManager := session.NewManager(store)
@@ -407,13 +413,15 @@ func runServer(cmd *cobra.Command, args []string) error {
 	llmClient = anthropic.NewClientWithBaseURL(apiKey, cfg.DefaultModel, baseURL)
 
 	// Initialize tool manager
-	toolManager := tools.NewManagerWithStore(cfg.WorkDir, store)
+	toolManager := tools.NewManager(cfg.WorkDir)
+	clipStore := speechcache.New(0)
+	integrationtools.Register(toolManager, store, clipStore)
 
 	// Initialize session manager
 	sessionManager := session.NewManager(store)
 
 	// Create HTTP server
-	server := httpserver.NewServer(cfg, llmClient, toolManager, sessionManager, store, portFlag)
+	server := httpserver.NewServer(cfg, llmClient, toolManager, sessionManager, store, clipStore, portFlag)
 
 	// Setup graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())

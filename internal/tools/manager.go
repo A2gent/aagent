@@ -46,7 +46,9 @@ func NewManager(workDir string) *Manager {
 	m.Register(NewReadTool(workDir))
 	m.Register(NewWriteTool(workDir))
 	m.Register(NewEditTool(workDir))
+	m.Register(NewReplaceLinesTool(workDir))
 	m.Register(NewGlobTool(workDir))
+	m.Register(NewFindFilesTool(workDir))
 	m.Register(NewGrepTool(workDir))
 
 	return m
@@ -54,11 +56,8 @@ func NewManager(workDir string) *Manager {
 
 // NewManagerWithStore creates a tool manager and registers store-backed tools.
 func NewManagerWithStore(workDir string, store storage.Store) *Manager {
-	m := NewManager(workDir)
-	if store != nil {
-		m.Register(NewGoogleCalendarQueryTool(store))
-	}
-	return m
+	_ = store
+	return NewManager(workDir)
 }
 
 // Register adds a tool to the manager

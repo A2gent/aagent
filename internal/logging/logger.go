@@ -43,6 +43,7 @@ type Logger struct {
 	logger   *log.Logger
 	level    Level
 	filePath string
+	recent   []string
 }
 
 var (
@@ -75,6 +76,7 @@ func Init(dataPath string) error {
 			logger:   log.New(file, "", 0),
 			level:    LevelDebug,
 			filePath: logPath,
+			recent:   make([]string, 0, 1024),
 		}
 	})
 	return initErr
@@ -126,12 +128,43 @@ func logf(level Level, format string, args ...interface{}) {
 
 	timestamp := time.Now().Format("2006-01-02 15:04:05.000")
 	msg := fmt.Sprintf(format, args...)
-	defaultLogger.logger.Printf("[%s] [%s] %s", timestamp, level.String(), msg)
+	line := fmt.Sprintf("[%s] [%s] %s", timestamp, level.String(), msg)
+	defaultLogger.logger.Print(line)
+	defaultLogger.appendRecent(line)
 
 	// Flush to disk immediately for real-time log viewing
 	if defaultLogger.file != nil {
 		defaultLogger.file.Sync()
 	}
+}
+
+func (l *Logger) appendRecent(line string) {
+	if l == nil {
+		return
+	}
+	const maxRecentLines = 2000
+	l.recent = append(l.recent, line)
+	if len(l.recent) > maxRecentLines {
+		l.recent = append([]string(nil), l.recent[len(l.recent)-maxRecentLines:]...)
+	}
+}
+
+// RecentLines returns up to the last n log lines from this process.
+func RecentLines(n int) []string {
+	if defaultLogger == nil {
+		return nil
+	}
+	defaultLogger.mu.Lock()
+	defer defaultLogger.mu.Unlock()
+
+	if n <= 0 || n >= len(defaultLogger.recent) {
+		out := make([]string, len(defaultLogger.recent))
+		copy(out, defaultLogger.recent)
+		return out
+	}
+	out := make([]string, n)
+	copy(out, defaultLogger.recent[len(defaultLogger.recent)-n:])
+	return out
 }
 
 // Debug logs a debug message

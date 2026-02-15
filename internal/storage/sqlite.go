@@ -74,6 +74,8 @@ func (s *SQLiteStore) migrate() error {
 			schedule_human TEXT NOT NULL,
 			schedule_cron TEXT NOT NULL,
 			task_prompt TEXT NOT NULL,
+			task_prompt_source TEXT NOT NULL DEFAULT 'text',
+			task_prompt_file TEXT NOT NULL DEFAULT '',
 			llm_provider TEXT,
 			enabled INTEGER NOT NULL DEFAULT 1,
 			last_run_at TIMESTAMP,
@@ -81,6 +83,8 @@ func (s *SQLiteStore) migrate() error {
 			created_at TIMESTAMP NOT NULL,
 			updated_at TIMESTAMP NOT NULL
 		)`,
+		`ALTER TABLE recurring_jobs ADD COLUMN task_prompt_source TEXT NOT NULL DEFAULT 'text'`,
+		`ALTER TABLE recurring_jobs ADD COLUMN task_prompt_file TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE recurring_jobs ADD COLUMN llm_provider TEXT`,
 		`CREATE INDEX IF NOT EXISTS idx_recurring_jobs_next_run ON recurring_jobs(next_run_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_recurring_jobs_enabled ON recurring_jobs(enabled)`,
@@ -260,12 +264,12 @@ func (s *SQLiteStore) GetSession(id string) (*Session, error) {
 	return &sess, nil
 }
 
-// ListSessions lists all non-job sessions (regular user sessions)
+// ListSessions lists all regular sessions plus Thinking job sessions.
 func (s *SQLiteStore) ListSessions() ([]*Session, error) {
 	rows, err := s.db.Query(`
 		SELECT id, agent_id, parent_id, job_id, project_id, title, status, metadata, created_at, updated_at
 		FROM sessions 
-		WHERE job_id IS NULL
+		WHERE job_id IS NULL OR project_id = 'project-thinking'
 		ORDER BY created_at DESC
 	`)
 	if err != nil {
@@ -478,19 +482,21 @@ func (s *SQLiteStore) Close() error {
 // SaveJob saves a recurring job to the database
 func (s *SQLiteStore) SaveJob(job *RecurringJob) error {
 	_, err := s.db.Exec(`
-		INSERT INTO recurring_jobs (id, name, schedule_human, schedule_cron, task_prompt, llm_provider, enabled, last_run_at, next_run_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO recurring_jobs (id, name, schedule_human, schedule_cron, task_prompt, task_prompt_source, task_prompt_file, llm_provider, enabled, last_run_at, next_run_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
 			schedule_human = excluded.schedule_human,
 			schedule_cron = excluded.schedule_cron,
 			task_prompt = excluded.task_prompt,
+			task_prompt_source = excluded.task_prompt_source,
+			task_prompt_file = excluded.task_prompt_file,
 			llm_provider = excluded.llm_provider,
 			enabled = excluded.enabled,
 			last_run_at = excluded.last_run_at,
 			next_run_at = excluded.next_run_at,
 			updated_at = excluded.updated_at
-	`, job.ID, job.Name, job.ScheduleHuman, job.ScheduleCron, job.TaskPrompt, job.LLMProvider, job.Enabled, job.LastRunAt, job.NextRunAt, job.CreatedAt, job.UpdatedAt)
+	`, job.ID, job.Name, job.ScheduleHuman, job.ScheduleCron, job.TaskPrompt, job.TaskPromptSource, job.TaskPromptFile, job.LLMProvider, job.Enabled, job.LastRunAt, job.NextRunAt, job.CreatedAt, job.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("failed to save job: %w", err)
 	}
@@ -504,9 +510,9 @@ func (s *SQLiteStore) GetJob(id string) (*RecurringJob, error) {
 	var enabled int
 
 	err := s.db.QueryRow(`
-		SELECT id, name, schedule_human, schedule_cron, task_prompt, llm_provider, enabled, last_run_at, next_run_at, created_at, updated_at
+		SELECT id, name, schedule_human, schedule_cron, task_prompt, task_prompt_source, task_prompt_file, llm_provider, enabled, last_run_at, next_run_at, created_at, updated_at
 		FROM recurring_jobs WHERE id = ?
-	`, id).Scan(&job.ID, &job.Name, &job.ScheduleHuman, &job.ScheduleCron, &job.TaskPrompt, &job.LLMProvider, &enabled, &lastRunAt, &nextRunAt, &job.CreatedAt, &job.UpdatedAt)
+	`, id).Scan(&job.ID, &job.Name, &job.ScheduleHuman, &job.ScheduleCron, &job.TaskPrompt, &job.TaskPromptSource, &job.TaskPromptFile, &job.LLMProvider, &enabled, &lastRunAt, &nextRunAt, &job.CreatedAt, &job.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("job not found: %s", id)
 	}
@@ -528,7 +534,7 @@ func (s *SQLiteStore) GetJob(id string) (*RecurringJob, error) {
 // ListJobs lists all recurring jobs
 func (s *SQLiteStore) ListJobs() ([]*RecurringJob, error) {
 	rows, err := s.db.Query(`
-		SELECT id, name, schedule_human, schedule_cron, task_prompt, llm_provider, enabled, last_run_at, next_run_at, created_at, updated_at
+		SELECT id, name, schedule_human, schedule_cron, task_prompt, task_prompt_source, task_prompt_file, llm_provider, enabled, last_run_at, next_run_at, created_at, updated_at
 		FROM recurring_jobs ORDER BY created_at DESC
 	`)
 	if err != nil {
@@ -542,7 +548,7 @@ func (s *SQLiteStore) ListJobs() ([]*RecurringJob, error) {
 		var lastRunAt, nextRunAt sql.NullTime
 		var enabled int
 
-		err := rows.Scan(&job.ID, &job.Name, &job.ScheduleHuman, &job.ScheduleCron, &job.TaskPrompt, &job.LLMProvider, &enabled, &lastRunAt, &nextRunAt, &job.CreatedAt, &job.UpdatedAt)
+		err := rows.Scan(&job.ID, &job.Name, &job.ScheduleHuman, &job.ScheduleCron, &job.TaskPrompt, &job.TaskPromptSource, &job.TaskPromptFile, &job.LLMProvider, &enabled, &lastRunAt, &nextRunAt, &job.CreatedAt, &job.UpdatedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -570,7 +576,7 @@ func (s *SQLiteStore) DeleteJob(id string) error {
 // GetDueJobs returns jobs that are due to run (next_run_at <= now and enabled)
 func (s *SQLiteStore) GetDueJobs(now time.Time) ([]*RecurringJob, error) {
 	rows, err := s.db.Query(`
-		SELECT id, name, schedule_human, schedule_cron, task_prompt, llm_provider, enabled, last_run_at, next_run_at, created_at, updated_at
+		SELECT id, name, schedule_human, schedule_cron, task_prompt, task_prompt_source, task_prompt_file, llm_provider, enabled, last_run_at, next_run_at, created_at, updated_at
 		FROM recurring_jobs 
 		WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?
 		ORDER BY next_run_at ASC
@@ -586,7 +592,7 @@ func (s *SQLiteStore) GetDueJobs(now time.Time) ([]*RecurringJob, error) {
 		var lastRunAt, nextRunAt sql.NullTime
 		var enabled int
 
-		err := rows.Scan(&job.ID, &job.Name, &job.ScheduleHuman, &job.ScheduleCron, &job.TaskPrompt, &job.LLMProvider, &enabled, &lastRunAt, &nextRunAt, &job.CreatedAt, &job.UpdatedAt)
+		err := rows.Scan(&job.ID, &job.Name, &job.ScheduleHuman, &job.ScheduleCron, &job.TaskPrompt, &job.TaskPromptSource, &job.TaskPromptFile, &job.LLMProvider, &enabled, &lastRunAt, &nextRunAt, &job.CreatedAt, &job.UpdatedAt)
 		if err != nil {
 			return nil, err
 		}

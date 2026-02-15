@@ -49,6 +49,8 @@ const (
 const (
 	envCompactionTriggerPercent = "AAGENT_CONTEXT_COMPACTION_TRIGGER_PERCENT"
 	envCompactionPrompt         = "AAGENT_CONTEXT_COMPACTION_PROMPT"
+	envSystemPrompt             = "AAGENT_SYSTEM_PROMPT"
+	envSystemPromptAppend       = "AAGENT_SYSTEM_PROMPT_APPEND"
 )
 
 const (
@@ -94,8 +96,16 @@ func New(config Config, llmClient llm.Client, toolManager *tools.Manager, sessio
 	if config.MaxSteps == 0 {
 		config.MaxSteps = 50
 	}
+	systemPromptExplicit := config.SystemPrompt != ""
 	if config.SystemPrompt == "" {
-		config.SystemPrompt = defaultSystemPrompt
+		config.SystemPrompt = strings.TrimSpace(os.Getenv(envSystemPrompt))
+		if config.SystemPrompt == "" {
+			config.SystemPrompt = defaultSystemPrompt
+		}
+	}
+	appendPrompt := strings.TrimSpace(os.Getenv(envSystemPromptAppend))
+	if appendPrompt != "" && !systemPromptExplicit {
+		config.SystemPrompt = strings.TrimSpace(config.SystemPrompt) + "\n\n" + appendPrompt
 	}
 
 	return &Agent{
@@ -581,6 +591,16 @@ func metadataSetString(sess *session.Session, key string, value string) {
 	sess.Metadata[key] = value
 }
 
+// DefaultSystemPrompt returns the built-in baseline system prompt.
+func DefaultSystemPrompt() string {
+	return defaultSystemPrompt
+}
+
+// DefaultSystemPromptWithoutBuiltInTools returns the baseline prompt without built-in tool guidance.
+func DefaultSystemPromptWithoutBuiltInTools() string {
+	return defaultSystemPromptWithoutBuiltInTools
+}
+
 // defaultSystemPrompt is the default system prompt for the agent
 const defaultSystemPrompt = `You are an AI coding assistant. You help users with software engineering tasks by using the available tools.
 
@@ -597,7 +617,21 @@ Available tools allow you to:
 - Read file contents (read)
 - Write new files (write)
 - Edit existing files with string replacement (edit)
+- Replace exact line ranges (replace_lines)
 - Find files by pattern (glob)
+- Find files with include/exclude filters (find_files)
 - Search file contents (grep)
+
+Be concise but thorough. Complete the user's task step by step.`
+
+const defaultSystemPromptWithoutBuiltInTools = `You are an AI coding assistant. You help users with software engineering tasks.
+
+Guidelines:
+- Explore and modify the codebase as needed
+- Read files before editing to understand context
+- Make minimal, targeted changes
+- Explain your reasoning before making changes
+- If a task is unclear, ask for clarification
+- If you encounter errors, try to understand and fix them
 
 Be concise but thorough. Complete the user's task step by step.`

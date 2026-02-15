@@ -4,11 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -16,14 +20,17 @@ import (
 	"github.com/google/uuid"
 	"github.com/gratheon/aagent/internal/agent"
 	"github.com/gratheon/aagent/internal/config"
+	"github.com/gratheon/aagent/internal/jobs"
 	"github.com/gratheon/aagent/internal/llm"
 	"github.com/gratheon/aagent/internal/llm/anthropic"
 	"github.com/gratheon/aagent/internal/llm/fallback"
 	"github.com/gratheon/aagent/internal/llm/lmstudio"
 	"github.com/gratheon/aagent/internal/logging"
 	"github.com/gratheon/aagent/internal/session"
+	"github.com/gratheon/aagent/internal/speechcache"
 	"github.com/gratheon/aagent/internal/storage"
 	"github.com/gratheon/aagent/internal/tools"
+	"github.com/gratheon/aagent/internal/tools/integrationtools"
 	"github.com/robfig/cron/v3"
 )
 
@@ -36,11 +43,77 @@ type Server struct {
 	store          storage.Store
 	router         chi.Router
 	port           int
+	speechClips    *speechcache.Store
+}
+
+func (s *Server) resolveSessionWorkDir(sess *session.Session) string {
+	defaultDir := strings.TrimSpace(s.config.WorkDir)
+	if defaultDir == "" {
+		defaultDir = "."
+	}
+
+	if sess == nil || sess.ProjectID == nil {
+		return defaultDir
+	}
+
+	projectID := strings.TrimSpace(*sess.ProjectID)
+	if projectID == "" {
+		return defaultDir
+	}
+
+	project, err := s.store.GetProject(projectID)
+	if err != nil {
+		logging.Warn("Failed to load project for session workdir: session=%s project=%s error=%v", sess.ID, projectID, err)
+		return defaultDir
+	}
+
+	for _, folder := range project.Folders {
+		candidate := strings.TrimSpace(folder)
+		if candidate == "" {
+			continue
+		}
+		if !filepath.IsAbs(candidate) {
+			candidate = filepath.Join(defaultDir, candidate)
+		}
+		candidate = filepath.Clean(candidate)
+
+		info, statErr := os.Stat(candidate)
+		if statErr != nil || !info.IsDir() {
+			logging.Warn("Skipping invalid project folder for session workdir: session=%s folder=%s", sess.ID, candidate)
+			return defaultDir
+		}
+		return candidate
+	}
+
+	return defaultDir
+}
+
+func (s *Server) toolManagerForSession(sess *session.Session) *tools.Manager {
+	workDir := s.resolveSessionWorkDir(sess)
+	defaultDir := strings.TrimSpace(s.config.WorkDir)
+	if defaultDir == "" {
+		defaultDir = "."
+	}
+	if workDir == defaultDir {
+		return s.toolManager
+	}
+
+	manager := tools.NewManager(workDir)
+	integrationtools.Register(manager, s.store, s.speechClips)
+	return manager
 }
 
 const thinkingJobIDSettingKey = "A2GENT_THINKING_JOB_ID"
 const thinkingProjectID = "project-thinking"
 const thinkingProjectName = "Thinking"
+const agentInstructionBlocksSettingKey = "A2GENT_AGENT_INSTRUCTION_BLOCKS"
+const builtInToolsInstructionBlockType = "builtin_tools"
+const integrationSkillsInstructionBlockType = "integration_skills"
+const externalMarkdownSkillsInstructionBlockType = "external_markdown_skills"
+const skillsFolderSettingKey = "AAGENT_SKILLS_FOLDER"
+const defaultDynamicInstructionFile = "AGENTS.md"
+const maxDynamicInstructionBytes = 32 * 1024
+const sessionSystemPromptSnapshotMetadataKey = "system_prompt_snapshot"
 
 // NewServer creates a new HTTP server instance
 func NewServer(
@@ -49,8 +122,12 @@ func NewServer(
 	toolManager *tools.Manager,
 	sessionManager *session.Manager,
 	store storage.Store,
+	speechClips *speechcache.Store,
 	port int,
 ) *Server {
+	if speechClips == nil {
+		speechClips = speechcache.New(0)
+	}
 	s := &Server{
 		config:         cfg,
 		llmClient:      llmClient,
@@ -58,6 +135,7 @@ func NewServer(
 		sessionManager: sessionManager,
 		store:          store,
 		port:           port,
+		speechClips:    speechClips,
 	}
 
 	s.setupRoutes()
@@ -88,6 +166,7 @@ func (s *Server) setupRoutes() {
 	// App settings (tokens/secrets/runtime options)
 	r.Get("/settings", s.handleGetSettings)
 	r.Put("/settings", s.handleUpdateSettings)
+	r.Post("/settings/instruction-estimate", s.handleEstimateInstructionPrompt)
 
 	// LLM provider configuration
 	r.Route("/providers", func(r chi.Router) {
@@ -117,6 +196,7 @@ func (s *Server) setupRoutes() {
 	r.Route("/speech", func(r chi.Router) {
 		r.Get("/voices", s.handleListSpeechVoices)
 		r.Post("/completion", s.handleCompletionSpeech)
+		r.Get("/clips/{clipID}", s.handleGetSpeechClip)
 	})
 
 	// Session endpoints
@@ -160,6 +240,15 @@ func (s *Server) setupRoutes() {
 		r.Get("/file", s.handleGetMindFile)
 		r.Post("/file", s.handleUpsertMindFile)
 		r.Put("/file", s.handleUpsertMindFile)
+		r.Delete("/file", s.handleDeleteMindFile)
+	})
+
+	// Skills helpers (folder selection and markdown discovery)
+	r.Route("/skills", func(r chi.Router) {
+		r.Get("/builtin", s.handleListBuiltInSkills)
+		r.Get("/integration-backed", s.handleListIntegrationBackedSkills)
+		r.Get("/browse", s.handleBrowseSkillDirectories)
+		r.Get("/discover", s.handleDiscoverSkills)
 	})
 
 	s.router = r
@@ -214,17 +303,38 @@ type CreateSessionResponse struct {
 
 // SessionResponse represents a session with its messages
 type SessionResponse struct {
-	ID        string            `json:"id"`
-	AgentID   string            `json:"agent_id"`
-	ParentID  string            `json:"parent_id,omitempty"`
-	ProjectID string            `json:"project_id,omitempty"`
-	Provider  string            `json:"provider,omitempty"`
-	Model     string            `json:"model,omitempty"`
-	Title     string            `json:"title"`
-	Status    string            `json:"status"`
-	CreatedAt time.Time         `json:"created_at"`
-	UpdatedAt time.Time         `json:"updated_at"`
-	Messages  []MessageResponse `json:"messages"`
+	ID                   string                       `json:"id"`
+	AgentID              string                       `json:"agent_id"`
+	ParentID             string                       `json:"parent_id,omitempty"`
+	ProjectID            string                       `json:"project_id,omitempty"`
+	Provider             string                       `json:"provider,omitempty"`
+	Model                string                       `json:"model,omitempty"`
+	RoutedProvider       string                       `json:"routed_provider,omitempty"`
+	RoutedModel          string                       `json:"routed_model,omitempty"`
+	Title                string                       `json:"title"`
+	Status               string                       `json:"status"`
+	CreatedAt            time.Time                    `json:"created_at"`
+	UpdatedAt            time.Time                    `json:"updated_at"`
+	Messages             []MessageResponse            `json:"messages"`
+	SystemPromptSnapshot *SystemPromptSnapshotPayload `json:"system_prompt_snapshot,omitempty"`
+}
+
+type SystemPromptSnapshotPayload struct {
+	BasePrompt        string                             `json:"base_prompt"`
+	CombinedPrompt    string                             `json:"combined_prompt"`
+	BaseEstimated     int                                `json:"base_estimated_tokens"`
+	CombinedEstimated int                                `json:"combined_estimated_tokens"`
+	Blocks            []SystemPromptBlockSnapshotPayload `json:"blocks"`
+}
+
+type SystemPromptBlockSnapshotPayload struct {
+	Type            string `json:"type"`
+	Value           string `json:"value"`
+	Enabled         bool   `json:"enabled"`
+	ResolvedContent string `json:"resolved_content,omitempty"`
+	SourcePath      string `json:"source_path,omitempty"`
+	Error           string `json:"error,omitempty"`
+	EstimatedTokens int    `json:"estimated_tokens"`
 }
 
 // MessageResponse represents a message in a session
@@ -287,6 +397,8 @@ type SessionListItem struct {
 	ProjectID          string    `json:"project_id,omitempty"`
 	Provider           string    `json:"provider,omitempty"`
 	Model              string    `json:"model,omitempty"`
+	RoutedProvider     string    `json:"routed_provider,omitempty"`
+	RoutedModel        string    `json:"routed_model,omitempty"`
 	Title              string    `json:"title"`
 	Status             string    `json:"status"`
 	TotalTokens        int       `json:"total_tokens"`
@@ -299,35 +411,41 @@ type SessionListItem struct {
 
 // CreateJobRequest represents a request to create a recurring job
 type CreateJobRequest struct {
-	Name         string `json:"name"`
-	ScheduleText string `json:"schedule_text"` // Natural language schedule
-	TaskPrompt   string `json:"task_prompt"`
-	LLMProvider  string `json:"llm_provider,omitempty"`
-	Enabled      bool   `json:"enabled"`
+	Name             string `json:"name"`
+	ScheduleText     string `json:"schedule_text"` // Natural language schedule
+	TaskPrompt       string `json:"task_prompt"`
+	TaskPromptSource string `json:"task_prompt_source,omitempty"` // "text" | "file"
+	TaskPromptFile   string `json:"task_prompt_file,omitempty"`
+	LLMProvider      string `json:"llm_provider,omitempty"`
+	Enabled          bool   `json:"enabled"`
 }
 
 // UpdateJobRequest represents a request to update a recurring job
 type UpdateJobRequest struct {
-	Name         string  `json:"name"`
-	ScheduleText string  `json:"schedule_text"`
-	TaskPrompt   string  `json:"task_prompt"`
-	LLMProvider  *string `json:"llm_provider,omitempty"`
-	Enabled      *bool   `json:"enabled,omitempty"`
+	Name             string  `json:"name"`
+	ScheduleText     string  `json:"schedule_text"`
+	TaskPrompt       string  `json:"task_prompt"`
+	TaskPromptSource string  `json:"task_prompt_source,omitempty"` // "text" | "file"
+	TaskPromptFile   string  `json:"task_prompt_file,omitempty"`
+	LLMProvider      *string `json:"llm_provider,omitempty"`
+	Enabled          *bool   `json:"enabled,omitempty"`
 }
 
 // JobResponse represents a recurring job response
 type JobResponse struct {
-	ID            string     `json:"id"`
-	Name          string     `json:"name"`
-	ScheduleHuman string     `json:"schedule_human"`
-	ScheduleCron  string     `json:"schedule_cron"`
-	TaskPrompt    string     `json:"task_prompt"`
-	LLMProvider   string     `json:"llm_provider,omitempty"`
-	Enabled       bool       `json:"enabled"`
-	LastRunAt     *time.Time `json:"last_run_at,omitempty"`
-	NextRunAt     *time.Time `json:"next_run_at,omitempty"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	ID               string     `json:"id"`
+	Name             string     `json:"name"`
+	ScheduleHuman    string     `json:"schedule_human"`
+	ScheduleCron     string     `json:"schedule_cron"`
+	TaskPrompt       string     `json:"task_prompt"`
+	TaskPromptSource string     `json:"task_prompt_source"`
+	TaskPromptFile   string     `json:"task_prompt_file,omitempty"`
+	LLMProvider      string     `json:"llm_provider,omitempty"`
+	Enabled          bool       `json:"enabled"`
+	LastRunAt        *time.Time `json:"last_run_at,omitempty"`
+	NextRunAt        *time.Time `json:"next_run_at,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
 }
 
 // JobExecutionResponse represents a job execution response
@@ -455,6 +573,53 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 
 	syncSettingsToEnv(oldSettings, req.Settings)
 	s.jsonResponse(w, http.StatusOK, SettingsResponse{Settings: req.Settings})
+}
+
+func (s *Server) handleEstimateInstructionPrompt(w http.ResponseWriter, r *http.Request) {
+	var req UpdateSettingsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	settings := req.Settings
+	if settings == nil {
+		loaded, err := s.store.GetSettings()
+		if err != nil {
+			s.errorResponse(w, http.StatusInternalServerError, "Failed to load settings: "+err.Error())
+			return
+		}
+		settings = loaded
+	}
+
+	snapshot := s.composeSystemPromptSnapshotWithSettings(nil, settings)
+	if snapshot == nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to compose instruction snapshot")
+		return
+	}
+
+	blocks := make([]SystemPromptBlockSnapshotPayload, len(snapshot.Blocks))
+	for i, block := range snapshot.Blocks {
+		blocks[i] = SystemPromptBlockSnapshotPayload{
+			Type:            block.Type,
+			Value:           block.Value,
+			Enabled:         block.Enabled,
+			ResolvedContent: block.ResolvedContent,
+			SourcePath:      block.SourcePath,
+			Error:           block.Error,
+			EstimatedTokens: block.EstimatedTokens,
+		}
+	}
+
+	s.jsonResponse(w, http.StatusOK, map[string]interface{}{
+		"snapshot": SystemPromptSnapshotPayload{
+			BasePrompt:        snapshot.BasePrompt,
+			CombinedPrompt:    snapshot.CombinedPrompt,
+			BaseEstimated:     snapshot.BaseEstimated,
+			CombinedEstimated: snapshot.CombinedEstimated,
+			Blocks:            blocks,
+		},
+	})
 }
 
 func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
@@ -893,6 +1058,7 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	items := make([]SessionListItem, len(sessions))
 	for i, sess := range sessions {
 		provider, model := sessionProviderAndModel(sess)
+		routedProvider, routedModel := sessionRoutedProviderAndModel(sess)
 		projectID := ""
 		if sess.ProjectID != nil {
 			projectID = *sess.ProjectID
@@ -903,6 +1069,8 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 			ProjectID:          projectID,
 			Provider:           provider,
 			Model:              model,
+			RoutedProvider:     routedProvider,
+			RoutedModel:        routedModel,
 			Title:              sess.Title,
 			Status:             string(sess.Status),
 			TotalTokens:        sessionTotalTokens(sess),
@@ -971,6 +1139,12 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 			logging.Warn("Failed to persist session project metadata: %v", err)
 		}
 	}
+	_ = s.ensureSessionSystemPromptSnapshot(sess)
+	go func(sessionID string, task string) {
+		syncCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+		s.syncHTTPCreatedSessionToTelegram(syncCtx, sessionID, task)
+	}(sess.ID, req.Task)
 
 	logging.LogSession("created", sess.ID, fmt.Sprintf("agent=%s via HTTP", req.AgentID))
 
@@ -1083,18 +1257,24 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		s.errorResponse(w, http.StatusBadRequest, "Provider configuration error: "+err.Error())
 		return
 	}
+	if setSessionRoutedProviderAndModel(sess, providerType, target.ProviderType, target.Model) {
+		if err := s.sessionManager.Save(sess); err != nil {
+			logging.Warn("Failed to persist session routed target metadata: %v", err)
+		}
+	}
 
 	// Create agent config
 	agentConfig := agent.Config{
 		Name:          sess.AgentID,
 		Model:         target.Model,
+		SystemPrompt:  s.buildSystemPromptForSession(sess),
 		MaxSteps:      s.config.MaxSteps,
 		Temperature:   s.config.Temperature,
 		ContextWindow: target.ContextWindow,
 	}
 
 	// Create agent instance
-	ag := agent.New(agentConfig, target.Client, s.toolManager, s.sessionManager)
+	ag := agent.New(agentConfig, target.Client, s.toolManagerForSession(sess), s.sessionManager)
 
 	// Run the agent (this is synchronous for now)
 	ctx := r.Context()
@@ -1155,6 +1335,11 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		s.errorResponse(w, http.StatusBadRequest, "Provider configuration error: "+err.Error())
 		return
 	}
+	if setSessionRoutedProviderAndModel(sess, providerType, target.ProviderType, target.Model) {
+		if err := s.sessionManager.Save(sess); err != nil {
+			logging.Warn("Failed to persist session routed target metadata: %v", err)
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1181,11 +1366,12 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	agentConfig := agent.Config{
 		Name:          sess.AgentID,
 		Model:         target.Model,
+		SystemPrompt:  s.buildSystemPromptForSession(sess),
 		MaxSteps:      s.config.MaxSteps,
 		Temperature:   s.config.Temperature,
 		ContextWindow: target.ContextWindow,
 	}
-	ag := agent.New(agentConfig, target.Client, s.toolManager, s.sessionManager)
+	ag := agent.New(agentConfig, target.Client, s.toolManagerForSession(sess), s.sessionManager)
 
 	ctx := r.Context()
 	content, usage, err := ag.RunWithEvents(ctx, sess, req.Message, func(ev agent.Event) {
@@ -1253,10 +1439,21 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		s.errorResponse(w, http.StatusBadRequest, "Schedule text is required")
 		return
 	}
-	if req.TaskPrompt == "" {
+
+	taskPromptSource := jobs.NormalizeTaskPromptSource(req.TaskPromptSource)
+	taskPromptFile := strings.TrimSpace(req.TaskPromptFile)
+	taskPrompt := strings.TrimSpace(req.TaskPrompt)
+	if taskPromptSource == jobs.TaskPromptSourceFile {
+		if taskPromptFile == "" {
+			s.errorResponse(w, http.StatusBadRequest, "Task prompt file is required when source is file")
+			return
+		}
+		taskPrompt = jobs.BuildTaskPromptForFile(taskPromptFile)
+	} else if taskPrompt == "" {
 		s.errorResponse(w, http.StatusBadRequest, "Task prompt is required")
 		return
 	}
+
 	llmProvider := normalizeJobLLMProvider(req.LLMProvider)
 	if llmProvider != "" {
 		if err := s.validateProviderRefForExecution(llmProvider); err != nil {
@@ -1274,15 +1471,17 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now()
 	job := &storage.RecurringJob{
-		ID:            uuid.New().String(),
-		Name:          req.Name,
-		ScheduleHuman: req.ScheduleText,
-		ScheduleCron:  cronExpr,
-		TaskPrompt:    req.TaskPrompt,
-		LLMProvider:   llmProvider,
-		Enabled:       req.Enabled,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		ID:               uuid.New().String(),
+		Name:             req.Name,
+		ScheduleHuman:    req.ScheduleText,
+		ScheduleCron:     cronExpr,
+		TaskPrompt:       taskPrompt,
+		TaskPromptSource: taskPromptSource,
+		TaskPromptFile:   taskPromptFile,
+		LLMProvider:      llmProvider,
+		Enabled:          req.Enabled,
+		CreatedAt:        now,
+		UpdatedAt:        now,
 	}
 
 	// Calculate next run time
@@ -1331,9 +1530,6 @@ func (s *Server) handleUpdateJob(w http.ResponseWriter, r *http.Request) {
 	if req.Name != "" {
 		job.Name = req.Name
 	}
-	if req.TaskPrompt != "" {
-		job.TaskPrompt = req.TaskPrompt
-	}
 	if req.Enabled != nil {
 		job.Enabled = *req.Enabled
 	}
@@ -1347,6 +1543,31 @@ func (s *Server) handleUpdateJob(w http.ResponseWriter, r *http.Request) {
 		}
 		job.LLMProvider = llmProvider
 	}
+	taskPromptSource := job.TaskPromptSource
+	if req.TaskPromptSource != "" {
+		taskPromptSource = jobs.NormalizeTaskPromptSource(req.TaskPromptSource)
+	}
+	taskPromptFile := job.TaskPromptFile
+	if req.TaskPromptFile != "" {
+		taskPromptFile = strings.TrimSpace(req.TaskPromptFile)
+	}
+	taskPrompt := job.TaskPrompt
+	if req.TaskPrompt != "" {
+		taskPrompt = strings.TrimSpace(req.TaskPrompt)
+	}
+	if taskPromptSource == jobs.TaskPromptSourceFile {
+		if strings.TrimSpace(taskPromptFile) == "" {
+			s.errorResponse(w, http.StatusBadRequest, "Task prompt file is required when source is file")
+			return
+		}
+		taskPrompt = jobs.BuildTaskPromptForFile(taskPromptFile)
+	} else if strings.TrimSpace(taskPrompt) == "" {
+		s.errorResponse(w, http.StatusBadRequest, "Task prompt is required")
+		return
+	}
+	job.TaskPromptSource = taskPromptSource
+	job.TaskPromptFile = strings.TrimSpace(taskPromptFile)
+	job.TaskPrompt = strings.TrimSpace(taskPrompt)
 
 	// Re-parse schedule if changed
 	if req.ScheduleText != "" && req.ScheduleText != job.ScheduleHuman {
@@ -1473,6 +1694,7 @@ func (s *Server) handleListJobSessions(w http.ResponseWriter, r *http.Request) {
 	resp := make([]SessionListItem, len(sessions))
 	for i, sess := range sessions {
 		provider, model := storageSessionProviderAndModel(sess)
+		routedProvider, routedModel := storageSessionRoutedProviderAndModel(sess)
 		projectID := ""
 		if sess.ProjectID != nil {
 			projectID = *sess.ProjectID
@@ -1483,6 +1705,8 @@ func (s *Server) handleListJobSessions(w http.ResponseWriter, r *http.Request) {
 			ProjectID:          projectID,
 			Provider:           provider,
 			Model:              model,
+			RoutedProvider:     routedProvider,
+			RoutedModel:        routedModel,
 			Title:              sess.Title,
 			Status:             sess.Status,
 			TotalTokens:        storageSessionTotalTokens(sess),
@@ -1531,12 +1755,13 @@ Cron expression:`, scheduleText)
 	agentConfig := agent.Config{
 		Name:          "scheduler",
 		Model:         target.Model,
+		SystemPrompt:  "You convert natural-language schedules into strict 5-field cron expressions.",
 		MaxSteps:      1, // Only need one response
 		Temperature:   0, // Deterministic output
 		ContextWindow: target.ContextWindow,
 	}
 
-	ag := agent.New(agentConfig, target.Client, s.toolManager, s.sessionManager)
+	ag := agent.New(agentConfig, target.Client, s.toolManagerForSession(sess), s.sessionManager)
 	cronExpr, _, err := ag.Run(ctx, sess, prompt)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse schedule: %w", err)
@@ -1607,8 +1832,19 @@ func (s *Server) executeJob(ctx context.Context, job *storage.RecurringJob) (*st
 	if err := s.sessionManager.Save(sess); err != nil {
 		logging.Warn("Failed to persist job session provider metadata: %v", err)
 	}
+	_ = s.ensureSessionSystemPromptSnapshot(sess)
 
-	target, clientErr := s.resolveExecutionTarget(ctx, providerType, model, job.TaskPrompt)
+	effectiveTaskPrompt, resolveErr := jobs.ResolveTaskPrompt(job)
+	if resolveErr != nil {
+		exec.Status = "failed"
+		exec.Error = "Failed to resolve task instructions: " + resolveErr.Error()
+		finishedAt := time.Now()
+		exec.FinishedAt = &finishedAt
+		s.store.SaveJobExecution(exec)
+		return exec, nil
+	}
+
+	target, clientErr := s.resolveExecutionTarget(ctx, providerType, model, effectiveTaskPrompt)
 	if clientErr != nil {
 		exec.Status = "failed"
 		exec.Error = "Failed to initialize provider: " + clientErr.Error()
@@ -1617,18 +1853,24 @@ func (s *Server) executeJob(ctx context.Context, job *storage.RecurringJob) (*st
 		s.store.SaveJobExecution(exec)
 		return exec, nil
 	}
+	if setSessionRoutedProviderAndModel(sess, providerType, target.ProviderType, target.Model) {
+		if err := s.sessionManager.Save(sess); err != nil {
+			logging.Warn("Failed to persist job session routed target metadata: %v", err)
+		}
+	}
 
-	// Run the agent with the job's task prompt
+	// Run the agent with resolved task prompt
 	agentConfig := agent.Config{
 		Name:          "job-runner",
 		Model:         target.Model,
+		SystemPrompt:  s.buildSystemPromptForSession(sess),
 		MaxSteps:      s.config.MaxSteps,
 		Temperature:   s.config.Temperature,
 		ContextWindow: target.ContextWindow,
 	}
-	ag := agent.New(agentConfig, target.Client, s.toolManager, s.sessionManager)
-	sess.AddUserMessage(job.TaskPrompt)
-	output, _, err := ag.Run(ctx, sess, job.TaskPrompt)
+	ag := agent.New(agentConfig, target.Client, s.toolManagerForSession(sess), s.sessionManager)
+	sess.AddUserMessage(effectiveTaskPrompt)
+	output, _, err := ag.Run(ctx, sess, effectiveTaskPrompt)
 
 	finishedAt := time.Now()
 	exec.FinishedAt = &finishedAt
@@ -1680,17 +1922,19 @@ func (s *Server) assignSessionToThinkingProject(sess *session.Session) error {
 // jobToResponse converts a storage job to API response
 func (s *Server) jobToResponse(job *storage.RecurringJob) JobResponse {
 	return JobResponse{
-		ID:            job.ID,
-		Name:          job.Name,
-		ScheduleHuman: job.ScheduleHuman,
-		ScheduleCron:  job.ScheduleCron,
-		TaskPrompt:    job.TaskPrompt,
-		LLMProvider:   job.LLMProvider,
-		Enabled:       job.Enabled,
-		LastRunAt:     job.LastRunAt,
-		NextRunAt:     job.NextRunAt,
-		CreatedAt:     job.CreatedAt,
-		UpdatedAt:     job.UpdatedAt,
+		ID:               job.ID,
+		Name:             job.Name,
+		ScheduleHuman:    job.ScheduleHuman,
+		ScheduleCron:     job.ScheduleCron,
+		TaskPrompt:       job.TaskPrompt,
+		TaskPromptSource: jobs.NormalizeTaskPromptSource(job.TaskPromptSource),
+		TaskPromptFile:   strings.TrimSpace(job.TaskPromptFile),
+		LLMProvider:      job.LLMProvider,
+		Enabled:          job.Enabled,
+		LastRunAt:        job.LastRunAt,
+		NextRunAt:        job.NextRunAt,
+		CreatedAt:        job.CreatedAt,
+		UpdatedAt:        job.UpdatedAt,
 	}
 }
 
@@ -1720,18 +1964,45 @@ func (s *Server) sessionToResponse(sess *session.Session) SessionResponse {
 		projectID = *sess.ProjectID
 	}
 	provider, model := sessionProviderAndModel(sess)
+	routedProvider, routedModel := sessionRoutedProviderAndModel(sess)
+	snapshot := sessionSystemPromptSnapshot(sess)
+	var snapshotPayload *SystemPromptSnapshotPayload
+	if snapshot != nil {
+		blocks := make([]SystemPromptBlockSnapshotPayload, len(snapshot.Blocks))
+		for i, block := range snapshot.Blocks {
+			blocks[i] = SystemPromptBlockSnapshotPayload{
+				Type:            block.Type,
+				Value:           block.Value,
+				Enabled:         block.Enabled,
+				ResolvedContent: block.ResolvedContent,
+				SourcePath:      block.SourcePath,
+				Error:           block.Error,
+				EstimatedTokens: block.EstimatedTokens,
+			}
+		}
+		snapshotPayload = &SystemPromptSnapshotPayload{
+			BasePrompt:        snapshot.BasePrompt,
+			CombinedPrompt:    snapshot.CombinedPrompt,
+			BaseEstimated:     snapshot.BaseEstimated,
+			CombinedEstimated: snapshot.CombinedEstimated,
+			Blocks:            blocks,
+		}
+	}
 	return SessionResponse{
-		ID:        sess.ID,
-		AgentID:   sess.AgentID,
-		ParentID:  parentID,
-		ProjectID: projectID,
-		Provider:  provider,
-		Model:     model,
-		Title:     sess.Title,
-		Status:    string(sess.Status),
-		CreatedAt: sess.CreatedAt,
-		UpdatedAt: sess.UpdatedAt,
-		Messages:  s.messagesToResponse(sess.Messages),
+		ID:                   sess.ID,
+		AgentID:              sess.AgentID,
+		ParentID:             parentID,
+		ProjectID:            projectID,
+		Provider:             provider,
+		Model:                model,
+		RoutedProvider:       routedProvider,
+		RoutedModel:          routedModel,
+		Title:                sess.Title,
+		Status:               string(sess.Status),
+		CreatedAt:            sess.CreatedAt,
+		UpdatedAt:            sess.UpdatedAt,
+		Messages:             s.messagesToResponse(sess.Messages),
+		SystemPromptSnapshot: snapshotPayload,
 	}
 }
 
@@ -1887,6 +2158,544 @@ func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+type configuredInstructionBlock struct {
+	Type    string `json:"type"`
+	Value   string `json:"value"`
+	Enabled *bool  `json:"enabled,omitempty"`
+}
+
+type systemPromptSnapshot struct {
+	BasePrompt        string                      `json:"base_prompt"`
+	CombinedPrompt    string                      `json:"combined_prompt"`
+	BaseEstimated     int                         `json:"base_estimated_tokens"`
+	CombinedEstimated int                         `json:"combined_estimated_tokens"`
+	Blocks            []systemPromptBlockSnapshot `json:"blocks"`
+}
+
+type systemPromptBlockSnapshot struct {
+	Type            string `json:"type"`
+	Value           string `json:"value"`
+	Enabled         bool   `json:"enabled"`
+	ResolvedContent string `json:"resolved_content,omitempty"`
+	SourcePath      string `json:"source_path,omitempty"`
+	Error           string `json:"error,omitempty"`
+	EstimatedTokens int    `json:"estimated_tokens"`
+}
+
+func (s *Server) buildSystemPromptForSession(sess *session.Session) string {
+	snapshot := s.ensureSessionSystemPromptSnapshot(sess)
+	if snapshot == nil {
+		return ""
+	}
+	return strings.TrimSpace(snapshot.CombinedPrompt)
+}
+
+func (s *Server) ensureSessionSystemPromptSnapshot(sess *session.Session) *systemPromptSnapshot {
+	if sess == nil {
+		return nil
+	}
+
+	if snapshot := sessionSystemPromptSnapshot(sess); snapshot != nil {
+		return snapshot
+	}
+
+	snapshot := s.composeSystemPromptSnapshot(sess)
+	if snapshot == nil {
+		return nil
+	}
+	attachSessionSystemPromptSnapshot(sess, snapshot)
+	if err := s.sessionManager.Save(sess); err != nil {
+		logging.Warn("Failed to persist system prompt snapshot for session %s: %v", sess.ID, err)
+	}
+	return snapshot
+}
+
+func sessionSystemPromptSnapshot(sess *session.Session) *systemPromptSnapshot {
+	if sess == nil || sess.Metadata == nil {
+		return nil
+	}
+	raw, ok := sess.Metadata[sessionSystemPromptSnapshotMetadataKey]
+	if !ok {
+		return nil
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var snapshot systemPromptSnapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return nil
+	}
+	snapshot.CombinedPrompt = strings.TrimSpace(snapshot.CombinedPrompt)
+	snapshot.BasePrompt = strings.TrimSpace(snapshot.BasePrompt)
+	if snapshot.CombinedPrompt == "" {
+		return nil
+	}
+	return &snapshot
+}
+
+func attachSessionSystemPromptSnapshot(sess *session.Session, snapshot *systemPromptSnapshot) {
+	if sess == nil || snapshot == nil {
+		return
+	}
+	if sess.Metadata == nil {
+		sess.Metadata = make(map[string]interface{})
+	}
+	sess.Metadata[sessionSystemPromptSnapshotMetadataKey] = snapshot
+}
+
+func (s *Server) composeSystemPromptSnapshot(sess *session.Session) *systemPromptSnapshot {
+	settings, err := s.store.GetSettings()
+	if err != nil {
+		logging.Warn("Failed to load settings for system prompt composition: %v", err)
+		settings = map[string]string{}
+	}
+	return s.composeSystemPromptSnapshotWithSettings(sess, settings)
+}
+
+func (s *Server) composeSystemPromptSnapshotWithSettings(sess *session.Session, settings map[string]string) *systemPromptSnapshot {
+	rawBlocks := strings.TrimSpace(settings[agentInstructionBlocksSettingKey])
+	blocks := []configuredInstructionBlock{}
+	if rawBlocks != "" {
+		if err := json.Unmarshal([]byte(rawBlocks), &blocks); err != nil {
+			logging.Warn("Failed to parse %s: %v", agentInstructionBlocksSettingKey, err)
+			blocks = []configuredInstructionBlock{}
+		}
+	}
+	hasBuiltInBlock := false
+	hasIntegrationBlock := false
+	hasExternalMarkdownBlock := false
+	for _, block := range blocks {
+		switch strings.TrimSpace(block.Type) {
+		case builtInToolsInstructionBlockType:
+			hasBuiltInBlock = true
+		case integrationSkillsInstructionBlockType:
+			hasIntegrationBlock = true
+		case externalMarkdownSkillsInstructionBlockType:
+			hasExternalMarkdownBlock = true
+		}
+	}
+	prefixedBlocks := make([]configuredInstructionBlock, 0, 3+len(blocks))
+	if !hasBuiltInBlock {
+		prefixedBlocks = append(prefixedBlocks, configuredInstructionBlock{Type: builtInToolsInstructionBlockType, Value: ""})
+	}
+	if !hasIntegrationBlock {
+		prefixedBlocks = append(prefixedBlocks, configuredInstructionBlock{Type: integrationSkillsInstructionBlockType, Value: ""})
+	}
+	if !hasExternalMarkdownBlock {
+		prefixedBlocks = append(prefixedBlocks, configuredInstructionBlock{Type: externalMarkdownSkillsInstructionBlockType, Value: ""})
+	}
+	blocks = append(prefixedBlocks, blocks...)
+
+	builtInToolsEnabled := true
+	for _, block := range blocks {
+		if strings.TrimSpace(block.Type) != builtInToolsInstructionBlockType {
+			continue
+		}
+		builtInToolsEnabled = block.Enabled == nil || *block.Enabled
+		break
+	}
+
+	basePrompt := strings.TrimSpace(os.Getenv("AAGENT_SYSTEM_PROMPT"))
+	if basePrompt == "" {
+		if builtInToolsEnabled {
+			basePrompt = agent.DefaultSystemPrompt()
+		} else {
+			basePrompt = agent.DefaultSystemPromptWithoutBuiltInTools()
+		}
+	}
+	if basePrompt == "" {
+		return nil
+	}
+
+	resolvedBlocks := make([]systemPromptBlockSnapshot, 0, len(blocks))
+	resolvedBlocks = append(resolvedBlocks, systemPromptBlockSnapshot{
+		Type:            builtInToolsInstructionBlockType,
+		Value:           "",
+		Enabled:         builtInToolsEnabled,
+		ResolvedContent: "Controls whether built-in tool guidance is included in the base system prompt.",
+		EstimatedTokens: builtInToolsEstimatedTokens(basePrompt, builtInToolsEnabled),
+	})
+	appendSections := make([]string, 0, len(blocks))
+	sectionNumber := 0
+	for _, block := range blocks {
+		blockType := strings.TrimSpace(block.Type)
+		if blockType == builtInToolsInstructionBlockType {
+			continue
+		}
+		sectionNumber++
+
+		enabled := block.Enabled == nil || *block.Enabled
+		blockSnapshot := systemPromptBlockSnapshot{
+			Type:    blockType,
+			Value:   strings.TrimSpace(block.Value),
+			Enabled: enabled,
+		}
+		if !enabled {
+			resolvedBlocks = append(resolvedBlocks, blockSnapshot)
+			continue
+		}
+
+		value := blockSnapshot.Value
+		switch blockType {
+		case integrationSkillsInstructionBlockType:
+			section, resolveErr := s.resolveIntegrationSkillsSection(sectionNumber)
+			blockSnapshot.ResolvedContent = section
+			blockSnapshot.Error = resolveErr
+			if section == "" {
+				resolvedBlocks = append(resolvedBlocks, blockSnapshot)
+				continue
+			}
+			blockSnapshot.EstimatedTokens = estimateTokensApprox(section)
+			appendSections = append(appendSections, section)
+		case externalMarkdownSkillsInstructionBlockType:
+			section, estimatedTokens, resolveErr := s.resolveExternalMarkdownSkillsSection(settings, sectionNumber)
+			blockSnapshot.ResolvedContent = section
+			blockSnapshot.Error = resolveErr
+			if section == "" {
+				resolvedBlocks = append(resolvedBlocks, blockSnapshot)
+				continue
+			}
+			blockSnapshot.EstimatedTokens = estimatedTokens
+			appendSections = append(appendSections, section)
+		case "text":
+			if value == "" {
+				resolvedBlocks = append(resolvedBlocks, blockSnapshot)
+				continue
+			}
+			blockSnapshot.ResolvedContent = value
+			rendered := fmt.Sprintf("Instruction block %d (text):\n%s", sectionNumber, blockSnapshot.ResolvedContent)
+			blockSnapshot.EstimatedTokens = estimateTokensApprox(rendered)
+			appendSections = append(appendSections, rendered)
+		case "file":
+			if value == "" {
+				resolvedBlocks = append(resolvedBlocks, blockSnapshot)
+				continue
+			}
+			blockSnapshot.SourcePath = value
+			content, readErr := s.readInstructionFileBlock(value)
+			if readErr != nil {
+				blockSnapshot.Error = readErr.Error()
+				rendered := fmt.Sprintf("Instruction block %d (file):\nUnable to load file %s: %s", sectionNumber, value, readErr.Error())
+				blockSnapshot.EstimatedTokens = estimateTokensApprox(rendered)
+				appendSections = append(appendSections, rendered)
+			} else {
+				blockSnapshot.ResolvedContent = content
+				rendered := fmt.Sprintf("Instruction block %d (file):\n%s", sectionNumber, content)
+				blockSnapshot.EstimatedTokens = estimateTokensApprox(rendered)
+				appendSections = append(appendSections, rendered)
+			}
+		case "project_agents_md":
+			section := s.resolveProjectAgentsMDSection(sess, settings, value, sectionNumber)
+			blockSnapshot.ResolvedContent = section
+			if section == "" {
+				blockSnapshot.Error = "No project/My Mind instruction file content found."
+				resolvedBlocks = append(resolvedBlocks, blockSnapshot)
+				continue
+			}
+			blockSnapshot.EstimatedTokens = estimateTokensApprox(section)
+			appendSections = append(appendSections, section)
+		default:
+			if value == "" {
+				resolvedBlocks = append(resolvedBlocks, blockSnapshot)
+				continue
+			}
+			blockSnapshot.Type = "text"
+			blockSnapshot.ResolvedContent = value
+			rendered := fmt.Sprintf("Instruction block %d (text):\n%s", sectionNumber, value)
+			blockSnapshot.EstimatedTokens = estimateTokensApprox(rendered)
+			appendSections = append(appendSections, rendered)
+		}
+		resolvedBlocks = append(resolvedBlocks, blockSnapshot)
+	}
+
+	if len(appendSections) == 0 {
+		if appendPrompt := strings.TrimSpace(os.Getenv("AAGENT_SYSTEM_PROMPT_APPEND")); appendPrompt != "" {
+			combinedPrompt := strings.TrimSpace(basePrompt) + "\n\n" + appendPrompt
+			return &systemPromptSnapshot{
+				BasePrompt:        basePrompt,
+				CombinedPrompt:    combinedPrompt,
+				BaseEstimated:     estimateTokensApprox(basePrompt),
+				CombinedEstimated: estimateTokensApprox(combinedPrompt),
+				Blocks:            resolvedBlocks,
+			}
+		}
+		return &systemPromptSnapshot{
+			BasePrompt:        basePrompt,
+			CombinedPrompt:    basePrompt,
+			BaseEstimated:     estimateTokensApprox(basePrompt),
+			CombinedEstimated: estimateTokensApprox(basePrompt),
+			Blocks:            resolvedBlocks,
+		}
+	}
+	combinedPrompt := strings.TrimSpace(basePrompt) + "\n\nApply these additional instructions in order:\n\n" + strings.Join(appendSections, "\n\n")
+	return &systemPromptSnapshot{
+		BasePrompt:        basePrompt,
+		CombinedPrompt:    combinedPrompt,
+		BaseEstimated:     estimateTokensApprox(basePrompt),
+		CombinedEstimated: estimateTokensApprox(combinedPrompt),
+		Blocks:            resolvedBlocks,
+	}
+}
+
+func builtInToolsEstimatedTokens(basePrompt string, enabled bool) int {
+	if !enabled {
+		return 0
+	}
+	if strings.TrimSpace(os.Getenv("AAGENT_SYSTEM_PROMPT")) != "" {
+		return 0
+	}
+	withTools := estimateTokensApprox(agent.DefaultSystemPrompt())
+	withoutTools := estimateTokensApprox(agent.DefaultSystemPromptWithoutBuiltInTools())
+	diff := withTools - withoutTools
+	if diff < 0 {
+		return 0
+	}
+	_ = basePrompt
+	return diff
+}
+
+func estimateTokensApprox(text string) int {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return 0
+	}
+	runes := utf8.RuneCountInString(trimmed)
+	if runes <= 0 {
+		return 0
+	}
+	return int(math.Ceil(float64(runes) / 4.0))
+}
+
+func (s *Server) readInstructionFileBlock(path string) (string, error) {
+	clean := strings.TrimSpace(path)
+	if clean == "" {
+		return "", fmt.Errorf("empty file path")
+	}
+	data, err := os.ReadFile(clean)
+	if err != nil {
+		return "", err
+	}
+	content := strings.TrimSpace(string(data))
+	if content == "" {
+		return "", fmt.Errorf("file is empty")
+	}
+	if len(content) > maxDynamicInstructionBytes {
+		content = content[:maxDynamicInstructionBytes] + "\n\n[truncated]"
+	}
+	return content, nil
+}
+
+func (s *Server) resolveProjectAgentsMDSection(sess *session.Session, settings map[string]string, rawFilename string, blockNumber int) string {
+	folders := make([]string, 0, 4)
+	if sess != nil && sess.ProjectID != nil && strings.TrimSpace(*sess.ProjectID) != "" {
+		project, err := s.store.GetProject(strings.TrimSpace(*sess.ProjectID))
+		if err == nil && project != nil {
+			folders = append(folders, project.Folders...)
+		}
+	}
+	if len(folders) == 0 {
+		mindRoot := strings.TrimSpace(settings[mindRootFolderSettingKey])
+		if mindRoot != "" {
+			folders = append(folders, mindRoot)
+		}
+	}
+	if len(folders) == 0 {
+		return ""
+	}
+
+	filename := strings.TrimSpace(rawFilename)
+	if filename == "" {
+		filename = defaultDynamicInstructionFile
+	}
+
+	pathsToTry := []string{filename}
+	lower := strings.ToLower(filename)
+	if lower != filename {
+		pathsToTry = append(pathsToTry, lower)
+	}
+
+	collected := make([]string, 0, len(folders))
+	for _, folder := range folders {
+		base := strings.TrimSpace(folder)
+		if base == "" {
+			continue
+		}
+		for _, rel := range pathsToTry {
+			candidate := rel
+			if !filepath.IsAbs(rel) {
+				candidate = filepath.Join(base, rel)
+			}
+			data, readErr := os.ReadFile(candidate)
+			if readErr != nil {
+				continue
+			}
+			content := strings.TrimSpace(string(data))
+			if content == "" {
+				continue
+			}
+			if len(content) > maxDynamicInstructionBytes {
+				content = content[:maxDynamicInstructionBytes] + "\n\n[truncated]"
+			}
+			collected = append(collected, fmt.Sprintf("Project instruction file (%s):\n%s", candidate, content))
+			break
+		}
+	}
+
+	if len(collected) == 0 {
+		return ""
+	}
+
+	return fmt.Sprintf("Instruction block %d (dynamic project file):\n%s", blockNumber, strings.Join(collected, "\n\n"))
+}
+
+func (s *Server) resolveIntegrationSkillsSection(blockNumber int) (string, string) {
+	integrations, err := s.store.ListIntegrations()
+	if err != nil {
+		return "", "Failed to list integrations: " + err.Error()
+	}
+
+	type skillEntry struct {
+		name     string
+		provider string
+		mode     string
+	}
+	entries := make([]skillEntry, 0, len(integrations))
+	for _, integration := range integrations {
+		if integration == nil || !integration.Enabled {
+			continue
+		}
+		entries = append(entries, skillEntry{
+			name:     strings.TrimSpace(integration.Name),
+			provider: strings.TrimSpace(integration.Provider),
+			mode:     strings.TrimSpace(integration.Mode),
+		})
+	}
+
+	if len(entries) == 0 {
+		return "", "No enabled integrations are configured."
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		left := strings.ToLower(entries[i].provider + "|" + entries[i].name + "|" + entries[i].mode)
+		right := strings.ToLower(entries[j].provider + "|" + entries[j].name + "|" + entries[j].mode)
+		return left < right
+	})
+
+	lines := make([]string, 0, len(entries)+2)
+	lines = append(lines, fmt.Sprintf("Instruction block %d (integration-backed skills):", blockNumber))
+	lines = append(lines, "Enabled integrations available to the agent (integration mode controls channel behavior, not tool availability):")
+	for _, entry := range entries {
+		label := entry.name
+		if label == "" {
+			label = entry.provider
+		}
+		mode := entry.mode
+		if mode == "" {
+			mode = "unknown"
+		}
+		lines = append(lines, fmt.Sprintf("- %s (%s/%s)", label, entry.provider, mode))
+	}
+
+	return strings.Join(lines, "\n"), ""
+}
+
+func (s *Server) resolveExternalMarkdownSkillsSection(settings map[string]string, blockNumber int) (string, int, string) {
+	folder := strings.TrimSpace(settings[skillsFolderSettingKey])
+	if folder == "" {
+		return "", 0, "Skills folder is not configured."
+	}
+
+	resolvedFolder, err := filepath.Abs(folder)
+	if err != nil {
+		return "", 0, "Invalid skills folder path."
+	}
+
+	info, err := os.Stat(resolvedFolder)
+	if err != nil {
+		return "", 0, "Skills folder is not accessible: " + err.Error()
+	}
+	if !info.IsDir() {
+		return "", 0, "Skills folder path is not a directory."
+	}
+
+	skills := make([]SkillFile, 0, 32)
+	walkErr := filepath.WalkDir(resolvedFolder, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			if path != resolvedFolder && strings.HasPrefix(d.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !isMarkdownFile(d.Name()) {
+			return nil
+		}
+		relPath, err := filepath.Rel(resolvedFolder, path)
+		if err != nil {
+			return nil
+		}
+		skills = append(skills, SkillFile{
+			Name:         deriveSkillName(path, d.Name()),
+			Path:         path,
+			RelativePath: filepath.ToSlash(relPath),
+		})
+		return nil
+	})
+	if walkErr != nil {
+		return "", 0, "Failed to scan skills folder: " + walkErr.Error()
+	}
+
+	if len(skills) == 0 {
+		return "", 0, "No markdown skills discovered in configured skills folder."
+	}
+
+	sort.Slice(skills, func(i, j int) bool {
+		return strings.ToLower(skills[i].RelativePath) < strings.ToLower(skills[j].RelativePath)
+	})
+
+	const maxListedSkills = 100
+	displaySkills := skills
+	truncated := false
+	if len(displaySkills) > maxListedSkills {
+		displaySkills = displaySkills[:maxListedSkills]
+		truncated = true
+	}
+
+	lines := make([]string, 0, len(displaySkills)+4)
+	lines = append(lines, fmt.Sprintf("Instruction block %d (external markdown skills):", blockNumber))
+	lines = append(lines, fmt.Sprintf("Connected skills folder: %s", resolvedFolder))
+	lines = append(lines, "Discovered markdown skills available to the agent:")
+	for _, skill := range displaySkills {
+		lines = append(lines, fmt.Sprintf("- %s [%s]", skill.Name, skill.RelativePath))
+	}
+	if truncated {
+		lines = append(lines, fmt.Sprintf("(showing %d of %d skills)", len(displaySkills), len(skills)))
+	}
+
+	totalEstimatedTokens := 0
+	for _, skill := range skills {
+		data, readErr := os.ReadFile(skill.Path)
+		if readErr != nil {
+			continue
+		}
+		content := strings.TrimSpace(string(data))
+		if content == "" {
+			continue
+		}
+		if len(content) > maxDynamicInstructionBytes {
+			content = content[:maxDynamicInstructionBytes] + "\n\n[truncated]"
+		}
+		totalEstimatedTokens += estimateTokensApprox(content)
+	}
+	// Include the overhead from the generated instruction wrapper/list itself.
+	totalEstimatedTokens += estimateTokensApprox(strings.Join(lines, "\n"))
+
+	return strings.Join(lines, "\n"), totalEstimatedTokens, ""
+}
+
 func syncSettingsToEnv(previous map[string]string, next map[string]string) {
 	for key := range previous {
 		if _, ok := next[key]; ok {
@@ -1934,6 +2743,75 @@ func sessionProviderAndModel(sess *session.Session) (string, string) {
 	return provider, model
 }
 
+func sessionRoutedProviderAndModel(sess *session.Session) (string, string) {
+	if sess == nil || sess.Metadata == nil {
+		return "", ""
+	}
+
+	provider := ""
+	model := ""
+	if rawProvider, ok := sess.Metadata["routed_provider"]; ok {
+		if v, ok := rawProvider.(string); ok {
+			provider = strings.TrimSpace(v)
+		}
+	}
+	if rawModel, ok := sess.Metadata["routed_model"]; ok {
+		if v, ok := rawModel.(string); ok {
+			model = strings.TrimSpace(v)
+		}
+	}
+
+	return provider, model
+}
+
+func setSessionRoutedProviderAndModel(sess *session.Session, requestedProvider config.ProviderType, routedProvider config.ProviderType, routedModel string) bool {
+	if sess == nil {
+		return false
+	}
+	if sess.Metadata == nil {
+		sess.Metadata = make(map[string]interface{})
+	}
+
+	changed := false
+	if requestedProvider != config.ProviderAutoRouter {
+		if _, ok := sess.Metadata["routed_provider"]; ok {
+			delete(sess.Metadata, "routed_provider")
+			changed = true
+		}
+		if _, ok := sess.Metadata["routed_model"]; ok {
+			delete(sess.Metadata, "routed_model")
+			changed = true
+		}
+		return changed
+	}
+
+	nextProvider := strings.TrimSpace(string(routedProvider))
+	nextModel := strings.TrimSpace(routedModel)
+
+	currentProvider, _ := sess.Metadata["routed_provider"].(string)
+	currentModel, _ := sess.Metadata["routed_model"].(string)
+
+	if strings.TrimSpace(currentProvider) != nextProvider {
+		if nextProvider == "" {
+			delete(sess.Metadata, "routed_provider")
+		} else {
+			sess.Metadata["routed_provider"] = nextProvider
+		}
+		changed = true
+	}
+
+	if strings.TrimSpace(currentModel) != nextModel {
+		if nextModel == "" {
+			delete(sess.Metadata, "routed_model")
+		} else {
+			sess.Metadata["routed_model"] = nextModel
+		}
+		changed = true
+	}
+
+	return changed
+}
+
 func storageSessionProviderAndModel(sess *storage.Session) (string, string) {
 	if sess == nil || sess.Metadata == nil {
 		return "", ""
@@ -1947,6 +2825,27 @@ func storageSessionProviderAndModel(sess *storage.Session) (string, string) {
 		}
 	}
 	if rawModel, ok := sess.Metadata["model"]; ok {
+		if v, ok := rawModel.(string); ok {
+			model = strings.TrimSpace(v)
+		}
+	}
+
+	return provider, model
+}
+
+func storageSessionRoutedProviderAndModel(sess *storage.Session) (string, string) {
+	if sess == nil || sess.Metadata == nil {
+		return "", ""
+	}
+
+	provider := ""
+	model := ""
+	if rawProvider, ok := sess.Metadata["routed_provider"]; ok {
+		if v, ok := rawProvider.(string); ok {
+			provider = strings.TrimSpace(v)
+		}
+	}
+	if rawModel, ok := sess.Metadata["routed_model"]; ok {
 		if v, ok := rawModel.(string); ok {
 			model = strings.TrimSpace(v)
 		}

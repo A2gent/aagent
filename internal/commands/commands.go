@@ -47,6 +47,11 @@ func NewRegistry() *Registry {
 				Description: "Show available commands",
 				Aliases:     []string{"h", "?"},
 			},
+			{
+				Name:        "logs",
+				Description: "Open live backend log view",
+				Aliases:     []string{"l"},
+			},
 		},
 	}
 }

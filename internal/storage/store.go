@@ -33,17 +33,19 @@ type Message struct {
 
 // RecurringJob represents a scheduled recurring job
 type RecurringJob struct {
-	ID            string
-	Name          string
-	ScheduleHuman string // Human-readable schedule (e.g., "every Monday at 9am")
-	ScheduleCron  string // Parsed cron expression (e.g., "0 9 * * 1")
-	TaskPrompt    string // The actual task instructions for the agent
-	LLMProvider   string // Optional provider override for this job
-	Enabled       bool
-	LastRunAt     *time.Time
-	NextRunAt     *time.Time
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID               string
+	Name             string
+	ScheduleHuman    string // Human-readable schedule (e.g., "every Monday at 9am")
+	ScheduleCron     string // Parsed cron expression (e.g., "0 9 * * 1")
+	TaskPrompt       string // The actual task instructions for the agent
+	TaskPromptSource string // "text" | "file"
+	TaskPromptFile   string // Absolute path when TaskPromptSource is "file"
+	LLMProvider      string // Optional provider override for this job
+	Enabled          bool
+	LastRunAt        *time.Time
+	NextRunAt        *time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 // JobExecution represents a single execution of a recurring job

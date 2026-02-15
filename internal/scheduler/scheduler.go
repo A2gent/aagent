@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gratheon/aagent/internal/agent"
 	"github.com/gratheon/aagent/internal/config"
+	"github.com/gratheon/aagent/internal/jobs"
 	"github.com/gratheon/aagent/internal/llm"
 	"github.com/gratheon/aagent/internal/llm/anthropic"
 	"github.com/gratheon/aagent/internal/llm/fallback"
@@ -183,6 +184,16 @@ func (s *Scheduler) executeJob(ctx context.Context, job *storage.RecurringJob) {
 	}
 
 	contextWindow := s.resolveContextWindowForProvider(providerType)
+	effectiveTaskPrompt, resolveErr := jobs.ResolveTaskPrompt(job)
+	if resolveErr != nil {
+		logging.Error("Failed to resolve task instructions for job %s: %v", job.ID, resolveErr)
+		exec.Status = "failed"
+		exec.Error = "Failed to resolve task instructions: " + resolveErr.Error()
+		finishedAt := time.Now()
+		exec.FinishedAt = &finishedAt
+		s.store.SaveJobExecution(exec)
+		return
+	}
 
 	agentConfig := agent.Config{
 		Name:          "job-runner",
@@ -209,9 +220,9 @@ func (s *Scheduler) executeJob(ctx context.Context, job *storage.RecurringJob) {
 	jobCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
 
-	sess.AddUserMessage(job.TaskPrompt)
+	sess.AddUserMessage(effectiveTaskPrompt)
 
-	output, _, err := ag.Run(jobCtx, sess, job.TaskPrompt)
+	output, _, err := ag.Run(jobCtx, sess, effectiveTaskPrompt)
 
 	finishedAt := time.Now()
 	exec.FinishedAt = &finishedAt

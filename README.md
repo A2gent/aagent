@@ -100,7 +100,9 @@ Environment variables:
 | `read` | Read file contents with line range support |
 | `write` | Create or overwrite files |
 | `edit` | String replacement edits in files |
+| `replace_lines` | Replace exact line ranges in files |
 | `glob` | Find files by pattern |
+| `find_files` | Find files with include/exclude filters |
 | `grep` | Search file contents with regex |
 
 ## Project Structure

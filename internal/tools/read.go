@@ -22,9 +22,11 @@ type ReadTool struct {
 
 // ReadParams defines parameters for the read tool
 type ReadParams struct {
-	Path   string `json:"path"`
-	Offset int    `json:"offset,omitempty"` // 0-based line offset
-	Limit  int    `json:"limit,omitempty"`  // Number of lines to read
+	Path      string `json:"path"`
+	Offset    int    `json:"offset,omitempty"`     // 0-based line offset
+	Limit     int    `json:"limit,omitempty"`      // Number of lines to read
+	StartLine int    `json:"start_line,omitempty"` // 1-based inclusive
+	EndLine   int    `json:"end_line,omitempty"`   // 1-based inclusive
 }
 
 // NewReadTool creates a new read tool
@@ -40,6 +42,7 @@ func (t *ReadTool) Description() string {
 	return `Read file contents from the filesystem.
 By default reads up to 2000 lines from the beginning.
 Use offset and limit for reading specific sections of large files.
+Use start_line and end_line for exact 1-based range reads.
 Line numbers in output start at 1.`
 }
 
@@ -59,6 +62,14 @@ func (t *ReadTool) Schema() map[string]interface{} {
 				"type":        "integer",
 				"description": "Maximum number of lines to read (default: 2000)",
 			},
+			"start_line": map[string]interface{}{
+				"type":        "integer",
+				"description": "1-based start line for exact range read (inclusive, optional)",
+			},
+			"end_line": map[string]interface{}{
+				"type":        "integer",
+				"description": "1-based end line for exact range read (inclusive, optional)",
+			},
 		},
 		"required": []string{"path"},
 	}
@@ -72,6 +83,12 @@ func (t *ReadTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 
 	if p.Path == "" {
 		return &Result{Success: false, Error: "path is required"}, nil
+	}
+	if p.StartLine < 0 || p.EndLine < 0 {
+		return &Result{Success: false, Error: "start_line and end_line must be >= 1 when provided"}, nil
+	}
+	if p.StartLine > 0 && p.EndLine > 0 && p.StartLine > p.EndLine {
+		return &Result{Success: false, Error: "start_line must be <= end_line"}, nil
 	}
 
 	// Resolve path
@@ -105,10 +122,12 @@ func (t *ReadTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 	if limit <= 0 {
 		limit = defaultReadLimit
 	}
+	rangeMode := p.StartLine > 0 || p.EndLine > 0
 
 	// Read lines
 	var lines []string
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	lineNum := 0
 	linesRead := 0
 
@@ -119,13 +138,31 @@ func (t *ReadTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 
 		lineNum++
 
+		if rangeMode {
+			startLine := p.StartLine
+			if startLine <= 0 {
+				startLine = 1
+			}
+			endLine := p.EndLine
+			if endLine <= 0 {
+				endLine = startLine + defaultReadLimit - 1
+			}
+
+			if lineNum < startLine {
+				continue
+			}
+			if lineNum > endLine {
+				break
+			}
+		}
+
 		// Skip lines before offset
-		if lineNum <= offset {
+		if !rangeMode && lineNum <= offset {
 			continue
 		}
 
 		// Check limit
-		if linesRead >= limit {
+		if !rangeMode && linesRead >= limit {
 			break
 		}
 
@@ -153,8 +190,15 @@ func (t *ReadTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 	}
 
 	output := strings.Join(lines, "\n")
-	if linesRead == limit {
+	if !rangeMode && linesRead == limit {
 		output += fmt.Sprintf("\n\n(showing lines %d-%d, file may have more content)", offset+1, lineNum)
+	}
+	if rangeMode && p.StartLine > 0 {
+		endLine := p.EndLine
+		if endLine <= 0 {
+			endLine = p.StartLine + linesRead - 1
+		}
+		output += fmt.Sprintf("\n\n(showing requested range starting at line %d through %d)", p.StartLine, endLine)
 	}
 
 	return &Result{

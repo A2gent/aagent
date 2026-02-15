@@ -39,6 +39,11 @@ type MindFileResponse struct {
 	Content    string `json:"content"`
 }
 
+type MindFileDeleteResponse struct {
+	RootFolder string `json:"root_folder"`
+	Path       string `json:"path"`
+}
+
 type UpdateMindFileRequest struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
@@ -324,6 +329,53 @@ func (s *Server) handleUpsertMindFile(w http.ResponseWriter, r *http.Request) {
 		RootFolder: rootFolder,
 		Path:       filepath.ToSlash(normalizedRelPath),
 		Content:    req.Content,
+	})
+}
+
+func (s *Server) handleDeleteMindFile(w http.ResponseWriter, r *http.Request) {
+	rootFolder, err := s.loadMindRootFolder()
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	relPath := strings.TrimSpace(r.URL.Query().Get("path"))
+	resolvedPath, normalizedRelPath, err := resolveMindPath(rootFolder, relPath)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if normalizedRelPath == "" {
+		s.errorResponse(w, http.StatusBadRequest, "File path is required")
+		return
+	}
+	if !isMarkdownFile(normalizedRelPath) {
+		s.errorResponse(w, http.StatusBadRequest, "Only markdown files can be deleted")
+		return
+	}
+
+	info, err := os.Stat(resolvedPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			s.errorResponse(w, http.StatusNotFound, "File does not exist")
+			return
+		}
+		s.errorResponse(w, http.StatusBadRequest, "Failed to access file: "+err.Error())
+		return
+	}
+	if info.IsDir() {
+		s.errorResponse(w, http.StatusBadRequest, "Path is a directory")
+		return
+	}
+
+	if err := os.Remove(resolvedPath); err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to delete file: "+err.Error())
+		return
+	}
+
+	s.jsonResponse(w, http.StatusOK, MindFileDeleteResponse{
+		RootFolder: rootFolder,
+		Path:       filepath.ToSlash(normalizedRelPath),
 	})
 }
 

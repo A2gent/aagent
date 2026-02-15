@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/go-chi/chi/v5"
 )
 
 const (
@@ -149,6 +151,32 @@ func (s *Server) handleCompletionSpeech(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusOK)
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		// Client may disconnect mid-stream; nothing actionable for handler.
+		return
+	}
+}
+
+func (s *Server) handleGetSpeechClip(w http.ResponseWriter, r *http.Request) {
+	clipID := strings.TrimSpace(chi.URLParam(r, "clipID"))
+	if clipID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "clipID is required")
+		return
+	}
+	if s.speechClips == nil {
+		s.errorResponse(w, http.StatusNotFound, "Speech clip store is unavailable")
+		return
+	}
+
+	contentType, payload, ok := s.speechClips.Load(clipID)
+	if !ok {
+		s.errorResponse(w, http.StatusNotFound, "Speech clip not found or expired")
+		return
+	}
+	if contentType == "" {
+		contentType = "audio/mpeg"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(payload); err != nil {
 		return
 	}
 }
