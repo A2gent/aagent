@@ -30,7 +30,7 @@ just build
 export KIMI_API_KEY=sk-kimi-...
 
 # 3. Launch and start coding!
-aa "Create a hello world Go program"
+a2 "Create a hello world Go program"
 ```
 
 ## Session Model (Important)
@@ -80,25 +80,25 @@ export KIMI_API_KEY=sk-kimi-...
 
 | Command | Description |
 |---------|-------------|
-| `aa` | Launch interactive TUI mode |
-| `aa "<task>"` | Run with an initial task |
-| `aa --continue <session-id>` | Resume a previous session |
-| `aa session list` | List all sessions |
-| `aa logs` | View session logs |
-| `aa logs -f` | Follow logs in real-time |
+| `a2` | Launch interactive TUI mode |
+| `a2 "<task>"` | Run with an initial task |
+| `a2 --continue <session-id>` | Resume a previous session |
+| `a2 session list` | List all sessions |
+| `a2 logs` | View session logs |
+| `a2 logs -f` | Follow logs in real-time |
 
 ### Examples
 
 ```bash
 # Interactive mode
-aa
+a2
 
 # Run a specific task
-aa "Refactor the auth module to use JWT tokens"
+a2 "Refactor the auth module to use JWT tokens"
 
 # Continue previous work
-aa session list                    # Find your session ID
-aa --continue abc123-def456-789   # Resume from where you left off
+a2 session list                    # Find your session ID
+a2 --continue abc123-def456-789   # Resume from where you left off
 ```
 
 ## TUI Interface
@@ -285,14 +285,14 @@ go version
 
 **Solution:** List available sessions and check the ID:
 ```bash
-aa session list
+a2 session list
 ```
 
 ### Logs
 
 View detailed logs for debugging:
 ```bash
-aa logs -f
+a2 logs -f
 ```
 
 ## License

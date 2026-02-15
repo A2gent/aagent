@@ -1,5 +1,5 @@
 # Binary name
-binary := "aa"
+binary := "a2"
 
 # Run the agent with go run (faster for development)
 run:
