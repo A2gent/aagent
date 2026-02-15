@@ -220,6 +220,7 @@ func (s *Server) setupRoutes() {
 	// Speech/TTS helpers (proxied through backend)
 	r.Route("/speech", func(r chi.Router) {
 		r.Get("/voices", s.handleListSpeechVoices)
+		r.Get("/piper/voices", s.handleListPiperVoices)
 		r.Post("/completion", s.handleCompletionSpeech)
 		r.Get("/clips/{clipID}", s.handleGetSpeechClip)
 	})

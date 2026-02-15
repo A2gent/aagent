@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +20,21 @@ import (
 const (
 	elevenLabsVoicesURL = "https://api.elevenlabs.io/v1/voices"
 )
+
+var recommendedPiperVoices = []string{
+	"en_US-lessac-medium",
+	"en_US-ryan-high",
+	"en_GB-alan-medium",
+	"de_DE-thorsten-medium",
+	"fr_FR-siwis-medium",
+	"es_ES-sharvard-medium",
+	"it_IT-riccardo-x_low",
+	"pt_BR-faber-medium",
+	"ru_RU-ruslan-medium",
+	"uk_UA-lada-x_low",
+	"ja_JP-kokoro-medium",
+	"zh_CN-huayan-medium",
+}
 
 type speechCompletionRequest struct {
 	Text string `json:"text"`
@@ -41,6 +58,12 @@ type elevenLabsTTSRequest struct {
 
 type elevenLabsVoiceSettings struct {
 	Speed float64 `json:"speed,omitempty"`
+}
+
+type piperVoiceOption struct {
+	ID        string `json:"id"`
+	Installed bool   `json:"installed"`
+	ModelPath string `json:"model_path,omitempty"`
 }
 
 func (s *Server) handleListSpeechVoices(w http.ResponseWriter, r *http.Request) {
@@ -78,6 +101,67 @@ func (s *Server) handleListSpeechVoices(w http.ResponseWriter, r *http.Request) 
 	}
 
 	s.jsonResponse(w, http.StatusOK, payload.Voices)
+}
+
+func (s *Server) handleListPiperVoices(w http.ResponseWriter, r *http.Request) {
+	dataDir := resolveAAgentDataDirForHTTP()
+	modelsDir := filepath.Join(dataDir, "tts", "piper", "models")
+
+	installed := map[string]string{}
+	_ = filepath.WalkDir(modelsDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d == nil || d.IsDir() {
+			return nil
+		}
+		if !strings.EqualFold(filepath.Ext(d.Name()), ".onnx") {
+			return nil
+		}
+		id := strings.TrimSuffix(d.Name(), ".onnx")
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return nil
+		}
+		installed[id] = filepath.Clean(path)
+		return nil
+	})
+
+	seen := map[string]struct{}{}
+	out := make([]piperVoiceOption, 0, len(recommendedPiperVoices)+len(installed))
+
+	for _, id := range recommendedPiperVoices {
+		trimmed := strings.TrimSpace(id)
+		if trimmed == "" {
+			continue
+		}
+		_, already := seen[trimmed]
+		if already {
+			continue
+		}
+		modelPath, ok := installed[trimmed]
+		out = append(out, piperVoiceOption{
+			ID:        trimmed,
+			Installed: ok,
+			ModelPath: modelPath,
+		})
+		seen[trimmed] = struct{}{}
+	}
+
+	installedIDs := make([]string, 0, len(installed))
+	for id := range installed {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		installedIDs = append(installedIDs, id)
+	}
+	sort.Strings(installedIDs)
+	for _, id := range installedIDs {
+		out = append(out, piperVoiceOption{
+			ID:        id,
+			Installed: true,
+			ModelPath: installed[id],
+		})
+	}
+
+	s.jsonResponse(w, http.StatusOK, out)
 }
 
 func (s *Server) handleCompletionSpeech(w http.ResponseWriter, r *http.Request) {
@@ -205,4 +289,15 @@ func (s *Server) proxyElevenLabsError(w http.ResponseWriter, upstream *http.Resp
 		statusDetail = upstream.Status
 	}
 	s.errorResponse(w, upstream.StatusCode, fmt.Sprintf("%s: %s", fallback, statusDetail))
+}
+
+func resolveAAgentDataDirForHTTP() string {
+	if raw := strings.TrimSpace(os.Getenv("AAGENT_DATA_PATH")); raw != "" {
+		return filepath.Clean(raw)
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(homeDir) == "" {
+		return filepath.Clean(filepath.Join(".", ".aagent-data"))
+	}
+	return filepath.Join(homeDir, ".local", "share", "aagent")
 }

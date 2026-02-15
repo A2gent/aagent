@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -76,7 +78,7 @@ type contentBlock struct {
 	Name      string `json:"name,omitempty"`
 	Input     any    `json:"input,omitempty"`
 	ToolUseID string `json:"tool_use_id,omitempty"`
-	Content   string `json:"content,omitempty"`
+	Content   any    `json:"content,omitempty"`
 	IsError   bool   `json:"is_error,omitempty"`
 }
 
@@ -443,10 +445,27 @@ func (c *Client) convertMessage(msg llm.Message) anthropicMessage {
 		// Tool results need special handling
 		blocks := make([]contentBlock, 0, len(msg.ToolResults))
 		for _, result := range msg.ToolResults {
+			content := any(result.Content)
+			if inline := extractInlineImage(result.Metadata); inline != nil {
+				content = []map[string]interface{}{
+					{
+						"type": "image",
+						"source": map[string]interface{}{
+							"type":       "base64",
+							"media_type": inline.MediaType,
+							"data":       inline.DataBase64,
+						},
+					},
+					{
+						"type": "text",
+						"text": result.Content,
+					},
+				}
+			}
 			blocks = append(blocks, contentBlock{
 				Type:      "tool_result",
 				ToolUseID: result.ToolCallID,
-				Content:   result.Content,
+				Content:   content,
 				IsError:   result.IsError,
 			})
 		}
@@ -486,6 +505,79 @@ func (c *Client) convertMessage(msg llm.Message) anthropicMessage {
 		Role:    msg.Role,
 		Content: msg.Content,
 	}
+}
+
+type inlineImage struct {
+	MediaType  string
+	DataBase64 string
+}
+
+func extractInlineImage(metadata map[string]interface{}) *inlineImage {
+	if len(metadata) == 0 {
+		return nil
+	}
+	rawInline, ok := metadata["image_inline"]
+	if !ok {
+		return nil
+	}
+	inlineMap, ok := rawInline.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	mediaType, _ := inlineMap["media_type"].(string)
+	dataBase64, _ := inlineMap["data_base64"].(string)
+	mediaType = strings.TrimSpace(mediaType)
+	dataBase64 = strings.TrimSpace(dataBase64)
+	if mediaType == "" {
+		return nil
+	}
+	if dataBase64 == "" {
+		path := strings.TrimSpace(asString(inlineMap["path"]))
+		if path == "" {
+			path = strings.TrimSpace(asString(metadataPath(metadata)))
+		}
+		if path == "" {
+			return nil
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil || len(raw) == 0 {
+			return nil
+		}
+		maxBytes := int64(2 * 1024 * 1024)
+		if v, ok := inlineMap["max_bytes"].(float64); ok && int64(v) > 0 {
+			maxBytes = int64(v)
+		}
+		if int64(len(raw)) > maxBytes {
+			return nil
+		}
+		dataBase64 = base64.StdEncoding.EncodeToString(raw)
+	}
+	if dataBase64 == "" {
+		return nil
+	}
+	return &inlineImage{
+		MediaType:  mediaType,
+		DataBase64: dataBase64,
+	}
+}
+
+func metadataPath(metadata map[string]interface{}) string {
+	imageFile, ok := metadata["image_file"]
+	if !ok {
+		return ""
+	}
+	imageFileMap, ok := imageFile.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	return asString(imageFileMap["path"])
+}
+
+func asString(value interface{}) string {
+	if s, ok := value.(string); ok {
+		return s
+	}
+	return ""
 }
 
 // Ensure Client implements llm.Client

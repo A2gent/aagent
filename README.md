@@ -105,6 +105,7 @@ Environment variables:
 | `find_files` | Find files with include/exclude filters |
 | `grep` | Search file contents with regex |
 | `take_screenshot_tool` | Capture screenshots (main/all/specific display/area) with configurable output path and Tools UI defaults |
+| `take_camera_photo_tool` | Capture camera photos with configurable camera index/output path and optional inline image metadata for multimodal handoff (macOS uses native AVFoundation via cgo) |
 
 ## Project Structure
 

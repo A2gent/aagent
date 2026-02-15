@@ -8,10 +8,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gratheon/aagent/internal/speechcache"
 	"github.com/gratheon/aagent/internal/tools"
@@ -22,7 +24,25 @@ const (
 	piperOutputModeFile   = "file"
 	piperOutputModeBoth   = "both"
 	piperDefaultExt       = ".wav"
+
+	defaultPiperModelID   = "en_US-lessac-medium"
+	defaultPiperPackage   = "piper-tts"
+	defaultPiperVenvRel   = "tts/piper/runtime"
+	defaultPiperModelsRel = "tts/piper/models"
 )
+
+var piperLanguageModelDefaults = map[string]string{
+	"en": "en_US-lessac-medium",
+	"ru": "ru_RU-ruslan-medium",
+	"uk": "uk_UA-lada-x_low",
+	"de": "de_DE-thorsten-medium",
+	"fr": "fr_FR-siwis-medium",
+	"es": "es_ES-sharvard-medium",
+	"it": "it_IT-riccardo-x_low",
+	"pt": "pt_BR-faber-medium",
+	"ja": "ja_JP-kokoro-medium",
+	"zh": "zh_CN-huayan-medium",
+}
 
 type PiperTTSTool struct {
 	workDir   string
@@ -31,15 +51,26 @@ type PiperTTSTool struct {
 
 type piperTTSParams struct {
 	Text          string   `json:"text"`
+	PiperBin      string   `json:"piper_bin,omitempty"`
 	ModelPath     string   `json:"model_path,omitempty"`
 	ConfigPath    string   `json:"config_path,omitempty"`
+	Language      string   `json:"language,omitempty"`
 	SpeakerID     *int     `json:"speaker_id,omitempty"`
 	LengthScale   *float64 `json:"length_scale,omitempty"`
 	NoiseScale    *float64 `json:"noise_scale,omitempty"`
 	NoiseW        *float64 `json:"noise_w,omitempty"`
+	AutoModelPick *bool    `json:"auto_model_select,omitempty"`
+	AutoSetup     *bool    `json:"auto_setup,omitempty"`
 	OutputMode    string   `json:"output_mode,omitempty"`
 	OutputPath    string   `json:"output_path,omitempty"`
 	AutoPlayAudio *bool    `json:"auto_play_audio,omitempty"`
+}
+
+type piperRuntime struct {
+	ExecPath    string
+	PrefixArgs  []string
+	Kind        string
+	InstalledAt string
 }
 
 func NewPiperTTSTool(workDir string, clipStore *speechcache.Store) *PiperTTSTool {
@@ -51,7 +82,7 @@ func (t *PiperTTSTool) Name() string {
 }
 
 func (t *PiperTTSTool) Description() string {
-	return "Generate speech audio using local Piper ONNX models. Works across platforms and supports multilingual model packs."
+	return "Generate speech audio using local Piper ONNX models. Supports first-run auto-setup for runtime and model downloads."
 }
 
 func (t *PiperTTSTool) Schema() map[string]interface{} {
@@ -64,11 +95,19 @@ func (t *PiperTTSTool) Schema() map[string]interface{} {
 			},
 			"model_path": map[string]interface{}{
 				"type":        "string",
-				"description": "Path to a Piper .onnx voice model. Defaults to PIPER_MODEL_PATH.",
+				"description": "Path to a Piper .onnx voice model, or a Piper model ID (for example: en_US-lessac-medium). Defaults to PIPER_MODEL_PATH, then PIPER_MODEL, then en_US-lessac-medium.",
+			},
+			"piper_bin": map[string]interface{}{
+				"type":        "string",
+				"description": "Optional path to piper executable. Defaults to PIPER_BIN then PATH/common Homebrew locations.",
 			},
 			"config_path": map[string]interface{}{
 				"type":        "string",
-				"description": "Optional path to Piper model config JSON. Defaults to <model_path>.json when present.",
+				"description": "Optional path to Piper model config JSON. Used only when model_path points to a local .onnx file.",
+			},
+			"language": map[string]interface{}{
+				"type":        "string",
+				"description": "Optional language hint (for example: en, ru, uk, de, fr, es, it, pt, ja, zh). Used when auto_model_select is enabled and model_path is not explicitly passed.",
 			},
 			"speaker_id": map[string]interface{}{
 				"type":        "integer",
@@ -85,6 +124,14 @@ func (t *PiperTTSTool) Schema() map[string]interface{} {
 			"noise_w": map[string]interface{}{
 				"type":        "number",
 				"description": "Optional Piper noise width.",
+			},
+			"auto_setup": map[string]interface{}{
+				"type":        "boolean",
+				"description": "When true (default), automatically bootstrap a local Piper runtime on first use if no piper binary is found.",
+			},
+			"auto_model_select": map[string]interface{}{
+				"type":        "boolean",
+				"description": "When true (default), automatically pick a language-compatible Piper model from text/language hint if model_path is not provided.",
 			},
 			"output_mode": map[string]interface{}{
 				"type":        "string",
@@ -110,10 +157,6 @@ func (t *PiperTTSTool) Execute(ctx context.Context, params json.RawMessage) (*to
 		return nil, fmt.Errorf("invalid parameters: %w", err)
 	}
 
-	if _, err := exec.LookPath("piper"); err != nil {
-		return &tools.Result{Success: false, Error: "piper binary not found in PATH"}, nil
-	}
-
 	text := strings.TrimSpace(p.Text)
 	if text == "" {
 		return &tools.Result{Success: false, Error: "text is required"}, nil
@@ -127,32 +170,36 @@ func (t *PiperTTSTool) Execute(ctx context.Context, params json.RawMessage) (*to
 		return &tools.Result{Success: false, Error: "output_mode must be one of: stream, file, both"}, nil
 	}
 
-	modelPath := strings.TrimSpace(p.ModelPath)
-	if modelPath == "" {
-		modelPath = strings.TrimSpace(os.Getenv("PIPER_MODEL_PATH"))
-	}
-	if modelPath == "" {
-		return &tools.Result{Success: false, Error: "model_path is required (pass model_path or set PIPER_MODEL_PATH)"}, nil
-	}
-	modelPath = t.resolvePath(modelPath)
-	if !strings.EqualFold(filepath.Ext(modelPath), ".onnx") {
-		return &tools.Result{Success: false, Error: "model_path must point to a .onnx file"}, nil
-	}
-	if _, err := os.Stat(modelPath); err != nil {
-		return &tools.Result{Success: false, Error: fmt.Sprintf("model_path is not accessible: %v", err)}, nil
+	autoSetup := true
+	if p.AutoSetup != nil {
+		autoSetup = *p.AutoSetup
 	}
 
-	configPath := strings.TrimSpace(p.ConfigPath)
-	if configPath == "" {
-		inferred := modelPath + ".json"
-		if _, err := os.Stat(inferred); err == nil {
-			configPath = inferred
-		}
+	dataDir := resolveAAgentDataDir()
+	runtimeSpec, err := resolvePiperRuntime(ctx, strings.TrimSpace(p.PiperBin), dataDir, autoSetup)
+	if err != nil {
+		return &tools.Result{Success: false, Error: err.Error()}, nil
 	}
-	if configPath != "" {
-		configPath = t.resolvePath(configPath)
-		if _, err := os.Stat(configPath); err != nil {
-			return &tools.Result{Success: false, Error: fmt.Sprintf("config_path is not accessible: %v", err)}, nil
+
+	modelArg, configPath, err := t.resolveModelReference(strings.TrimSpace(p.ModelPath), strings.TrimSpace(p.ConfigPath))
+	if err != nil {
+		return &tools.Result{Success: false, Error: err.Error()}, nil
+	}
+	detectedLang := detectTextLanguage(text)
+	selectedLang := normalizeLanguageHint(strings.TrimSpace(p.Language))
+	if selectedLang == "" {
+		selectedLang = detectedLang
+	}
+	autoModelSelect := true
+	if p.AutoModelPick != nil {
+		autoModelSelect = *p.AutoModelPick
+	}
+	modelSelectionSource := "explicit_or_env"
+	if strings.TrimSpace(p.ModelPath) == "" && autoModelSelect {
+		if autoModel := chooseAutoModelForLanguage(selectedLang); autoModel != "" {
+			modelArg = autoModel
+			configPath = ""
+			modelSelectionSource = "auto_language"
 		}
 	}
 
@@ -182,41 +229,107 @@ func (t *PiperTTSTool) Execute(ctx context.Context, params json.RawMessage) (*to
 		defer os.Remove(cleanupPath)
 	}
 
-	args := []string{
-		"--model", modelPath,
-		"--output_file", outputPath,
+	modelsDir := filepath.Join(dataDir, defaultPiperModelsRel)
+	if err := os.MkdirAll(modelsDir, 0o755); err != nil {
+		return &tools.Result{Success: false, Error: fmt.Sprintf("failed to create piper model directory: %v", err)}, nil
 	}
-	if configPath != "" {
-		args = append(args, "--config", configPath)
+	installedModels := listInstalledPiperModels(modelsDir)
+
+	effectiveModelArg, effectiveConfigPath := resolveDownloadedVoicePaths(modelsDir, modelArg, configPath)
+
+	inputFile, err := os.CreateTemp("", "a2gent-piper-input-*.txt")
+	if err != nil {
+		return &tools.Result{Success: false, Error: fmt.Sprintf("failed to create temporary input file: %v", err)}, nil
 	}
-	if p.SpeakerID != nil {
-		args = append(args, "--speaker", strconv.Itoa(*p.SpeakerID))
-	}
-	if p.LengthScale != nil {
-		args = append(args, "--length_scale", formatFloat(*p.LengthScale))
-	}
-	if p.NoiseScale != nil {
-		args = append(args, "--noise_scale", formatFloat(*p.NoiseScale))
-	}
-	if p.NoiseW != nil {
-		args = append(args, "--noise_w", formatFloat(*p.NoiseW))
+	inputPath := inputFile.Name()
+	_ = inputFile.Close()
+	defer os.Remove(inputPath)
+	if err := os.WriteFile(inputPath, []byte(text+"\n"), 0o600); err != nil {
+		return &tools.Result{Success: false, Error: fmt.Sprintf("failed to write synthesis input: %v", err)}, nil
 	}
 
-	cmd := exec.CommandContext(ctx, "piper", args...)
-	cmd.Stdin = strings.NewReader(text + "\n")
-	if out, err := cmd.CombinedOutput(); err != nil {
+	buildArgs := func(modelValue string, cfgPath string) []string {
+		args := make([]string, 0, 32)
+		args = append(args, runtimeSpec.PrefixArgs...)
+		args = append(args,
+			"--model", modelValue,
+			"--input_file", inputPath,
+			"--output_file", outputPath,
+			"--data-dir", modelsDir,
+		)
+		if cfgPath != "" {
+			args = append(args, "--config", cfgPath)
+		}
+		if p.SpeakerID != nil {
+			args = append(args, "--speaker", strconv.Itoa(*p.SpeakerID))
+		}
+		if p.LengthScale != nil {
+			args = append(args, "--length_scale", formatFloat(*p.LengthScale))
+		}
+		if p.NoiseScale != nil {
+			args = append(args, "--noise_scale", formatFloat(*p.NoiseScale))
+		}
+		if p.NoiseW != nil {
+			args = append(args, "--noise_w", formatFloat(*p.NoiseW))
+		}
+		return args
+	}
+
+	runSynthesis := func() ([]byte, error) {
+		cmd := exec.CommandContext(ctx, runtimeSpec.ExecPath, buildArgs(effectiveModelArg, effectiveConfigPath)...)
+		return cmd.CombinedOutput()
+	}
+
+	downloadedVoice := false
+	if out, err := runSynthesis(); err != nil {
 		detail := strings.TrimSpace(string(out))
+		voiceMissing := !strings.EqualFold(filepath.Ext(modelArg), ".onnx") && strings.Contains(detail, "Unable to find voice:")
+		if voiceMissing && runtimeSpec.Kind == "python_module" {
+			if dlErr := downloadPiperVoice(ctx, runtimeSpec.ExecPath, modelsDir, modelArg); dlErr == nil {
+				downloadedVoice = true
+				effectiveModelArg, effectiveConfigPath = resolveDownloadedVoicePaths(modelsDir, modelArg, configPath)
+				if retryOut, retryErr := runSynthesis(); retryErr == nil {
+					_ = retryOut
+					err = nil
+				} else {
+					retryDetail := strings.TrimSpace(string(retryOut))
+					if retryDetail != "" {
+						return &tools.Result{Success: false, Error: fmt.Sprintf("piper failed after voice download: %v (%s)", retryErr, retryDetail)}, nil
+					}
+					return &tools.Result{Success: false, Error: fmt.Sprintf("piper failed after voice download: %v", retryErr)}, nil
+				}
+			}
+		}
+		if err == nil {
+			goto synthesisRecovered
+		}
 		if detail != "" {
 			return &tools.Result{Success: false, Error: fmt.Sprintf("piper failed: %v (%s)", err, detail)}, nil
 		}
 		return &tools.Result{Success: false, Error: fmt.Sprintf("piper failed: %v", err)}, nil
 	}
+synthesisRecovered:
 
 	metadata := map[string]interface{}{
-		"model_path": modelPath,
+		"model_path":        effectiveModelArg,
+		"runtime":           runtimeSpec.Kind,
+		"runtime_exec":      runtimeSpec.ExecPath,
+		"runtime_location":  runtimeSpec.InstalledAt,
+		"models_dir":        modelsDir,
+		"detected_language": detectedLang,
+		"selected_language": selectedLang,
+		"model_selection": map[string]interface{}{
+			"source":              modelSelectionSource,
+			"auto_model_select":   autoModelSelect,
+			"language_model_map":  piperLanguageModelDefaults,
+			"installed_model_ids": installedModels,
+		},
 	}
-	if configPath != "" {
-		metadata["config_path"] = configPath
+	if downloadedVoice {
+		metadata["voice_downloaded"] = true
+	}
+	if effectiveConfigPath != "" {
+		metadata["config_path"] = effectiveConfigPath
 	}
 	outputParts := []string{"Generated Piper speech audio."}
 
@@ -265,6 +378,301 @@ func (t *PiperTTSTool) Execute(ctx context.Context, params json.RawMessage) (*to
 	}, nil
 }
 
+func resolvePiperRuntime(ctx context.Context, requested string, dataDir string, autoSetup bool) (*piperRuntime, error) {
+	if bin, ok := resolveLocalPiperBinary(requested); ok {
+		return &piperRuntime{ExecPath: bin, Kind: "native_binary"}, nil
+	}
+
+	if !autoSetup {
+		return nil, fmt.Errorf("piper binary not found and auto_setup is disabled")
+	}
+
+	python, err := findPython()
+	if err != nil {
+		return nil, fmt.Errorf("piper binary not found and Python runtime is unavailable for auto-setup: %v", err)
+	}
+
+	venvDir := filepath.Join(dataDir, defaultPiperVenvRel)
+	pythonInVenv := venvPythonPath(venvDir)
+	if _, err := os.Stat(pythonInVenv); err != nil {
+		if mkErr := os.MkdirAll(venvDir, 0o755); mkErr != nil {
+			return nil, fmt.Errorf("failed to create piper runtime directory: %v", mkErr)
+		}
+		if err := runCommand(ctx, python, "-m", "venv", venvDir); err != nil {
+			return nil, fmt.Errorf("failed to create piper virtualenv: %v", err)
+		}
+	}
+
+	if err := runCommand(ctx, pythonInVenv, "-m", "piper", "--help"); err != nil {
+		if err := runCommand(ctx, pythonInVenv, "-m", "pip", "install", "--upgrade", "pip"); err != nil {
+			return nil, fmt.Errorf("failed to upgrade pip for piper runtime: %v", err)
+		}
+		if err := runCommand(ctx, pythonInVenv, "-m", "pip", "install", defaultPiperPackage); err != nil {
+			return nil, fmt.Errorf("failed to install piper runtime package: %v", err)
+		}
+		if err := runCommand(ctx, pythonInVenv, "-m", "piper", "--help"); err != nil {
+			// Some environments have incomplete transitive installs; heal common missing modules.
+			if err := runCommand(ctx, pythonInVenv, "-m", "pip", "install", "pathvalidate"); err != nil {
+				return nil, fmt.Errorf("piper runtime was installed but is not runnable: %v", err)
+			}
+			if err := runCommand(ctx, pythonInVenv, "-m", "piper", "--help"); err != nil {
+				return nil, fmt.Errorf("piper runtime was installed but is not runnable: %v", err)
+			}
+		}
+	}
+
+	return &piperRuntime{
+		ExecPath:    pythonInVenv,
+		PrefixArgs:  []string{"-m", "piper"},
+		Kind:        "python_module",
+		InstalledAt: venvDir,
+	}, nil
+}
+
+func resolveLocalPiperBinary(requested string) (string, bool) {
+	candidates := make([]string, 0, 5)
+	if requested != "" {
+		candidates = append(candidates, requested)
+	}
+	if env := strings.TrimSpace(os.Getenv("PIPER_BIN")); env != "" {
+		candidates = append(candidates, env)
+	}
+	candidates = append(candidates, "piper", "/opt/homebrew/bin/piper", "/usr/local/bin/piper")
+
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if strings.Contains(candidate, string(filepath.Separator)) {
+			path := filepath.Clean(candidate)
+			if info, err := os.Stat(path); err == nil && !info.IsDir() {
+				return path, true
+			}
+			continue
+		}
+		if resolved, err := exec.LookPath(candidate); err == nil {
+			return resolved, true
+		}
+	}
+	return "", false
+}
+
+func findPython() (string, error) {
+	for _, name := range []string{"python3", "python"} {
+		if path, err := exec.LookPath(name); err == nil {
+			return path, nil
+		}
+	}
+	return "", fmt.Errorf("python3/python not found in PATH")
+}
+
+func venvPythonPath(venvDir string) string {
+	if runtime.GOOS == "windows" {
+		return filepath.Join(venvDir, "Scripts", "python.exe")
+	}
+	return filepath.Join(venvDir, "bin", "python")
+}
+
+func runCommand(ctx context.Context, command string, args ...string) error {
+	cmd := exec.CommandContext(ctx, command, args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		detail := strings.TrimSpace(string(out))
+		if detail == "" {
+			return err
+		}
+		return fmt.Errorf("%w: %s", err, detail)
+	}
+	return nil
+}
+
+func downloadPiperVoice(ctx context.Context, pythonExec string, modelsDir string, voiceName string) error {
+	voice := strings.TrimSpace(voiceName)
+	if voice == "" {
+		return fmt.Errorf("voice name is required")
+	}
+	return runCommand(
+		ctx,
+		pythonExec,
+		"-m", "piper.download_voices",
+		"--download-dir", modelsDir,
+		voice,
+	)
+}
+
+func resolveAAgentDataDir() string {
+	if raw := strings.TrimSpace(os.Getenv("AAGENT_DATA_PATH")); raw != "" {
+		return filepath.Clean(raw)
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(homeDir) == "" {
+		return filepath.Clean(filepath.Join(".", ".aagent-data"))
+	}
+	return filepath.Join(homeDir, ".local", "share", "aagent")
+}
+
+func listInstalledPiperModels(modelsDir string) []string {
+	out := make([]string, 0, 16)
+	_ = filepath.WalkDir(modelsDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d == nil || d.IsDir() {
+			return nil
+		}
+		if !strings.EqualFold(filepath.Ext(d.Name()), ".onnx") {
+			return nil
+		}
+		id := strings.TrimSuffix(d.Name(), ".onnx")
+		id = strings.TrimSpace(id)
+		if id != "" {
+			out = append(out, id)
+		}
+		return nil
+	})
+	sort.Strings(out)
+	return out
+}
+
+func chooseAutoModelForLanguage(language string) string {
+	lang := normalizeLanguageHint(language)
+	if lang == "" {
+		return ""
+	}
+	if model, ok := piperLanguageModelDefaults[lang]; ok {
+		return model
+	}
+	return ""
+}
+
+func normalizeLanguageHint(raw string) string {
+	lang := strings.ToLower(strings.TrimSpace(raw))
+	if lang == "" {
+		return ""
+	}
+	lang = strings.ReplaceAll(lang, "-", "_")
+	switch {
+	case strings.HasPrefix(lang, "en"):
+		return "en"
+	case strings.HasPrefix(lang, "ru"):
+		return "ru"
+	case strings.HasPrefix(lang, "uk"):
+		return "uk"
+	case strings.HasPrefix(lang, "de"):
+		return "de"
+	case strings.HasPrefix(lang, "fr"):
+		return "fr"
+	case strings.HasPrefix(lang, "es"):
+		return "es"
+	case strings.HasPrefix(lang, "it"):
+		return "it"
+	case strings.HasPrefix(lang, "pt"):
+		return "pt"
+	case strings.HasPrefix(lang, "ja"):
+		return "ja"
+	case strings.HasPrefix(lang, "zh"):
+		return "zh"
+	default:
+		return ""
+	}
+}
+
+func detectTextLanguage(text string) string {
+	hasCyrillic := false
+	hasUkrainianOnly := false
+	hasHiraganaKatakana := false
+	hasCJK := false
+	hasLatinAccent := false
+
+	for _, r := range text {
+		switch {
+		case unicode.In(r, unicode.Cyrillic):
+			hasCyrillic = true
+			if strings.ContainsRune("іїєґІЇЄҐ", r) {
+				hasUkrainianOnly = true
+			}
+		case unicode.In(r, unicode.Hiragana, unicode.Katakana):
+			hasHiraganaKatakana = true
+		case unicode.In(r, unicode.Han):
+			hasCJK = true
+		case r >= 0x00C0 && r <= 0x024F:
+			hasLatinAccent = true
+		}
+	}
+
+	switch {
+	case hasHiraganaKatakana:
+		return "ja"
+	case hasCJK:
+		return "zh"
+	case hasUkrainianOnly:
+		return "uk"
+	case hasCyrillic:
+		return "ru"
+	case hasLatinAccent:
+		return "es"
+	default:
+		return "en"
+	}
+}
+
+func (t *PiperTTSTool) resolveModelReference(modelInput string, configInput string) (string, string, error) {
+	modelArg := strings.TrimSpace(modelInput)
+	if modelArg == "" {
+		modelArg = strings.TrimSpace(os.Getenv("PIPER_MODEL_PATH"))
+	}
+	if modelArg == "" {
+		modelArg = strings.TrimSpace(os.Getenv("PIPER_MODEL"))
+	}
+	if modelArg == "" {
+		modelArg = defaultPiperModelID
+	}
+
+	configPath := strings.TrimSpace(configInput)
+
+	if strings.EqualFold(filepath.Ext(modelArg), ".onnx") {
+		resolvedModelPath := t.resolvePath(modelArg)
+		if _, err := os.Stat(resolvedModelPath); err != nil {
+			return "", "", fmt.Errorf("model_path is not accessible: %v", err)
+		}
+		if configPath == "" {
+			inferred := resolvedModelPath + ".json"
+			if _, err := os.Stat(inferred); err == nil {
+				configPath = inferred
+			}
+		}
+		if configPath != "" {
+			configPath = t.resolvePath(configPath)
+			if _, err := os.Stat(configPath); err != nil {
+				return "", "", fmt.Errorf("config_path is not accessible: %v", err)
+			}
+		}
+		return resolvedModelPath, configPath, nil
+	}
+
+	if configPath != "" {
+		return "", "", fmt.Errorf("config_path is only supported when model_path points to a local .onnx file")
+	}
+
+	return modelArg, "", nil
+}
+
+func resolveDownloadedVoicePaths(modelsDir string, modelArg string, configPath string) (string, string) {
+	if strings.EqualFold(filepath.Ext(modelArg), ".onnx") {
+		return modelArg, configPath
+	}
+
+	voiceModelPath := filepath.Join(modelsDir, modelArg+".onnx")
+	if info, err := os.Stat(voiceModelPath); err == nil && !info.IsDir() {
+		if strings.TrimSpace(configPath) != "" {
+			return voiceModelPath, configPath
+		}
+		inferredConfig := voiceModelPath + ".json"
+		if cfgInfo, cfgErr := os.Stat(inferredConfig); cfgErr == nil && !cfgInfo.IsDir() {
+			return voiceModelPath, inferredConfig
+		}
+		return voiceModelPath, ""
+	}
+	return modelArg, configPath
+}
+
 func (t *PiperTTSTool) resolveOutputPath(requested string) (string, error) {
 	baseDir := strings.TrimSpace(t.workDir)
 	if baseDir == "" {
@@ -310,117 +718,3 @@ func formatFloat(v float64) string {
 }
 
 var _ tools.Tool = (*PiperTTSTool)(nil)
-
-type PiperListModelsTool struct {
-	workDir string
-}
-
-type piperListModelsParams struct {
-	ModelDir   string `json:"model_dir,omitempty"`
-	MaxResults int    `json:"max_results,omitempty"`
-}
-
-func NewPiperListModelsTool(workDir string) *PiperListModelsTool {
-	return &PiperListModelsTool{workDir: workDir}
-}
-
-func (t *PiperListModelsTool) Name() string {
-	return "piper_list_models"
-}
-
-func (t *PiperListModelsTool) Description() string {
-	return "List available local Piper .onnx models from a directory."
-}
-
-func (t *PiperListModelsTool) Schema() map[string]interface{} {
-	return map[string]interface{}{
-		"type": "object",
-		"properties": map[string]interface{}{
-			"model_dir": map[string]interface{}{
-				"type":        "string",
-				"description": "Directory to scan recursively for .onnx files. Defaults to PIPER_MODEL_DIR then ./models/piper.",
-			},
-			"max_results": map[string]interface{}{
-				"type":        "integer",
-				"description": "Optional maximum number of models to include (default: 100).",
-			},
-		},
-	}
-}
-
-func (t *PiperListModelsTool) Execute(_ context.Context, params json.RawMessage) (*tools.Result, error) {
-	var p piperListModelsParams
-	if len(params) > 0 {
-		if err := json.Unmarshal(params, &p); err != nil {
-			return nil, fmt.Errorf("invalid parameters: %w", err)
-		}
-	}
-
-	modelDir := strings.TrimSpace(p.ModelDir)
-	if modelDir == "" {
-		modelDir = strings.TrimSpace(os.Getenv("PIPER_MODEL_DIR"))
-	}
-	if modelDir == "" {
-		modelDir = filepath.Join(t.workDir, "models", "piper")
-	}
-	if !filepath.IsAbs(modelDir) {
-		modelDir = filepath.Join(t.workDir, modelDir)
-	}
-	modelDir = filepath.Clean(modelDir)
-
-	maxResults := p.MaxResults
-	if maxResults <= 0 {
-		maxResults = 100
-	}
-
-	models := make([]string, 0, 16)
-	walkErr := filepath.WalkDir(modelDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() {
-			return nil
-		}
-		if strings.EqualFold(filepath.Ext(d.Name()), ".onnx") {
-			models = append(models, filepath.Clean(path))
-		}
-		return nil
-	})
-	if walkErr != nil {
-		return &tools.Result{Success: false, Error: fmt.Sprintf("failed to scan model_dir: %v", walkErr)}, nil
-	}
-
-	sort.Strings(models)
-	if len(models) > maxResults {
-		models = models[:maxResults]
-	}
-
-	entries := make([]map[string]interface{}, 0, len(models))
-	lines := make([]string, 0, len(models)+2)
-	lines = append(lines, fmt.Sprintf("Found %d Piper model(s) in %s", len(models), modelDir))
-	for _, modelPath := range models {
-		configPath := modelPath + ".json"
-		_, hasConfig := os.Stat(configPath)
-		entry := map[string]interface{}{
-			"model_path": modelPath,
-		}
-		if hasConfig == nil {
-			entry["config_path"] = configPath
-			lines = append(lines, fmt.Sprintf("- %s (config: %s)", modelPath, configPath))
-		} else {
-			lines = append(lines, "- "+modelPath)
-		}
-		entries = append(entries, entry)
-	}
-
-	return &tools.Result{
-		Success: true,
-		Output:  strings.Join(lines, "\n"),
-		Metadata: map[string]interface{}{
-			"model_dir": modelDir,
-			"models":    entries,
-		},
-	}, nil
-}
-
-var _ tools.Tool = (*PiperListModelsTool)(nil)
