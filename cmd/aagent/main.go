@@ -16,12 +16,13 @@ import (
 	httpserver "github.com/gratheon/aagent/internal/http"
 	"github.com/gratheon/aagent/internal/llm"
 	"github.com/gratheon/aagent/internal/llm/anthropic"
+	"github.com/gratheon/aagent/internal/llm/autorouter"
 	"github.com/gratheon/aagent/internal/llm/fallback"
 	"github.com/gratheon/aagent/internal/llm/lmstudio"
 	"github.com/gratheon/aagent/internal/logging"
 	"github.com/gratheon/aagent/internal/scheduler"
-	"github.com/gratheon/aagent/internal/speechcache"
 	"github.com/gratheon/aagent/internal/session"
+	"github.com/gratheon/aagent/internal/speechcache"
 	"github.com/gratheon/aagent/internal/storage"
 	"github.com/gratheon/aagent/internal/tools"
 	"github.com/gratheon/aagent/internal/tools/integrationtools"
@@ -53,6 +54,15 @@ Starts both the HTTP API server and the TUI interface simultaneously.`,
 	rootCmd.Flags().StringVarP(&continueFlag, "continue", "c", "", "Resume previous session by ID")
 	rootCmd.Flags().BoolVarP(&verboseFlag, "verbose", "v", false, "Verbose output")
 	rootCmd.Flags().IntVarP(&portFlag, "port", "p", 8080, "HTTP API server port")
+
+	// Server mode subcommand (HTTP API only, no TUI)
+	serverCmd := &cobra.Command{
+		Use:   "server",
+		Short: "Run HTTP API server only",
+		RunE:  runServer,
+	}
+	serverCmd.Flags().IntVarP(&portFlag, "port", "p", 8080, "HTTP API server port")
+	rootCmd.AddCommand(serverCmd)
 
 	// Session management subcommand
 	sessionCmd := &cobra.Command{
@@ -629,76 +639,87 @@ func initLLMClient(cfg *config.Config) (llm.Client, error) {
 		}
 	}
 
-	providerType := config.ProviderType(config.NormalizeProviderRef(cfg.ActiveProvider))
-	providerRef := config.NormalizeProviderRef(string(providerType))
-	if providerRef == string(config.ProviderAutoRouter) {
-		return nil, fmt.Errorf("automatic_router is supported in HTTP sessions; select a concrete provider for CLI runs")
-	}
-	if providerRef == string(config.ProviderFallback) || config.IsFallbackAggregateRef(providerRef) {
-		var chain []config.FallbackChainNode
-		if providerRef == string(config.ProviderFallback) {
-			fallbackCfg := cfg.Providers[string(config.ProviderFallback)]
-			chain = fallbackCfg.FallbackChainNodes
-			if len(chain) == 0 {
-				for _, raw := range fallbackCfg.FallbackChain {
-					nodeType := config.ProviderType(config.NormalizeProviderRef(raw))
-					if nodeType == "" || nodeType == config.ProviderFallback {
-						continue
-					}
-					model := strings.TrimSpace(cfg.Providers[string(nodeType)].Model)
-					if model == "" {
-						if def := config.GetProviderDefinition(nodeType); def != nil {
-							model = strings.TrimSpace(def.DefaultModel)
+	createClientForProvider := func(providerRef string, modelOverride string) (llm.Client, string, error) {
+		normalizedRef := config.NormalizeProviderRef(providerRef)
+		if normalizedRef == "" {
+			return nil, "", fmt.Errorf("provider reference is empty")
+		}
+		providerType := config.ProviderType(normalizedRef)
+		if providerType == config.ProviderAutoRouter {
+			return nil, "", fmt.Errorf("automatic_router cannot be used as a nested provider target")
+		}
+		if normalizedRef == string(config.ProviderFallback) || config.IsFallbackAggregateRef(normalizedRef) {
+			var chain []config.FallbackChainNode
+			if normalizedRef == string(config.ProviderFallback) {
+				fallbackCfg := cfg.Providers[string(config.ProviderFallback)]
+				chain = fallbackCfg.FallbackChainNodes
+				if len(chain) == 0 {
+					for _, raw := range fallbackCfg.FallbackChain {
+						nodeType := config.ProviderType(config.NormalizeProviderRef(raw))
+						if nodeType == "" || nodeType == config.ProviderFallback {
+							continue
 						}
+						model := strings.TrimSpace(cfg.Providers[string(nodeType)].Model)
+						if model == "" {
+							if def := config.GetProviderDefinition(nodeType); def != nil {
+								model = strings.TrimSpace(def.DefaultModel)
+							}
+						}
+						if model == "" {
+							model = strings.TrimSpace(cfg.DefaultModel)
+						}
+						if model == "" {
+							continue
+						}
+						chain = append(chain, config.FallbackChainNode{Provider: string(nodeType), Model: model})
 					}
-					if model == "" {
-						model = strings.TrimSpace(cfg.DefaultModel)
+				}
+			} else {
+				id := config.FallbackAggregateIDFromRef(normalizedRef)
+				for _, aggregate := range cfg.FallbackAggregates {
+					if config.NormalizeToken(aggregate.ID) == id {
+						chain = aggregate.Chain
+						break
 					}
-					if model == "" {
-						continue
-					}
-					chain = append(chain, config.FallbackChainNode{Provider: string(nodeType), Model: model})
 				}
 			}
-		} else {
-			id := config.FallbackAggregateIDFromRef(providerRef)
-			for _, aggregate := range cfg.FallbackAggregates {
-				if config.NormalizeToken(aggregate.ID) == id {
-					chain = aggregate.Chain
-					break
+
+			nodes := make([]fallback.Node, 0, len(chain))
+			seen := make(map[string]struct{}, len(chain))
+			for _, rawNode := range chain {
+				nodeType := config.ProviderType(config.NormalizeProviderRef(rawNode.Provider))
+				model := strings.TrimSpace(rawNode.Model)
+				if nodeType == "" || nodeType == config.ProviderFallback || model == "" {
+					continue
 				}
+				seenKey := string(nodeType) + "::" + model
+				if _, exists := seen[seenKey]; exists {
+					continue
+				}
+				seen[seenKey] = struct{}{}
+				client, _, err := createDirectClient(nodeType, model)
+				if err != nil {
+					return nil, "", fmt.Errorf("fallback node %s/%s is not available: %w", nodeType, model, err)
+				}
+				nodes = append(nodes, fallback.Node{
+					Name:   string(nodeType),
+					Model:  model,
+					Client: client,
+				})
 			}
+			if len(nodes) < 2 {
+				return nil, "", fmt.Errorf("%s requires at least two valid fallback model nodes", normalizedRef)
+			}
+			return fallback.NewClient(nodes), "", nil
 		}
 
-		nodes := make([]fallback.Node, 0, len(chain))
-		seen := make(map[string]struct{}, len(chain))
-		for _, rawNode := range chain {
-			nodeType := config.ProviderType(config.NormalizeProviderRef(rawNode.Provider))
-			model := strings.TrimSpace(rawNode.Model)
-			if nodeType == "" || nodeType == config.ProviderFallback || model == "" {
-				continue
-			}
-			seenKey := string(nodeType) + "::" + model
-			if _, exists := seen[seenKey]; exists {
-				continue
-			}
-			seen[seenKey] = struct{}{}
-			client, _, err := createDirectClient(nodeType, model)
-			if err != nil {
-				return nil, fmt.Errorf("fallback node %s/%s is not available: %w", nodeType, model, err)
-			}
-			nodes = append(nodes, fallback.Node{
-				Name:   string(nodeType),
-				Model:  model,
-				Client: client,
-			})
-		}
-		if len(nodes) < 2 {
-			return nil, fmt.Errorf("%s requires at least two valid fallback model nodes", providerRef)
-		}
-		return fallback.NewClient(nodes), nil
+		return createDirectClient(providerType, modelOverride)
 	}
 
-	client, _, err := createDirectClient(providerType, "")
+	providerRef := config.NormalizeProviderRef(cfg.ActiveProvider)
+	if providerRef == string(config.ProviderAutoRouter) {
+		return autorouter.New(cfg, createClientForProvider), nil
+	}
+	client, _, err := createClientForProvider(providerRef, "")
 	return client, err
 }

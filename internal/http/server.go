@@ -201,6 +201,16 @@ func (s *Server) setupRoutes() {
 		r.Post("/{integrationID}/test", s.handleTestIntegration)
 	})
 
+	// MCP server registry and diagnostics
+	r.Route("/mcp/servers", func(r chi.Router) {
+		r.Get("/", s.handleListMCPServers)
+		r.Post("/", s.handleCreateMCPServer)
+		r.Get("/{serverID}", s.handleGetMCPServer)
+		r.Put("/{serverID}", s.handleUpdateMCPServer)
+		r.Delete("/{serverID}", s.handleDeleteMCPServer)
+		r.Post("/{serverID}/test", s.handleTestMCPServer)
+	})
+
 	// Speech/TTS helpers (proxied through backend)
 	r.Route("/speech", func(r chi.Router) {
 		r.Get("/voices", s.handleListSpeechVoices)

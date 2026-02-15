@@ -104,6 +104,11 @@ Environment variables:
 | `glob` | Find files by pattern |
 | `find_files` | Find files with include/exclude filters |
 | `grep` | Search file contents with regex |
+| `take_screenshot_tool` | Capture screenshots (main/all/specific display/area) with configurable output path (defaults to `/tmp`) |
+
+Screenshot tool defaults can be configured via settings/env:
+- `AAGENT_SCREENSHOT_OUTPUT_DIR` (default output directory, default `/tmp`)
+- `AAGENT_SCREENSHOT_DISPLAY_INDEX` (optional 1-based default monitor index)
 
 ## Project Structure
 
@@ -132,6 +137,15 @@ aagent/
 # Run directly (faster for development)
 just run
 
+# Run backend API server only
+just server
+
+# Install hot-reload tool once
+just install-air
+
+# Hot reload backend API server (restarts only after successful build)
+just dev
+
 # Build
 just build
 
@@ -150,6 +164,11 @@ just logs
 # Follow logs
 just logs-follow
 ```
+
+Hot reload details:
+- Uses `air` with project config at `.air.toml`.
+- `stop_on_error = false` keeps the previous healthy process running when a code change fails to compile.
+- The server restarts only after a successful `go build`, which avoids replacing a working backend with a broken one during self-edits.
 
 ## License
 

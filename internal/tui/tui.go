@@ -21,6 +21,7 @@ import (
 	"github.com/gratheon/aagent/internal/config"
 	"github.com/gratheon/aagent/internal/llm"
 	"github.com/gratheon/aagent/internal/llm/anthropic"
+	"github.com/gratheon/aagent/internal/llm/autorouter"
 	"github.com/gratheon/aagent/internal/llm/fallback"
 	"github.com/gratheon/aagent/internal/llm/lmstudio"
 	"github.com/gratheon/aagent/internal/logging"
@@ -2316,83 +2317,139 @@ func (m Model) activateProvider(providerType config.ProviderType) (tea.Model, te
 
 // createLLMClient creates an LLM client for the given provider type
 func (m Model) createLLMClient(providerType config.ProviderType) llm.Client {
-	if providerType == config.ProviderAutoRouter {
-		// Automatic router is resolved per-request in the HTTP API.
-		return anthropic.NewClientWithBaseURL("", "kimi-k2.5", "https://api.kimi.com/coding/v1")
-	}
-	if providerType == config.ProviderFallback {
-		fallbackProvider := m.appConfig.Providers[string(config.ProviderFallback)]
-		seen := map[string]struct{}{}
-		nodes := make([]fallback.Node, 0, len(fallbackProvider.FallbackChain))
-		for _, raw := range fallbackProvider.FallbackChain {
-			nodeType := config.ProviderType(strings.ToLower(strings.TrimSpace(raw)))
-			if nodeType == "" || nodeType == config.ProviderFallback {
-				continue
-			}
-			if _, exists := seen[string(nodeType)]; exists {
-				continue
-			}
-			seen[string(nodeType)] = struct{}{}
-			nodeProvider := m.appConfig.Providers[string(nodeType)]
-			nodeDef := config.GetProviderDefinition(nodeType)
-			if nodeDef == nil {
-				continue
-			}
-			apiKey := strings.TrimSpace(nodeProvider.APIKey)
-			if apiKey == "" {
-				apiKey = providerAPIKeyFromEnv(nodeType)
-			}
-			baseURL := strings.TrimSpace(nodeProvider.BaseURL)
-			if baseURL == "" {
-				baseURL = strings.TrimSpace(nodeDef.DefaultURL)
-			}
-			model := strings.TrimSpace(nodeProvider.Model)
-			if model == "" {
-				model = strings.TrimSpace(nodeDef.DefaultModel)
-			}
-			var client llm.Client
-			switch nodeType {
-			case config.ProviderLMStudio, config.ProviderOpenRouter, config.ProviderGoogle, config.ProviderOpenAI:
-				client = lmstudio.NewClient(apiKey, model, baseURL)
-			default:
-				client = anthropic.NewClientWithBaseURL(apiKey, model, baseURL)
-			}
-			nodes = append(nodes, fallback.Node{
-				Name:   string(nodeType),
-				Model:  model,
-				Client: client,
-			})
-		}
-		if len(nodes) >= 2 {
-			return fallback.NewClient(nodes)
-		}
-		// Fall back to default provider if chain is invalid.
-		return anthropic.NewClientWithBaseURL("", "kimi-k2.5", "https://api.kimi.com/coding/v1")
+	defaultClient := anthropic.NewClientWithBaseURL("", "kimi-k2.5", "https://api.kimi.com/coding/v1")
+	if m.appConfig == nil {
+		return defaultClient
 	}
 
-	provider := m.appConfig.Providers[string(providerType)]
-	providerDef := config.GetProviderDefinition(providerType)
-	apiKey := strings.TrimSpace(provider.APIKey)
-	if apiKey == "" {
-		apiKey = providerAPIKeyFromEnv(providerType)
+	createDirectClient := func(targetType config.ProviderType, modelOverride string) (llm.Client, string, error) {
+		providerDef := config.GetProviderDefinition(targetType)
+		if providerDef == nil || targetType == config.ProviderFallback || targetType == config.ProviderAutoRouter {
+			return nil, "", fmt.Errorf("unsupported provider: %s", targetType)
+		}
+
+		provider := m.appConfig.Providers[string(targetType)]
+		apiKey := strings.TrimSpace(provider.APIKey)
+		if apiKey == "" {
+			apiKey = providerAPIKeyFromEnv(targetType)
+		}
+
+		baseURL := strings.TrimSpace(provider.BaseURL)
+		if baseURL == "" {
+			baseURL = strings.TrimSpace(providerDef.DefaultURL)
+		}
+		if envURL := strings.TrimSpace(os.Getenv(strings.ToUpper(string(targetType)) + "_BASE_URL")); envURL != "" {
+			baseURL = envURL
+		} else if envURL := strings.TrimSpace(os.Getenv("ANTHROPIC_BASE_URL")); envURL != "" && (targetType == config.ProviderKimi || targetType == config.ProviderAnthropic) {
+			baseURL = envURL
+		}
+
+		model := strings.TrimSpace(modelOverride)
+		if model == "" {
+			model = strings.TrimSpace(provider.Model)
+		}
+		if model == "" {
+			model = strings.TrimSpace(providerDef.DefaultModel)
+		}
+		if model == "" {
+			model = strings.TrimSpace(m.appConfig.DefaultModel)
+		}
+
+		switch targetType {
+		case config.ProviderLMStudio, config.ProviderOpenRouter, config.ProviderGoogle, config.ProviderOpenAI:
+			return lmstudio.NewClient(apiKey, model, baseURL), model, nil
+		default:
+			return anthropic.NewClientWithBaseURL(apiKey, model, baseURL), model, nil
+		}
 	}
 
-	switch providerType {
-	case config.ProviderLMStudio, config.ProviderOpenRouter, config.ProviderGoogle, config.ProviderOpenAI:
-		baseURL := provider.BaseURL
-		if baseURL == "" {
-			baseURL = providerDef.DefaultURL
+	createClientForProvider := func(providerRef string, modelOverride string) (llm.Client, string, error) {
+		normalizedRef := config.NormalizeProviderRef(providerRef)
+		if normalizedRef == "" {
+			return nil, "", fmt.Errorf("provider reference is empty")
 		}
-		return lmstudio.NewClient(apiKey, provider.Model, baseURL)
-	default:
-		// For Anthropic-compatible providers (Kimi, Anthropic)
-		baseURL := provider.BaseURL
-		if baseURL == "" {
-			baseURL = providerDef.DefaultURL
+		targetType := config.ProviderType(normalizedRef)
+		if targetType == config.ProviderAutoRouter {
+			return nil, "", fmt.Errorf("automatic_router cannot be used as nested target")
 		}
-		// Import and use anthropic client
-		return anthropic.NewClientWithBaseURL(apiKey, provider.Model, baseURL)
+		if normalizedRef == string(config.ProviderFallback) || config.IsFallbackAggregateRef(normalizedRef) {
+			var chain []config.FallbackChainNode
+			if normalizedRef == string(config.ProviderFallback) {
+				fallbackProvider := m.appConfig.Providers[string(config.ProviderFallback)]
+				chain = fallbackProvider.FallbackChainNodes
+				if len(chain) == 0 {
+					for _, raw := range fallbackProvider.FallbackChain {
+						nodeType := config.ProviderType(config.NormalizeProviderRef(raw))
+						if nodeType == "" || nodeType == config.ProviderFallback {
+							continue
+						}
+						model := strings.TrimSpace(m.appConfig.Providers[string(nodeType)].Model)
+						if model == "" {
+							if nodeDef := config.GetProviderDefinition(nodeType); nodeDef != nil {
+								model = strings.TrimSpace(nodeDef.DefaultModel)
+							}
+						}
+						if model == "" {
+							model = strings.TrimSpace(m.appConfig.DefaultModel)
+						}
+						if model == "" {
+							continue
+						}
+						chain = append(chain, config.FallbackChainNode{Provider: string(nodeType), Model: model})
+					}
+				}
+			} else {
+				id := config.FallbackAggregateIDFromRef(normalizedRef)
+				for _, aggregate := range m.appConfig.FallbackAggregates {
+					if config.NormalizeToken(aggregate.ID) == id {
+						chain = aggregate.Chain
+						break
+					}
+				}
+			}
+
+			nodes := make([]fallback.Node, 0, len(chain))
+			seen := make(map[string]struct{}, len(chain))
+			for _, rawNode := range chain {
+				nodeType := config.ProviderType(config.NormalizeProviderRef(rawNode.Provider))
+				model := strings.TrimSpace(rawNode.Model)
+				if nodeType == "" || nodeType == config.ProviderFallback || model == "" {
+					continue
+				}
+				seenKey := string(nodeType) + "::" + model
+				if _, exists := seen[seenKey]; exists {
+					continue
+				}
+				seen[seenKey] = struct{}{}
+				client, _, err := createDirectClient(nodeType, model)
+				if err != nil {
+					return nil, "", fmt.Errorf("fallback node %s/%s is unavailable: %w", nodeType, model, err)
+				}
+				nodes = append(nodes, fallback.Node{
+					Name:   string(nodeType),
+					Model:  model,
+					Client: client,
+				})
+			}
+			if len(nodes) < 2 {
+				return nil, "", fmt.Errorf("%s requires at least two valid fallback model nodes", normalizedRef)
+			}
+			return fallback.NewClient(nodes), "", nil
+		}
+
+		return createDirectClient(targetType, modelOverride)
 	}
+
+	providerRef := config.NormalizeProviderRef(string(providerType))
+	if providerRef == string(config.ProviderAutoRouter) {
+		return autorouter.New(m.appConfig, createClientForProvider)
+	}
+	client, _, err := createClientForProvider(providerRef, "")
+	if err != nil {
+		logging.Warn("Failed to create LLM client for %s: %v", providerType, err)
+		return defaultClient
+	}
+	return client
 }
 
 func (m Model) validateActiveProviderConfig() error {
@@ -2412,7 +2469,28 @@ func (m Model) validateActiveProviderConfig() error {
 		return nil
 	}
 	if providerType == config.ProviderAutoRouter {
-		return fmt.Errorf("automatic_router is supported in HTTP sessions; choose a concrete provider for TUI")
+		provider := m.appConfig.Providers[string(config.ProviderAutoRouter)]
+		routerProvider := config.NormalizeProviderRef(provider.RouterProvider)
+		if routerProvider == "" {
+			return fmt.Errorf("automatic router requires router_provider")
+		}
+		if routerProvider == string(config.ProviderAutoRouter) {
+			return fmt.Errorf("automatic router cannot use automatic_router as router provider")
+		}
+		hasRule := false
+		for _, rule := range provider.RouterRules {
+			if strings.TrimSpace(rule.Match) == "" || strings.TrimSpace(rule.Provider) == "" {
+				continue
+			}
+			hasRule = true
+			if config.NormalizeProviderRef(rule.Provider) == string(config.ProviderAutoRouter) {
+				return fmt.Errorf("routing rule %q cannot target automatic_router", strings.TrimSpace(rule.Match))
+			}
+		}
+		if !hasRule {
+			return fmt.Errorf("automatic router requires at least one routing rule")
+		}
+		return nil
 	}
 	if !def.RequiresKey {
 		return nil

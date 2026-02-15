@@ -50,6 +50,7 @@ func NewManager(workDir string) *Manager {
 	m.Register(NewGlobTool(workDir))
 	m.Register(NewFindFilesTool(workDir))
 	m.Register(NewGrepTool(workDir))
+	m.Register(NewTakeScreenshotTool(workDir))
 
 	return m
 }

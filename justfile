@@ -5,6 +5,18 @@ binary := "aa"
 run:
     go run ./cmd/aagent
 
+# Run backend API server only
+server:
+    go run ./cmd/aagent server
+
+# Install air hot-reload tool
+install-air:
+    go install github.com/air-verse/air@latest
+
+# Run backend API server with hot reload (build must succeed before restart)
+dev:
+    air -c .air.toml
+
 # Build the binary
 build:
     go build -o {{binary}} ./cmd/aagent

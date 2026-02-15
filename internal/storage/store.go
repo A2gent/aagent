@@ -72,6 +72,22 @@ type Integration struct {
 	UpdatedAt time.Time
 }
 
+// MCPServer represents a configured MCP server endpoint.
+type MCPServer struct {
+	ID                  string
+	Name                string
+	Transport           string // "stdio" | "http"
+	Enabled             bool
+	Config              map[string]string
+	LastTestAt          *time.Time
+	LastTestSuccess     *bool
+	LastTestMessage     string
+	LastEstimatedTokens *int
+	LastToolCount       *int
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+}
+
 // Project represents a session grouping container optionally tied to one or more folders.
 type Project struct {
 	ID        string
@@ -117,6 +133,12 @@ type Store interface {
 	GetIntegration(id string) (*Integration, error)
 	ListIntegrations() ([]*Integration, error)
 	DeleteIntegration(id string) error
+
+	// MCP server operations
+	SaveMCPServer(server *MCPServer) error
+	GetMCPServer(id string) (*MCPServer, error)
+	ListMCPServers() ([]*MCPServer, error)
+	DeleteMCPServer(id string) error
 
 	// Close closes the store
 	Close() error
