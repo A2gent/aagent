@@ -19,4 +19,5 @@ func Register(manager *tools.Manager, store storage.Store, clipStore *speechcach
 	manager.Register(NewWhisperSTTTool(manager.WorkDir()))
 	manager.Register(NewNotifyWebAppTool())
 	manager.Register(NewTelegramSendMessageTool(store))
+	manager.Register(NewFetchURLTool())
 }
