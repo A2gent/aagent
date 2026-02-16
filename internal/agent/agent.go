@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gratheon/aagent/internal/llm"
 	"github.com/gratheon/aagent/internal/logging"
 	"github.com/gratheon/aagent/internal/session"
@@ -422,22 +423,6 @@ func (a *Agent) maybeCompactContext(ctx context.Context, sess *session.Session, 
 		return llm.TokenUsage{}, false, nil
 	}
 
-	request := a.buildCompactionRequest(sess, cfg.Prompt)
-	if len(request.Messages) == 0 {
-		return llm.TokenUsage{}, false, nil
-	}
-
-	response, err := a.llmClient.Chat(ctx, request)
-	if err != nil {
-		return llm.TokenUsage{}, false, fmt.Errorf("compaction LLM error: %w", err)
-	}
-
-	a.addTokenUsageMetadata(sess, response.Usage)
-	metadataSetFloat(sess, metadataCurrentContextTokens, 0)
-	compactionCount := int(metadataFloat(sess.Metadata, metadataCompactionCount)) + 1
-	metadataSetFloat(sess, metadataCompactionCount, float64(compactionCount))
-	metadataSetString(sess, metadataLastCompactionAt, time.Now().UTC().Format(time.RFC3339))
-
 	// If the latest message is a user prompt awaiting the next response, keep it after compaction.
 	var pendingUser *session.Message
 	if len(sess.Messages) > 0 && sess.Messages[len(sess.Messages)-1].Role == "user" {
@@ -446,17 +431,120 @@ func (a *Agent) maybeCompactContext(ctx context.Context, sess *session.Session, 
 		sess.Messages = sess.Messages[:len(sess.Messages)-1]
 	}
 
+	// Calculate which messages to summarize and which to keep
+	// We want to keep the last N messages raw to preserve context
+	const parserKeepMessages = 2
+
+	activeMessages := a.getActiveConversationMessages(sess)
+	if len(activeMessages) == 0 {
+		if pendingUser != nil {
+			sess.AddMessage(*pendingUser)
+		}
+		return llm.TokenUsage{}, false, nil
+	}
+
+	var messagesToSummarize []session.Message
+	var messagesToKeep []session.Message
+
+	// If we have enough messages, split them. Otherwise, summarize everything (fallback)
+	// But usually we should have at least keep + 1 to make compaction worth it.
+	// If len <= parserKeepMessages, we compact everything to avoid infinite loops if messages are just huge.
+	if len(activeMessages) > parserKeepMessages {
+		splitIdx := len(activeMessages) - parserKeepMessages
+		messagesToSummarize = activeMessages[:splitIdx]
+		messagesToKeep = activeMessages[splitIdx:]
+	} else {
+		messagesToSummarize = activeMessages
+		messagesToKeep = []session.Message{}
+	}
+
+	request := a.buildCompactionRequestFromMessages(messagesToSummarize, cfg.Prompt)
+	if len(request.Messages) == 0 {
+		// Nothing to summarize? Should not happen if logic above is correct
+		if pendingUser != nil {
+			sess.AddMessage(*pendingUser)
+		}
+		return llm.TokenUsage{}, false, nil
+	}
+
+	response, err := a.llmClient.Chat(ctx, request)
+	if err != nil {
+		// Restore pending user on error
+		if pendingUser != nil {
+			sess.AddMessage(*pendingUser)
+		}
+		return llm.TokenUsage{}, false, fmt.Errorf("compaction LLM error: %w", err)
+	}
+
+	a.addTokenUsageMetadata(sess, response.Usage)
+	// We reset current tokens, but we should add back the tokens of the KEPT messages if we could calculate them.
+	// For now, resetting to 0 is "okay" because the next step will add the *response* tokens,
+	// but the *input* context (the kept messages) are "free" in this accounting until next turn.
+	// To be accurate, we should count tokens of [Summary + Kept].
+	// But we don't have a tokenizer here easily.
+	// Let's stick to 0 for now as it matches previous behavior (reset on compaction).
+	metadataSetFloat(sess, metadataCurrentContextTokens, 0)
+
+	compactionCount := int(metadataFloat(sess.Metadata, metadataCompactionCount)) + 1
+	metadataSetFloat(sess, metadataCompactionCount, float64(compactionCount))
+	metadataSetString(sess, metadataLastCompactionAt, time.Now().UTC().Format(time.RFC3339))
+
 	summary := strings.TrimSpace(response.Content)
 	if summary == "" {
 		summary = "Context was compacted to continue in a fresh window."
 	}
 
-	sess.AddAssistantMessageWithMetadata(summary, nil, map[string]interface{}{
-		messageMetadataCompaction: true,
-		"compaction_index":        compactionCount,
-		"trigger_percent":         cfg.TriggerPercent,
-		"triggered_at_step":       step,
-	})
+	// Create summary message
+	summaryMsg := session.Message{
+		ID:        "", // will be generated
+		Role:      "assistant",
+		Content:   summary,
+		Timestamp: time.Now(),
+		Metadata: map[string]interface{}{
+			messageMetadataCompaction: true,
+			"compaction_index":        compactionCount,
+			"trigger_percent":         cfg.TriggerPercent,
+			"triggered_at_step":       step,
+		},
+	}
+
+	// Insert summary message BEFORE the kept messages.
+	// We need to find the insertion point in the original sess.Messages.
+	// activeMessages is a slice of sess.Messages.
+	// The split point in activeMessages corresponds to `splitIdx`.
+	// However, since we might have popped pendingUser, we just need to append Summary then Kept?
+	// No, we want to maintain history.
+
+	// Strategy: Rebuild sess.Messages.
+	// [ ... (Old Inactive) ... , (Summarized Active) ... , (Kept Active) ... ]
+	// becomes
+	// [ ... (Old Inactive) ... , (Summarized Active) ... , NEW_SUMMARY, (Kept Active) ... ]
+
+	// Finding the index of the first kept message in the main slice
+	insertionIdx := len(sess.Messages) // Default to end
+	if len(messagesToKeep) > 0 {
+		// Find the index of the first kept message
+		// Since activeMessages is a slice of sess.Messages, and messagesToKeep is a slice of activeMessages,
+		// they share the same backing array (mostly). But safely, let's just use the ID or reference.
+		firstKeptID := messagesToKeep[0].ID
+		for i, m := range sess.Messages {
+			if m.ID == firstKeptID {
+				insertionIdx = i
+				break
+			}
+		}
+	}
+
+	// Do the insertion
+	// Extend slice
+	sess.Messages = append(sess.Messages, session.Message{})
+	copy(sess.Messages[insertionIdx+1:], sess.Messages[insertionIdx:])
+	sess.Messages[insertionIdx] = summaryMsg
+
+	// Ensure ID is generated
+	if sess.Messages[insertionIdx].ID == "" {
+		sess.Messages[insertionIdx].ID = uuid.New().String()
+	}
 
 	if pendingUser != nil {
 		sess.AddMessage(*pendingUser)
@@ -466,7 +554,7 @@ func (a *Agent) maybeCompactContext(ctx context.Context, sess *session.Session, 
 		logging.Warn("Failed to save compacted session state: %v", err)
 	}
 
-	logging.Info("Context compaction completed: session=%s current_tokens=%.0f threshold=%.1f%%", sess.ID, currentTokens, cfg.TriggerPercent)
+	logging.Info("Context compaction completed: session=%s current_tokens=%.0f threshold=%.1f%% kept=%d", sess.ID, currentTokens, cfg.TriggerPercent, len(messagesToKeep))
 	return response.Usage, true, nil
 }
 
@@ -640,3 +728,47 @@ Guidelines:
 - If you encounter errors, try to understand and fix them
 
 Be concise but thorough. Complete the user's task step by step.`
+
+func (a *Agent) buildCompactionRequestFromMessages(messagesToSummarize []session.Message, prompt string) *llm.ChatRequest {
+	messages := make([]llm.Message, 0, len(messagesToSummarize))
+
+	for _, m := range messagesToSummarize {
+		msg := llm.Message{
+			Role:    m.Role,
+			Content: m.Content,
+		}
+
+		if len(m.ToolCalls) > 0 {
+			msg.ToolCalls = make([]llm.ToolCall, len(m.ToolCalls))
+			for i, tc := range m.ToolCalls {
+				msg.ToolCalls[i] = llm.ToolCall{
+					ID:    tc.ID,
+					Name:  tc.Name,
+					Input: string(tc.Input),
+				}
+			}
+		}
+
+		if len(m.ToolResults) > 0 {
+			msg.ToolResults = make([]llm.ToolResult, len(m.ToolResults))
+			for i, tr := range m.ToolResults {
+				msg.ToolResults[i] = llm.ToolResult{
+					ToolCallID: tr.ToolCallID,
+					Content:    tr.Content,
+					IsError:    tr.IsError,
+					Metadata:   tr.Metadata,
+				}
+			}
+		}
+
+		messages = append(messages, msg)
+	}
+
+	return &llm.ChatRequest{
+		Model:        a.config.Model,
+		Messages:     messages,
+		Temperature:  0.2,
+		MaxTokens:    4096,
+		SystemPrompt: prompt,
+	}
+}

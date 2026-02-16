@@ -2460,6 +2460,33 @@ func (s *Server) composeSystemPromptSnapshot(sess *session.Session) *systemPromp
 	return s.composeSystemPromptSnapshotWithSettings(sess, settings)
 }
 
+func (s *Server) resolveProjectContextSection(sess *session.Session) (string, int) {
+	if sess == nil || sess.ProjectID == nil {
+		return "", 0
+	}
+	projectID := strings.TrimSpace(*sess.ProjectID)
+	if projectID == "" {
+		return "", 0
+	}
+	project, err := s.store.GetProject(projectID)
+	if err != nil || project == nil {
+		return "", 0
+	}
+	if len(project.Folders) == 0 {
+		return "", 0
+	}
+	var sb strings.Builder
+	sb.WriteString("Project context:\n")
+	sb.WriteString(fmt.Sprintf("- Project: %s\n", project.Name))
+	sb.WriteString("- Associated folders:\n")
+	for _, folder := range project.Folders {
+		sb.WriteString(fmt.Sprintf("  - %s\n", folder))
+	}
+	sb.WriteString("\nWhen working on this project, prefer operating within the associated folders above.")
+	content := sb.String()
+	return content, estimateTokensApprox(content)
+}
+
 func (s *Server) composeSystemPromptSnapshotWithSettings(sess *session.Session, settings map[string]string) *systemPromptSnapshot {
 	rawBlocks := strings.TrimSpace(settings[agentInstructionBlocksSettingKey])
 	blocks := []configuredInstructionBlock{}
@@ -2691,6 +2718,19 @@ func (s *Server) composeSystemPromptSnapshotWithSettings(sess *session.Session, 
 			}
 			resolvedBlocks = append(resolvedBlocks, blockSnapshot)
 		}
+	}
+
+	// Inject project context as the first section if a project is associated
+	projectContext, projectContextTokens := s.resolveProjectContextSection(sess)
+	if projectContext != "" {
+		appendSections = append([]string{projectContext}, appendSections...)
+		resolvedBlocks = append([]systemPromptBlockSnapshot{{
+			Type:            "project_context",
+			Value:           "",
+			Enabled:         true,
+			ResolvedContent: projectContext,
+			EstimatedTokens: projectContextTokens,
+		}}, resolvedBlocks...)
 	}
 
 	if len(appendSections) == 0 {
