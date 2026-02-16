@@ -33,6 +33,7 @@ var supportedIntegrationProviders = map[string]struct{}{
 	"google_calendar": {},
 	"perplexity":      {},
 	"brave_search":    {},
+	"exa":             {},
 }
 
 var supportedIntegrationModes = map[string]struct{}{
@@ -51,6 +52,7 @@ var requiredConfigFields = map[string][]string{
 	"google_calendar": {"client_id", "client_secret", "refresh_token"},
 	"perplexity":      {"api_key"},
 	"brave_search":    {"api_key"},
+	"exa":             {"api_key"},
 }
 
 type IntegrationRequest struct {

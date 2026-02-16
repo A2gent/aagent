@@ -16,6 +16,7 @@ var integrationToolsByProvider = map[string][]string{
 	"brave_search":    {"brave_search_query"},
 	"elevenlabs":      {"elevenlabs_tts"},
 	"telegram":        {"telegram_send_message"},
+	"exa":             {"exa_search"},
 }
 
 var integrationToolNameSet = func() map[string]struct{} {
