@@ -3358,6 +3358,21 @@ func sessionTotalTokens(sess *session.Session) int {
 	return total
 }
 
+func sessionInputOutputTokens(sess *session.Session) (int, int) {
+	if sess == nil || sess.Metadata == nil {
+		return 0, 0
+	}
+	input := int(metadataNumber(sess.Metadata, "total_input_tokens"))
+	output := int(metadataNumber(sess.Metadata, "total_output_tokens"))
+	if input < 0 {
+		input = 0
+	}
+	if output < 0 {
+		output = 0
+	}
+	return input, output
+}
+
 func storageSessionTotalTokens(sess *storage.Session) int {
 	if sess == nil || sess.Metadata == nil {
 		return 0
