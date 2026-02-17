@@ -289,12 +289,13 @@ func (s *Server) handleDiscoverSkills(w http.ResponseWriter, r *http.Request) {
 
 // SkillMetadata represents the YAML frontmatter in SKILL.md files
 type SkillMetadata struct {
-	Name          string            `yaml:"name"`
-	Description   string            `yaml:"description"`
-	License       string            `yaml:"license,omitempty"`
-	Compatibility string            `yaml:"compatibility,omitempty"`
-	Metadata      map[string]string `yaml:"metadata,omitempty"`
-	AllowedTools  string            `yaml:"allowed-tools,omitempty"`
+	Name          string      `yaml:"name"`
+	Description   string      `yaml:"description"`
+	License       string      `yaml:"license,omitempty"`
+	Compatibility string      `yaml:"compatibility,omitempty"`
+	Homepage      string      `yaml:"homepage,omitempty"`
+	Metadata      interface{} `yaml:"metadata,omitempty"`
+	AllowedTools  string      `yaml:"allowed-tools,omitempty"`
 }
 
 // parseSkillMetadata extracts YAML frontmatter and metadata from a SKILL.md file
