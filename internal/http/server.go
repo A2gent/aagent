@@ -200,6 +200,7 @@ func (s *Server) setupRoutes() {
 		r.Get("/kimi/models", s.handleListKimiModels)
 		r.Get("/google/models", s.handleListGoogleModels)
 		r.Get("/openai/models", s.handleListOpenAIModels)
+		r.Get("/openrouter/models", s.handleListOpenRouterModels)
 		r.Put("/{providerType}", s.handleUpdateProvider)
 		r.Delete("/{providerType}", s.handleDeleteProvider)
 	})
@@ -1064,6 +1065,10 @@ func (s *Server) handleListGoogleModels(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleListOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	s.handleListOpenAICompatibleModels(w, r, config.ProviderOpenAI, "OpenAI")
+}
+
+func (s *Server) handleListOpenRouterModels(w http.ResponseWriter, r *http.Request) {
+	s.handleListOpenAICompatibleModels(w, r, config.ProviderOpenRouter, "OpenRouter")
 }
 
 func (s *Server) handleListOpenAICompatibleModels(w http.ResponseWriter, r *http.Request, providerType config.ProviderType, providerName string) {

@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	defaultReadLimit = 2000
+	defaultReadLimit = 20
 	maxLineLength    = 2000
 )
 
@@ -40,7 +40,7 @@ func (t *ReadTool) Name() string {
 
 func (t *ReadTool) Description() string {
 	return `Read file contents from the filesystem.
-By default reads up to 2000 lines from the beginning.
+By default reads up to 20 lines from the beginning.
 Use offset and limit for reading specific sections of large files.
 Use start_line and end_line for exact 1-based range reads.
 Line numbers in output start at 1.`

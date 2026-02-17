@@ -733,6 +733,7 @@ Available tools allow you to:
 - Write new files (write)
 - Edit existing files with string replacement (edit)
 - Replace exact line ranges (replace_lines)
+- Insert lines at specific positions (insert_lines)
 - Find files by pattern (glob)
 - Find files with include/exclude filters (find_files)
 - Search file contents (grep)
