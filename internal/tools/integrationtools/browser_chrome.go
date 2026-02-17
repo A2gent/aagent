@@ -103,6 +103,10 @@ func (t *BrowserChromeTool) Schema() map[string]interface{} {
 				"type":        "string",
 				"description": "CSS selector for the element",
 			},
+			"page": map[string]interface{}{
+				"type":        "integer",
+				"description": "Page number for get_interactive_elements (default 1, 20 items per page)",
+			},
 			"text": map[string]interface{}{
 				"type":        "string",
 				"description": "Text to type (required for 'type')",
@@ -206,8 +210,16 @@ func (t *BrowserChromeTool) Execute(ctx context.Context, params json.RawMessage)
 		return &tools.Result{Success: true, Output: text}, nil
 
 	case "get_interactive_elements":
+		// Get page number (default 1)
+		pageNum := 1
+		if p, ok := input["page"].(float64); ok && p > 0 {
+			pageNum = int(p)
+		}
+		const perPage = 20
+		offset := (pageNum - 1) * perPage
+
 		// Get all interactive elements (inputs, buttons, links) with unique selectors
-		result := page.MustEval(`() => {
+		result := page.MustEval(fmt.Sprintf(`(offset, perPage) => {
 			const elements = [];
 			const seen = new Set();
 			
@@ -266,8 +278,10 @@ func (t *BrowserChromeTool) Execute(ctx context.Context, params json.RawMessage)
 				});
 			});
 			
-			return elements.slice(0, 40);
-		}`)
+			const total = elements.length;
+			const paged = elements.slice(%d, %d);
+			return { elements: paged, total: total, page: %d, perPage: %d, hasMore: total > %d };
+		}`, offset, offset+perPage, pageNum, perPage, offset+perPage))
 
 		// Format output nicely
 		elementsJSON, err := json.MarshalIndent(result, "", "  ")
