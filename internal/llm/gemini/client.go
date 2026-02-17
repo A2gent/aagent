@@ -494,8 +494,10 @@ func (c *Client) convertMessage(msg llm.Message) []geminiMessage {
 			// Use saved thought_signature or generate default
 			if tc.ThoughtSignature != "" {
 				toolCall.Function.ThoughtSignature = tc.ThoughtSignature
+				logging.Debug("Using saved thought_signature for %s: %s", tc.Name, tc.ThoughtSignature)
 			} else {
 				toolCall.Function.ThoughtSignature = "Calling tool: " + tc.Name
+				logging.Debug("Generated thought_signature for %s: %s", tc.Name, toolCall.Function.ThoughtSignature)
 			}
 			toolCalls = append(toolCalls, toolCall)
 		}

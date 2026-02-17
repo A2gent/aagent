@@ -214,9 +214,10 @@ func (a *Agent) loop(ctx context.Context, sess *session.Session, onEvent func(Ev
 		sessionToolCalls := make([]session.ToolCall, len(response.ToolCalls))
 		for i, tc := range response.ToolCalls {
 			sessionToolCalls[i] = session.ToolCall{
-				ID:    tc.ID,
-				Name:  tc.Name,
-				Input: []byte(tc.Input),
+				ID:               tc.ID,
+				Name:             tc.Name,
+				Input:            []byte(tc.Input),
+				ThoughtSignature: tc.ThoughtSignature,
 			}
 		}
 
@@ -300,9 +301,10 @@ func (a *Agent) buildRequest(sess *session.Session) *llm.ChatRequest {
 			msg.ToolCalls = make([]llm.ToolCall, len(m.ToolCalls))
 			for i, tc := range m.ToolCalls {
 				msg.ToolCalls[i] = llm.ToolCall{
-					ID:    tc.ID,
-					Name:  tc.Name,
-					Input: string(tc.Input),
+					ID:               tc.ID,
+					Name:             tc.Name,
+					Input:            string(tc.Input),
+					ThoughtSignature: tc.ThoughtSignature,
 				}
 			}
 		}
@@ -346,9 +348,10 @@ func (a *Agent) buildCompactionRequest(sess *session.Session, prompt string) *ll
 			msg.ToolCalls = make([]llm.ToolCall, len(m.ToolCalls))
 			for i, tc := range m.ToolCalls {
 				msg.ToolCalls[i] = llm.ToolCall{
-					ID:    tc.ID,
-					Name:  tc.Name,
-					Input: string(tc.Input),
+					ID:               tc.ID,
+					Name:             tc.Name,
+					Input:            string(tc.Input),
+					ThoughtSignature: tc.ThoughtSignature,
 				}
 			}
 		}
