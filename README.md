@@ -169,6 +169,49 @@ Configuration is loaded in order (later overrides earlier):
 | `AAGENT_WHISPER_AUTO_DOWNLOAD` | Auto-download model (default: enabled) |
 | `AAGENT_WHISPER_SOURCE` | Path to whisper.cpp source |
 
+## Database
+
+The agent uses SQLite for persistent storage of sessions, messages, recurring jobs, and settings.
+
+### Database Location
+
+The SQLite database is stored at:
+
+```
+~/.local/share/aagent/aagent.db
+```
+
+Or if `AAGENT_DATA_PATH` is set:
+
+```
+$AAGENT_DATA_PATH/aagent.db
+```
+
+### Database Schema
+
+The database contains the following main tables:
+
+- **sessions** - Session metadata (id, agent_id, parent_id, job_id, project_id, title, status, timestamps)
+- **messages** - Conversation messages with tool calls and results
+- **recurring_jobs** - Scheduled recurring tasks
+- **job_executions** - Execution history for recurring jobs
+- **app_settings** - Application settings and API keys
+- **integrations** - External integrations (Telegram, Slack, etc.)
+- **mcp_servers** - MCP server registry
+- **projects** - Project groupings for sessions
+
+### Accessing the Database
+
+You can query the database directly using `sqlite3`:
+
+```bash
+sqlite3 ~/.local/share/aagent/aagent.db
+
+# Example queries
+SELECT id, title, status, created_at FROM sessions ORDER BY created_at DESC LIMIT 10;
+SELECT COUNT(*) FROM messages WHERE session_id = 'your-session-id';
+```
+
 ## Tools
 
 | Tool | Description |

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -147,11 +148,19 @@ func (a *Agent) loop(ctx context.Context, sess *session.Session, onEvent func(Ev
 	a.cleanupIncompleteToolCalls(sess)
 
 	for {
-		// Check context
+		// Check context - distinguish between user cancellation and timeouts
 		if ctx.Err() != nil {
-			sess.SetStatus(session.StatusPaused)
-			a.sessionManager.Save(sess)
-			return "", totalUsage, ctx.Err()
+			if errors.Is(ctx.Err(), context.Canceled) {
+				// Explicit user cancellation (e.g., user clicked cancel, closed browser)
+				// Pause immediately - user wants to stop
+				logging.Info("User cancelled session %s", sess.ID)
+				sess.SetStatus(session.StatusPaused)
+				a.sessionManager.Save(sess)
+				return "", totalUsage, ctx.Err()
+			}
+			// For context.DeadlineExceeded, we continue and let the agent see tool errors
+			// The agent can then decide whether to retry or give up
+			logging.Info("Context deadline exceeded for session %s, continuing to let agent handle errors", sess.ID)
 		}
 
 		// Check step limit

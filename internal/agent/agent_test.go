@@ -100,16 +100,17 @@ func TestMaybeCompactContext(t *testing.T) {
 	}
 
 	// Check final session state
-	// We expect 5 messages: [User, Assistant, Summary, User, Assistant]
+	// We expect 6 messages: [User, Assistant, Summary, User, Assistant, Synthetic Continuation]
 	// The first 2 are summarized but kept in history.
 	// The Summary is inserted at index 2.
 	// The last 2 are kept raw.
+	// A synthetic continuation message is added at the end.
 
-	if len(sess.Messages) != 5 {
-		t.Errorf("Expected 5 messages after compaction, got %d", len(sess.Messages))
+	if len(sess.Messages) != 6 {
+		t.Errorf("Expected 6 messages after compaction, got %d", len(sess.Messages))
 	}
 
-	if len(sess.Messages) == 5 {
+	if len(sess.Messages) == 6 {
 		if sess.Messages[2].Role != "assistant" {
 			t.Errorf("Expected message at index 2 to be summary (assistant), got %s", sess.Messages[2].Role)
 		}
@@ -129,6 +130,15 @@ func TestMaybeCompactContext(t *testing.T) {
 
 		if sess.Messages[3].Content != "How are you?" {
 			t.Errorf("Expected message at index 3 to be 'How are you?', got '%s'", sess.Messages[3].Content)
+		}
+
+		// Check that the last message is the synthetic continuation
+		lastMsg := sess.Messages[5]
+		if lastMsg.Role != "user" {
+			t.Errorf("Expected last message to be user (synthetic continuation), got %s", lastMsg.Role)
+		}
+		if lastMsg.Metadata == nil || lastMsg.Metadata["synthetic_continuation"] != true {
+			t.Errorf("Expected last message to have synthetic_continuation metadata")
 		}
 	}
 }
