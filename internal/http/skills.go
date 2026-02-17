@@ -522,7 +522,7 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Install skill using real ClawHub API v1
-	installedSkill, err := skills.InstallSkill("", req.SkillID, resolvedFolder)
+	_, err = skills.InstallSkill("", req.SkillID, resolvedFolder)
 	if err != nil {
 		s.errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to install skill: %v", err))
 		return
@@ -530,8 +530,8 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 
 	s.jsonResponse(w, http.StatusOK, SkillInstallResponse{
 		Success: true,
-		Message: fmt.Sprintf("Skill %s installed successfully", installedSkill.Name),
-		Name:    installedSkill.Name,
+		Message: fmt.Sprintf("Skill '%s' installed successfully", req.SkillID),
+		Name:    req.SkillID,
 		Path:    filepath.Join(resolvedFolder, req.SkillID),
 	})
 }
