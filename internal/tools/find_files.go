@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	defaultFindFilesLimit = 200
-	maxFindFilesLimit     = 2000
+	defaultFindFilesLimit    = 30 // Changed to 30 for pagination
+	maxFindFilesLimit        = 2000
+	defaultFindFilesPageSize = 30
 )
 
 // FindFilesTool finds files with include/exclude filters.
@@ -28,7 +29,10 @@ type FindFilesParams struct {
 	Pattern    string   `json:"pattern,omitempty"`
 	Exclude    []string `json:"exclude,omitempty"`
 	MaxResults int      `json:"max_results,omitempty"`
-	Sort       string   `json:"sort,omitempty"` // none|path|mtime
+	Sort       string   `json:"sort,omitempty"`        // none|path|mtime
+	Page       int      `json:"page,omitempty"`        // page number (1-based, default: 1)
+	PageSize   int      `json:"page_size,omitempty"`   // items per page (default: 30)
+	ShowHidden bool     `json:"show_hidden,omitempty"` // include hidden files/folders (default: false)
 }
 
 // NewFindFilesTool creates a new find_files tool.
@@ -42,6 +46,7 @@ func (t *FindFilesTool) Name() string {
 
 func (t *FindFilesTool) Description() string {
 	return `Find files with glob patterns and exclude filters.
+Supports pagination (30 files per page by default) and hides hidden files by default.
 Optimized for precise file discovery with compact output.
 Use this before grep/read/edit to minimize context usage.`
 }
@@ -67,12 +72,27 @@ func (t *FindFilesTool) Schema() map[string]interface{} {
 			},
 			"max_results": map[string]interface{}{
 				"type":        "integer",
-				"description": "Maximum number of results (default: 200, max: 2000)",
+				"description": "Maximum number of results (default: 30, max: 2000)",
 			},
 			"sort": map[string]interface{}{
 				"type":        "string",
 				"description": "Sort mode: none, path, or mtime (default: path)",
 				"enum":        []string{"none", "path", "mtime"},
+			},
+			"page": map[string]interface{}{
+				"type":        "integer",
+				"description": "Page number for pagination (1-based, default: 1)",
+				"minimum":     1,
+			},
+			"page_size": map[string]interface{}{
+				"type":        "integer",
+				"description": "Number of results per page (default: 30, max: 100)",
+				"minimum":     1,
+				"maximum":     100,
+			},
+			"show_hidden": map[string]interface{}{
+				"type":        "boolean",
+				"description": "Include hidden files and folders (default: false)",
 			},
 		},
 	}
@@ -98,9 +118,24 @@ func (t *FindFilesTool) Execute(ctx context.Context, params json.RawMessage) (*R
 		pattern = "**/*"
 	}
 
+	// Handle pagination parameters
+	page := p.Page
+	if page <= 0 {
+		page = 1
+	}
+
+	pageSize := p.PageSize
+	if pageSize <= 0 {
+		pageSize = defaultFindFilesPageSize
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+
+	// Handle max_results for backwards compatibility
 	limit := p.MaxResults
 	if limit <= 0 {
-		limit = defaultFindFilesLimit
+		limit = maxFindFilesLimit // Use max to collect all files for pagination
 	}
 	if limit > maxFindFilesLimit {
 		limit = maxFindFilesLimit
@@ -146,10 +181,18 @@ func (t *FindFilesTool) Execute(ctx context.Context, params json.RawMessage) (*R
 			continue
 		}
 
+		// Skip hidden files unless explicitly requested
+		if !p.ShowHidden && isHiddenPath(rel) {
+			continue
+		}
+
 		totalIncluded++
-		results = append(results, fileResult{path: rel, modTime: info.ModTime().UnixNano()})
+		if len(results) < limit {
+			results = append(results, fileResult{path: rel, modTime: info.ModTime().UnixNano()})
+		}
 	}
 
+	// Sort all results first
 	switch sortMode {
 	case "path":
 		sort.Slice(results, func(i, j int) bool {
@@ -161,22 +204,42 @@ func (t *FindFilesTool) Execute(ctx context.Context, params json.RawMessage) (*R
 		})
 	}
 
-	if len(results) > limit {
-		results = results[:limit]
-	}
-
 	if len(results) == 0 {
 		return &Result{Success: true, Output: "No files found"}, nil
 	}
 
-	lines := make([]string, 0, len(results))
-	for _, r := range results {
+	// Apply pagination
+	totalResults := len(results)
+	totalPages := (totalResults + pageSize - 1) / pageSize // Ceiling division
+
+	if page > totalPages {
+		return &Result{Success: true, Output: fmt.Sprintf("Page %d does not exist. Total pages: %d", page, totalPages)}, nil
+	}
+
+	startIdx := (page - 1) * pageSize
+	endIdx := startIdx + pageSize
+	if endIdx > totalResults {
+		endIdx = totalResults
+	}
+
+	paginatedResults := results[startIdx:endIdx]
+
+	lines := make([]string, 0, len(paginatedResults))
+	for _, r := range paginatedResults {
 		lines = append(lines, r.path)
 	}
 
 	output := strings.Join(lines, "\n")
-	if totalIncluded > len(results) {
-		output += fmt.Sprintf("\n\n(showing %d of %d files)", len(results), totalIncluded)
+
+	// Add pagination info
+	if totalPages > 1 {
+		output += fmt.Sprintf("\n\nPage %d of %d (showing %d-%d of %d files)",
+			page, totalPages, startIdx+1, endIdx, totalResults)
+		if page < totalPages {
+			output += fmt.Sprintf("\nUse page=%d for next page", page+1)
+		}
+	} else if totalResults > 0 {
+		output += fmt.Sprintf("\n\n(showing all %d files)", totalResults)
 	}
 
 	return &Result{Success: true, Output: output}, nil
@@ -198,6 +261,17 @@ func isExcluded(path string, patterns []string) bool {
 			if ok {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+// isHiddenPath checks if any component of the path is hidden (starts with '.')
+func isHiddenPath(path string) bool {
+	parts := strings.Split(filepath.Clean(path), string(filepath.Separator))
+	for _, part := range parts {
+		if strings.HasPrefix(part, ".") && part != "." && part != ".." {
+			return true
 		}
 	}
 	return false
