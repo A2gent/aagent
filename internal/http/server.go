@@ -201,8 +201,15 @@ func (s *Server) setupRoutes() {
 		r.Get("/google/models", s.handleListGoogleModels)
 		r.Get("/openai/models", s.handleListOpenAIModels)
 		r.Get("/openrouter/models", s.handleListOpenRouterModels)
+		r.Get("/anthropic/models", s.handleListAnthropicModels)
 		r.Put("/{providerType}", s.handleUpdateProvider)
 		r.Delete("/{providerType}", s.handleDeleteProvider)
+
+		// Anthropic OAuth
+		r.Post("/anthropic/oauth/start", s.handleAnthropicOAuthStart)
+		r.Post("/anthropic/oauth/callback", s.handleAnthropicOAuthCallback)
+		r.Get("/anthropic/oauth/status", s.handleAnthropicOAuthStatus)
+		r.Delete("/anthropic/oauth", s.handleAnthropicOAuthDisconnect)
 	})
 
 	// External channel integrations
@@ -758,8 +765,11 @@ func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 
 		configured := baseURL != ""
 		hasAPIKey := strings.TrimSpace(existing.APIKey) != ""
+		hasOAuth := existing.OAuth != nil && existing.OAuth.AccessToken != ""
+
 		if def.RequiresKey {
-			configured = configured && hasAPIKey
+			// Provider is configured if it has API key OR OAuth tokens
+			configured = configured && (hasAPIKey || hasOAuth)
 		}
 
 		resp = append(resp, ProviderConfigResponse{
@@ -1075,6 +1085,24 @@ func (s *Server) handleListOpenAIModels(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleListOpenRouterModels(w http.ResponseWriter, r *http.Request) {
 	s.handleListOpenAICompatibleModels(w, r, config.ProviderOpenRouter, "OpenRouter")
+}
+
+func (s *Server) handleListAnthropicModels(w http.ResponseWriter, r *http.Request) {
+	provider := s.config.Providers[string(config.ProviderAnthropic)]
+	apiKey := strings.TrimSpace(provider.APIKey)
+	if apiKey == "" {
+		apiKey = s.apiKeyFromEnv(config.ProviderAnthropic)
+	}
+
+	models, err := anthropic.ListModels(apiKey)
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to list Anthropic models: "+err.Error())
+		return
+	}
+
+	s.jsonResponse(w, http.StatusOK, ListProviderModelsResponse{
+		Models: models,
+	})
 }
 
 func (s *Server) handleListOpenAICompatibleModels(w http.ResponseWriter, r *http.Request, providerType config.ProviderType, providerName string) {
@@ -3606,6 +3634,19 @@ func (s *Server) createBaseLLMClient(providerType config.ProviderType, model str
 		// Other OpenAI-compatible providers
 		baseURL = normalizeOpenAIBaseURL(baseURL)
 		return lmstudio.NewClient(apiKey, modelName, baseURL), nil
+	case config.ProviderAnthropic:
+		// Anthropic with OAuth or API key support
+		if provider.OAuth != nil && provider.OAuth.AccessToken != "" {
+			// Use OAuth
+			tokens := &anthropic.OAuthTokens{
+				AccessToken:  provider.OAuth.AccessToken,
+				RefreshToken: provider.OAuth.RefreshToken,
+				ExpiresIn:    int(provider.OAuth.ExpiresAt - time.Now().Unix()),
+			}
+			return anthropic.NewOAuthClient(tokens, modelName, s.refreshAnthropicOAuthToken), nil
+		}
+		// Use API key
+		return anthropic.NewClientWithBaseURL(apiKey, modelName, baseURL), nil
 	default:
 		return anthropic.NewClientWithBaseURL(apiKey, modelName, baseURL), nil
 	}

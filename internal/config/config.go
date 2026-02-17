@@ -31,6 +31,16 @@ type Provider struct {
 	RouterModel        string              `json:"router_model,omitempty"`    // Optional model override for direct router provider.
 	RouterRules        []RouterRule        `json:"router_rules,omitempty"`
 	ContextWindow      int                 `json:"context_window,omitempty"` // in tokens
+
+	// OAuth support
+	OAuth *OAuthConfig `json:"oauth,omitempty"`
+}
+
+// OAuthConfig stores OAuth tokens for a provider
+type OAuthConfig struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresAt    int64  `json:"expires_at"` // Unix timestamp
 }
 
 // FallbackChainNode stores a single fallback step with explicit provider+model.

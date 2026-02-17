@@ -21,22 +21,32 @@ const (
 	defaultBaseURL    = "https://api.anthropic.com/v1"
 	defaultAPIVersion = "2023-06-01"
 	defaultMaxTokens  = 8192
+	// Beta features required for Claude Code compatibility
+	claudeCodeBetaHeader = "claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
+	// OAuth beta feature
+	oauthBetaFeature = "oauth-2025-04-20"
 )
 
 // Client implements the LLM client for Anthropic Claude
 type Client struct {
-	apiKey     string
-	baseURL    string
-	model      string
-	httpClient *http.Client
+	apiKey       string
+	baseURL      string
+	model        string
+	httpClient   *http.Client
+	isClaudeCode bool // Enable Claude Code branding and features
+
+	// OAuth support
+	oauth          *OAuthTokens
+	refreshHandler func(string) (*OAuthTokens, error) // Callback to refresh tokens
 }
 
 // NewClient creates a new Anthropic client
 func NewClient(apiKey, model string) *Client {
 	return &Client{
-		apiKey:  apiKey,
-		baseURL: defaultBaseURL,
-		model:   model,
+		apiKey:       apiKey,
+		baseURL:      defaultBaseURL,
+		model:        model,
+		isClaudeCode: true, // Default to Claude Code mode for better compatibility
 		httpClient: &http.Client{
 			Timeout: 5 * time.Minute,
 		},
@@ -46,13 +56,46 @@ func NewClient(apiKey, model string) *Client {
 // NewClientWithBaseURL creates a new Anthropic-compatible client with a custom base URL
 func NewClientWithBaseURL(apiKey, model, baseURL string) *Client {
 	return &Client{
-		apiKey:  apiKey,
-		baseURL: baseURL,
-		model:   model,
+		apiKey:       apiKey,
+		baseURL:      baseURL,
+		model:        model,
+		isClaudeCode: true,
 		httpClient: &http.Client{
 			Timeout: 5 * time.Minute,
 		},
 	}
+}
+
+// WithClaudeCodeMode enables/disables Claude Code branding and beta features
+func (c *Client) WithClaudeCodeMode(enabled bool) *Client {
+	c.isClaudeCode = enabled
+	return c
+}
+
+// NewOAuthClient creates a new Anthropic client with OAuth tokens
+func NewOAuthClient(tokens *OAuthTokens, model string, refreshHandler func(string) (*OAuthTokens, error)) *Client {
+	return &Client{
+		baseURL:        defaultBaseURL,
+		model:          model,
+		isClaudeCode:   true,
+		oauth:          tokens,
+		refreshHandler: refreshHandler,
+		httpClient: &http.Client{
+			Timeout: 5 * time.Minute,
+		},
+	}
+}
+
+// WithOAuth sets OAuth tokens for the client
+func (c *Client) WithOAuth(tokens *OAuthTokens, refreshHandler func(string) (*OAuthTokens, error)) *Client {
+	c.oauth = tokens
+	c.refreshHandler = refreshHandler
+	return c
+}
+
+// isUsingOAuth returns true if client is configured for OAuth
+func (c *Client) isUsingOAuth() bool {
+	return c.oauth != nil && c.oauth.AccessToken != ""
 }
 
 // anthropicRequest is the request format for Anthropic API
@@ -128,6 +171,78 @@ type anthropicStreamEvent struct {
 	} `json:"delta"`
 }
 
+// transformSystemPrompt adds Claude Code prefix if enabled
+func (c *Client) transformSystemPrompt(systemPrompt string) string {
+	if !c.isClaudeCode {
+		return systemPrompt
+	}
+	prefix := "You are Claude Code, Anthropic's official CLI for Claude."
+	if systemPrompt == "" {
+		return prefix
+	}
+	return prefix + "\n\n" + systemPrompt
+}
+
+// refreshOAuthTokenIfNeeded checks and refreshes OAuth token if expired
+func (c *Client) refreshOAuthTokenIfNeeded() error {
+	if !c.isUsingOAuth() {
+		return nil
+	}
+
+	// Calculate expiration time (token expires_in seconds from now)
+	expiresAt := time.Now().Unix() + int64(c.oauth.ExpiresIn)
+
+	// Check if token is expired (with 5 minute buffer)
+	if !IsTokenExpired(expiresAt) {
+		return nil
+	}
+
+	// Refresh token
+	if c.refreshHandler == nil {
+		return fmt.Errorf("OAuth token expired but no refresh handler configured")
+	}
+
+	newTokens, err := c.refreshHandler(c.oauth.RefreshToken)
+	if err != nil {
+		return fmt.Errorf("failed to refresh OAuth token: %w", err)
+	}
+
+	c.oauth = newTokens
+	return nil
+}
+
+// prepareHeaders sets up HTTP headers for API request
+func (c *Client) prepareHeaders(req *http.Request) error {
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("anthropic-version", defaultAPIVersion)
+
+	// OAuth or API key authentication
+	if c.isUsingOAuth() {
+		// Refresh token if needed
+		if err := c.refreshOAuthTokenIfNeeded(); err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+c.oauth.AccessToken)
+
+		// Add OAuth beta header
+		if c.isClaudeCode {
+			req.Header.Set("anthropic-beta", claudeCodeBetaHeader+","+oauthBetaFeature)
+		} else {
+			req.Header.Set("anthropic-beta", oauthBetaFeature)
+		}
+	} else {
+		// API key authentication
+		req.Header.Set("x-api-key", c.apiKey)
+
+		// Add Claude Code beta headers if enabled
+		if c.isClaudeCode {
+			req.Header.Set("anthropic-beta", claudeCodeBetaHeader)
+		}
+	}
+
+	return nil
+}
+
 // Chat sends a chat request to Anthropic
 func (c *Client) Chat(ctx context.Context, request *llm.ChatRequest) (*llm.ChatResponse, error) {
 	// Build Anthropic request
@@ -168,7 +283,7 @@ func (c *Client) Chat(ctx context.Context, request *llm.ChatRequest) (*llm.ChatR
 	reqBody := anthropicRequest{
 		Model:       model,
 		Messages:    messages,
-		System:      request.SystemPrompt,
+		System:      c.transformSystemPrompt(request.SystemPrompt),
 		MaxTokens:   maxTokens,
 		Temperature: request.Temperature,
 		Tools:       tools,
@@ -185,9 +300,10 @@ func (c *Client) Chat(ctx context.Context, request *llm.ChatRequest) (*llm.ChatR
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", c.apiKey)
-	httpReq.Header.Set("anthropic-version", defaultAPIVersion)
+	// Set headers (handles both OAuth and API key auth)
+	if err := c.prepareHeaders(httpReq); err != nil {
+		return nil, err
+	}
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
@@ -293,7 +409,7 @@ func (c *Client) ChatStream(ctx context.Context, request *llm.ChatRequest, onEve
 	reqBody := anthropicRequest{
 		Model:       model,
 		Messages:    messages,
-		System:      request.SystemPrompt,
+		System:      c.transformSystemPrompt(request.SystemPrompt),
 		MaxTokens:   maxTokens,
 		Temperature: request.Temperature,
 		Tools:       tools,
@@ -308,9 +424,11 @@ func (c *Client) ChatStream(ctx context.Context, request *llm.ChatRequest, onEve
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", c.apiKey)
-	httpReq.Header.Set("anthropic-version", defaultAPIVersion)
+
+	// Set headers (handles both OAuth and API key auth)
+	if err := c.prepareHeaders(httpReq); err != nil {
+		return nil, err
+	}
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
