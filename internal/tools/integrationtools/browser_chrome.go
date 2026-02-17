@@ -71,7 +71,19 @@ func (t *BrowserChromeTool) Name() string {
 }
 
 func (t *BrowserChromeTool) Description() string {
-	return "Control a Chrome browser instance with a dedicated agent profile. Can navigate, click, type, scroll, take screenshots, and read content. Use 'navigate' action with a URL to start browsing. The agent profile is separate from your main Chrome profile and can run simultaneously."
+	return `Control a Chrome browser instance with a dedicated agent profile.
+
+Actions:
+- navigate: Go to a URL (requires 'url')
+- get_interactive_elements: List all clickable/typeable elements with CSS selectors - USE THIS FIRST to find selectors
+- get_text: Get page text content (simplified, no HTML)
+- click: Click an element (requires 'selector')
+- type: Type text into an input (requires 'selector' and 'text')
+- screenshot: Take a screenshot
+- read_content: Get full HTML (verbose)
+- eval: Run JavaScript (requires 'script')
+
+Workflow: navigate -> get_interactive_elements -> click/type using returned selectors`
 }
 
 func (t *BrowserChromeTool) Schema() map[string]interface{} {
@@ -81,7 +93,7 @@ func (t *BrowserChromeTool) Schema() map[string]interface{} {
 			"action": map[string]interface{}{
 				"type":        "string",
 				"description": "Action to perform",
-				"enum":        []string{"navigate", "click", "type", "scroll", "screenshot", "read_content", "eval"},
+				"enum":        []string{"navigate", "click", "type", "scroll", "screenshot", "read_content", "get_interactive_elements", "get_text", "eval"},
 			},
 			"url": map[string]interface{}{
 				"type":        "string",
@@ -180,6 +192,89 @@ func (t *BrowserChromeTool) Execute(ctx context.Context, params json.RawMessage)
 			return &tools.Result{Success: false, Error: fmt.Sprintf("failed to read content: %v", err)}, nil
 		}
 		return &tools.Result{Success: true, Output: content}, nil
+
+	case "get_text":
+		// Get simplified text content without HTML tags
+		body, err := page.Element("body")
+		if err != nil {
+			return &tools.Result{Success: false, Error: fmt.Sprintf("failed to find body: %v", err)}, nil
+		}
+		text, err := body.Text()
+		if err != nil {
+			return &tools.Result{Success: false, Error: fmt.Sprintf("failed to get text: %v", err)}, nil
+		}
+		return &tools.Result{Success: true, Output: text}, nil
+
+	case "get_interactive_elements":
+		// Get all interactive elements (inputs, buttons, links) with unique selectors
+		result := page.MustEval(`() => {
+			const elements = [];
+			const seen = new Set();
+			
+			document.querySelectorAll('input, textarea, button, a[href], select, [role="button"], [onclick]').forEach((el, globalIdx) => {
+				if (el.type === 'hidden') return;
+				const rect = el.getBoundingClientRect();
+				if (rect.width === 0 && rect.height === 0) return;
+				if (el.offsetParent === null && getComputedStyle(el).position !== 'fixed') return;
+				
+				// Build unique selector
+				let selector = '';
+				if (el.id) {
+					selector = '#' + el.id;
+				} else if (el.name) {
+					selector = el.tagName.toLowerCase() + '[name="' + el.name + '"]';
+				} else if (el.getAttribute('data-testid')) {
+					selector = '[data-testid="' + el.getAttribute('data-testid') + '"]';
+				} else {
+					// Build path-based selector
+					let path = [];
+					let current = el;
+					while (current && current !== document.body) {
+						let seg = current.tagName.toLowerCase();
+						if (current.id) {
+							seg = '#' + current.id;
+							path.unshift(seg);
+							break;
+						}
+						const siblings = current.parentElement ? 
+							Array.from(current.parentElement.children).filter(c => c.tagName === current.tagName) : [];
+						if (siblings.length > 1) {
+							const idx = siblings.indexOf(current) + 1;
+							seg += ':nth-of-type(' + idx + ')';
+						}
+						path.unshift(seg);
+						current = current.parentElement;
+						if (path.length > 3) break;
+					}
+					selector = path.join(' > ');
+				}
+				
+				if (seen.has(selector)) {
+					selector = el.tagName.toLowerCase() + '[data-idx="' + globalIdx + '"]';
+					el.setAttribute('data-idx', globalIdx);
+				}
+				seen.add(selector);
+				
+				const text = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '').substring(0, 60).trim();
+				
+				elements.push({
+					selector: selector,
+					tag: el.tagName.toLowerCase(),
+					type: el.type || el.getAttribute('role') || '',
+					text: text,
+					href: el.href ? el.href.substring(0, 80) : undefined
+				});
+			});
+			
+			return elements.slice(0, 40);
+		}`)
+
+		// Format output nicely
+		elementsJSON, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			return &tools.Result{Success: true, Output: fmt.Sprintf("%v", result)}, nil
+		}
+		return &tools.Result{Success: true, Output: string(elementsJSON)}, nil
 
 	case "eval":
 		script, _ := input["script"].(string)
