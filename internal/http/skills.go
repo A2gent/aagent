@@ -535,3 +535,67 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 		Path:    filepath.Join(resolvedFolder, req.SkillID),
 	})
 }
+
+// handleDeleteSkill deletes a skill from the skills folder
+func (s *Server) handleDeleteSkill(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SkillPath string `json:"skill_path"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	if req.SkillPath == "" {
+		s.errorResponse(w, http.StatusBadRequest, "skill_path is required")
+		return
+	}
+
+	// Get skills folder from settings to validate the path
+	settings, err := s.store.GetSettings()
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to get settings")
+		return
+	}
+
+	folder := strings.TrimSpace(settings[skillsFolderSettingKey])
+	if folder == "" {
+		s.errorResponse(w, http.StatusBadRequest, "Skills folder is not configured")
+		return
+	}
+
+	resolvedFolder, err := filepath.Abs(folder)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid skills folder path")
+		return
+	}
+
+	// Resolve the skill path
+	resolvedPath, err := filepath.Abs(req.SkillPath)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid skill path")
+		return
+	}
+
+	// Security check: ensure the path is within the skills folder
+	if !strings.HasPrefix(resolvedPath, resolvedFolder) {
+		s.errorResponse(w, http.StatusBadRequest, "Skill path is outside the skills folder")
+		return
+	}
+
+	// Get the skill directory (parent of SKILL.md)
+	skillDir := filepath.Dir(resolvedPath)
+
+	// Delete the skill directory
+	if err := os.RemoveAll(skillDir); err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to delete skill: %v", err))
+		return
+	}
+
+	s.jsonResponse(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("Skill deleted successfully"),
+		"path":    skillDir,
+	})
+}

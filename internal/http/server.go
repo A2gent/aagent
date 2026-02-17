@@ -318,6 +318,7 @@ func (s *Server) setupRoutes() {
 		r.Get("/discover", s.handleDiscoverSkills)
 		r.Get("/registry/search", s.handleSearchRegistry)
 		r.Post("/registry/install", s.handleInstallSkill)
+		r.Delete("/delete", s.handleDeleteSkill)
 	})
 
 	s.router = r
