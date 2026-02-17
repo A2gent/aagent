@@ -34,9 +34,10 @@ type Message struct {
 
 // ToolCall represents a tool invocation
 type ToolCall struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Input string `json:"input"` // JSON string
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	Input            string `json:"input"`                       // JSON string
+	ThoughtSignature string `json:"thought_signature,omitempty"` // Gemini-specific field
 }
 
 // ToolResult represents a tool result

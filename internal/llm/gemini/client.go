@@ -271,9 +271,10 @@ func (c *Client) Chat(ctx context.Context, request *llm.ChatRequest) (*llm.ChatR
 	// Convert tool calls
 	for _, tc := range choice.Message.ToolCalls {
 		response.ToolCalls = append(response.ToolCalls, llm.ToolCall{
-			ID:    tc.ID,
-			Name:  tc.Function.Name,
-			Input: tc.Function.Arguments,
+			ID:               tc.ID,
+			Name:             tc.Function.Name,
+			Input:            tc.Function.Arguments,
+			ThoughtSignature: tc.Function.ThoughtSignature,
 		})
 	}
 
@@ -431,6 +432,9 @@ func (c *Client) ChatStream(ctx context.Context, request *llm.ChatRequest, onEve
 				if tc.Function.Arguments != "" {
 					result.ToolCalls[idx].Input += tc.Function.Arguments
 				}
+				if tc.Function.ThoughtSignature != "" {
+					result.ToolCalls[idx].ThoughtSignature = tc.Function.ThoughtSignature
+				}
 				if onEvent != nil {
 					if err := onEvent(llm.StreamEvent{
 						Type:           llm.StreamEventToolCallDelta,
@@ -479,7 +483,7 @@ func (c *Client) convertMessage(msg llm.Message) []geminiMessage {
 	}
 
 	if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
-		// Assistant with tool calls - add thought_signature for Gemini
+		// Assistant with tool calls - preserve or generate thought_signature for Gemini
 		var toolCalls []geminiToolCall
 		for _, tc := range msg.ToolCalls {
 			var toolCall geminiToolCall
@@ -487,7 +491,12 @@ func (c *Client) convertMessage(msg llm.Message) []geminiMessage {
 			toolCall.Type = "function"
 			toolCall.Function.Name = tc.Name
 			toolCall.Function.Arguments = tc.Input
-			toolCall.Function.ThoughtSignature = "Calling tool: " + tc.Name // Gemini requirement
+			// Use saved thought_signature or generate default
+			if tc.ThoughtSignature != "" {
+				toolCall.Function.ThoughtSignature = tc.ThoughtSignature
+			} else {
+				toolCall.Function.ThoughtSignature = "Calling tool: " + tc.Name
+			}
 			toolCalls = append(toolCalls, toolCall)
 		}
 		return []geminiMessage{{
