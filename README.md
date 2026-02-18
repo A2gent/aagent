@@ -203,7 +203,6 @@ Configuration is loaded in order (later overrides earlier):
 `.env` files are loaded from:
 - Current directory
 - Home directory (`~/.env`)
-- `~/git/mind/.env`
 
 ### Environment Variables
 
