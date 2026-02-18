@@ -1164,6 +1164,51 @@ func (s *Server) deleteTelegramForumTopic(ctx context.Context, botToken string, 
 	return nil
 }
 
+func (s *Server) editTelegramForumTopicName(ctx context.Context, botToken string, chatID string, threadID int64, name string) error {
+	payload := map[string]interface{}{
+		"chat_id":           chatID,
+		"message_thread_id": threadID,
+		"name":              name,
+	}
+	jsonBody, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to encode editForumTopicName payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		fmt.Sprintf("https://api.telegram.org/bot%s/editForumTopicName", botToken),
+		bytes.NewReader(jsonBody),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to build editForumTopicName request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("editForumTopicName request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result telegramBasicResponsePayload
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("failed to decode editForumTopicName response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK || !result.OK {
+		msg := strings.TrimSpace(result.Description)
+		if msg == "" {
+			msg = resp.Status
+		}
+		return fmt.Errorf("telegram editForumTopicName failed: %s", msg)
+	}
+
+	return nil
+}
+
 func (s *Server) deleteTelegramTopicForSession(ctx context.Context, sess *session.Session) error {
 	if sess == nil || sess.Metadata == nil {
 		return nil
@@ -1278,8 +1323,11 @@ func (s *Server) syncHTTPCreatedSessionToTelegram(ctx context.Context, sessionID
 	sess.Metadata["telegram_scope_key"] = scopeKey
 	if threadID > 0 {
 		sess.Metadata["telegram_thread_id"] = strconv.FormatInt(threadID, 10)
+		topicName := telegramTopicNameForSession(sess, initialTask)
+		sess.Metadata["telegram_topic_name"] = topicName
 	} else {
 		delete(sess.Metadata, "telegram_thread_id")
+		delete(sess.Metadata, "telegram_topic_name")
 	}
 	if err := s.sessionManager.Save(sess); err != nil {
 		logging.Warn("Failed to persist Telegram outbound metadata for session %s: %v", sessionID, err)
@@ -1460,6 +1508,22 @@ func (s *Server) syncSessionMessagesToTelegramBySessionID(ctx context.Context, s
 		return
 	}
 	threadID := telegramThreadIDFromSession(sess)
+
+	// Update topic name if title changed
+	if threadID > 0 && sess.Title != "" {
+		currentTopicName := metadataString(sess.Metadata["telegram_topic_name"])
+		expectedTopicName := telegramTopicNameForSession(sess, "")
+		if currentTopicName != expectedTopicName {
+			if err := s.editTelegramForumTopicName(ctx, botToken, chatID, threadID, expectedTopicName); err != nil {
+				logging.Warn("Failed to update Telegram topic name for session %s: %s", sessionID, sanitizeTelegramError(err))
+			} else {
+				sess.Metadata["telegram_topic_name"] = expectedTopicName
+				if err := s.sessionManager.Save(sess); err != nil {
+					logging.Warn("Failed to persist updated topic name for session %s: %v", sessionID, err)
+				}
+			}
+		}
+	}
 
 	if err := s.syncSessionMessagesToTelegram(ctx, sess, botToken, chatID, threadID); err != nil {
 		logging.Warn("Telegram session message sync failed for session %s: %s", sessionID, sanitizeTelegramError(err))
