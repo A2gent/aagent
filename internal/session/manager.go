@@ -1,6 +1,7 @@
 package session
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/gratheon/aagent/internal/storage"
@@ -74,4 +75,101 @@ func (m *Manager) List() ([]*Session, error) {
 // Delete deletes a session
 func (m *Manager) Delete(id string) error {
 	return m.store.DeleteSession(id)
+}
+
+// QuestionData represents a question asked to the user
+type QuestionData struct {
+	Question string           `json:"question"`
+	Header   string           `json:"header"`
+	Options  []QuestionOption `json:"options"`
+	Multiple bool             `json:"multiple"`
+	Custom   bool             `json:"custom"`
+}
+
+// QuestionOption represents a single answer choice
+type QuestionOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description"`
+}
+
+// SetPendingQuestion stores a pending question in session metadata
+func (m *Manager) SetPendingQuestion(sessionID string, data *QuestionData) error {
+	sess, err := m.Get(sessionID)
+	if err != nil {
+		return fmt.Errorf("session not found: %w", err)
+	}
+
+	if sess.Metadata == nil {
+		sess.Metadata = make(map[string]interface{})
+	}
+
+	sess.Metadata["pending_question"] = data
+	return m.Save(sess)
+}
+
+// GetPendingQuestion retrieves pending question from session metadata
+func (m *Manager) GetPendingQuestion(sessionID string) (*QuestionData, error) {
+	sess, err := m.Get(sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("session not found: %w", err)
+	}
+
+	if sess.Status != StatusInputRequired {
+		return nil, nil
+	}
+
+	data, ok := sess.Metadata["pending_question"]
+	if !ok {
+		return nil, nil
+	}
+
+	// Convert map to QuestionData
+	jsonBytes, err := json.Marshal(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal question data: %w", err)
+	}
+
+	var question QuestionData
+	if err := json.Unmarshal(jsonBytes, &question); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal question data: %w", err)
+	}
+
+	return &question, nil
+}
+
+// AnswerQuestion handles user's answer to a pending question
+func (m *Manager) AnswerQuestion(sessionID string, answer string) error {
+	sess, err := m.Get(sessionID)
+	if err != nil {
+		return fmt.Errorf("session not found: %w", err)
+	}
+
+	if sess.Status != StatusInputRequired {
+		return fmt.Errorf("session is not waiting for input")
+	}
+
+	// Remove pending question
+	delete(sess.Metadata, "pending_question")
+
+	// Add user answer as a message
+	sess.AddMessage(Message{
+		Role:    "user",
+		Content: answer,
+	})
+
+	// Resume session
+	sess.SetStatus(StatusRunning)
+
+	return m.Save(sess)
+}
+
+// SetSessionStatus updates session status (used by question tool)
+func (m *Manager) SetSessionStatus(sessionID string, status string) error {
+	sess, err := m.Get(sessionID)
+	if err != nil {
+		return fmt.Errorf("session not found: %w", err)
+	}
+
+	sess.SetStatus(Status(status))
+	return m.Save(sess)
 }

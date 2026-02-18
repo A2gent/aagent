@@ -117,6 +117,7 @@ func (s *Server) registerServerBackedTools(manager *tools.Manager) {
 	}
 	manager.Register(newRecurringJobsTool(s))
 	manager.Register(newMCPManageTool(s))
+	manager.RegisterQuestionTool(s.sessionManager)
 }
 
 const thinkingJobIDSettingKey = "A2GENT_THINKING_JOB_ID"
@@ -270,6 +271,8 @@ func (s *Server) setupRoutes() {
 		r.Put("/{sessionID}/project", s.handleUpdateSessionProject)
 		r.Post("/{sessionID}/chat", s.handleChat)
 		r.Post("/{sessionID}/chat/stream", s.handleChatStream)
+		r.Get("/{sessionID}/question", s.handleGetPendingQuestion)
+		r.Post("/{sessionID}/answer", s.handleAnswerQuestion)
 	})
 
 	// Projects endpoints (optional grouping for sessions)
@@ -1380,6 +1383,47 @@ func (s *Server) handleCancelSession(w http.ResponseWriter, r *http.Request) {
 		"session_status":  string(sess.Status),
 		"session_updated": sess.UpdatedAt,
 	})
+}
+
+func (s *Server) handleGetPendingQuestion(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "sessionID")
+
+	question, err := s.sessionManager.GetPendingQuestion(sessionID)
+	if err != nil {
+		s.errorResponse(w, http.StatusNotFound, "Failed to get question: "+err.Error())
+		return
+	}
+
+	if question == nil {
+		s.jsonResponse(w, http.StatusOK, map[string]interface{}{"question": nil})
+		return
+	}
+
+	s.jsonResponse(w, http.StatusOK, question)
+}
+
+func (s *Server) handleAnswerQuestion(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "sessionID")
+
+	var req struct {
+		Answer string `json:"answer"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	if req.Answer == "" {
+		s.errorResponse(w, http.StatusBadRequest, "answer is required")
+		return
+	}
+
+	if err := s.sessionManager.AnswerQuestion(sessionID, req.Answer); err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to answer question: "+err.Error())
+		return
+	}
+
+	s.jsonResponse(w, http.StatusOK, map[string]interface{}{"status": "ok"})
 }
 
 func (s *Server) registerActiveSessionRun(sessionID string, cancel context.CancelFunc) string {

@@ -13,10 +13,11 @@ import (
 type Status string
 
 const (
-	StatusRunning   Status = "running"
-	StatusPaused    Status = "paused"
-	StatusCompleted Status = "completed"
-	StatusFailed    Status = "failed"
+	StatusRunning       Status = "running"
+	StatusPaused        Status = "paused"
+	StatusInputRequired Status = "input_required" // Agent is waiting for user input
+	StatusCompleted     Status = "completed"
+	StatusFailed        Status = "failed"
 )
 
 // Session represents an agent session

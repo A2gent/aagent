@@ -144,6 +144,9 @@ func (a *Agent) loop(ctx context.Context, sess *session.Session, onEvent func(Ev
 	step := 0
 	totalUsage := llm.TokenUsage{}
 
+	// Add session ID to context for tools that need it (e.g., question tool)
+	ctx = context.WithValue(ctx, "session_id", sess.ID)
+
 	// Clean up incomplete tool calls before starting
 	a.cleanupIncompleteToolCalls(sess)
 
@@ -250,6 +253,16 @@ func (a *Agent) loop(ctx context.Context, sess *session.Session, onEvent func(Ev
 			// Silently continue on save errors
 			_ = err
 		}
+
+		// Check if session status changed to input_required (e.g., question tool was called)
+		if sess.Status == session.StatusInputRequired {
+			logging.Info("Session %s requires user input, pausing execution", sess.ID)
+			if onEvent != nil {
+				onEvent(Event{Type: EventStepCompleted, Step: step})
+			}
+			return "", totalUsage, nil
+		}
+
 		if onEvent != nil {
 			onEvent(Event{Type: EventToolCompleted, Step: step})
 			onEvent(Event{Type: EventStepCompleted, Step: step})
@@ -659,12 +672,30 @@ func (a *Agent) addTokenUsageMetadata(sess *session.Session, usage llm.TokenUsag
 	if sess == nil {
 		return
 	}
-	metadataSetFloat(sess, metadataTotalInputTokens, metadataFloat(sess.Metadata, metadataTotalInputTokens)+float64(usage.InputTokens))
+
+	// Get previous context size before updating
+	prevContext := metadataFloat(sess.Metadata, metadataCurrentContextTokens)
+
+	// OutputTokens are new tokens generated in this step - accumulate them
 	metadataSetFloat(sess, metadataTotalOutputTokens, metadataFloat(sess.Metadata, metadataTotalOutputTokens)+float64(usage.OutputTokens))
-	// Current context size is the input tokens of the last request (full conversation sent to LLM)
-	// plus the output tokens from the response (which will be added to next request).
-	// We use InputTokens as the base since it represents the actual context sent to LLM.
-	metadataSetFloat(sess, metadataCurrentContextTokens, float64(usage.InputTokens+usage.OutputTokens))
+
+	// InputTokens from API represent the FULL context size (system prompt + all history)
+	// NOT incremental tokens, so we should NOT accumulate them.
+	// Store the current full context size.
+	metadataSetFloat(sess, metadataCurrentContextTokens, float64(usage.InputTokens))
+
+	// For total_input_tokens, we track cumulative input by calculating the delta:
+	// new tokens = current input - previous context size
+	if prevContext == 0 {
+		// First call - use InputTokens as-is (includes system prompt)
+		metadataSetFloat(sess, metadataTotalInputTokens, float64(usage.InputTokens))
+	} else {
+		// Subsequent calls - add only the delta (new user message + new output from previous step)
+		deltaTokens := float64(usage.InputTokens) - prevContext
+		if deltaTokens > 0 {
+			metadataSetFloat(sess, metadataTotalInputTokens, metadataFloat(sess.Metadata, metadataTotalInputTokens)+deltaTokens)
+		}
+	}
 }
 
 func metadataFloat(metadata map[string]interface{}, key string) float64 {

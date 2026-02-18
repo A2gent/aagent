@@ -72,6 +72,11 @@ func NewManagerWithStore(workDir string, store storage.Store) *Manager {
 	return NewManager(workDir)
 }
 
+// RegisterQuestionTool registers the question tool with a session metadata store
+func (m *Manager) RegisterQuestionTool(store QuestionSessionStore) {
+	m.Register(NewQuestionTool(store))
+}
+
 // Register adds a tool to the manager
 func (m *Manager) Register(tool Tool) {
 	m.mu.Lock()
