@@ -10,6 +10,8 @@ Recommended to use [web-app](https://github.com/A2gent/web-app) for full experie
 
 > **Note:** This project uses the Kimi Code API (Anthropic-compatible) as its LLM backend. You will need an API key to use it.
 
+
+<img width="1600" height="486" alt="Screenshot 2026-02-18 at 02 28 44" src="https://github.com/user-attachments/assets/829a71f2-e5c2-4258-8fbd-74071aa52dec" />
 <img width="1415" height="483" alt="Screenshot 2026-02-16 at 01 01 04" src="https://github.com/user-attachments/assets/0b472db5-8a78-4f39-8e28-65d50211cc68" />
 
 
