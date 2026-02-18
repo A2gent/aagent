@@ -575,12 +575,45 @@ func New(
 	appConfig *config.Config,
 ) Model {
 	ta := textarea.New()
-	ta.Placeholder = "Enter your task or message (type / for commands)..."
-	ta.SetWidth(80)
+	ta.Placeholder = ""
 	ta.SetHeight(3)
 	ta.Focus()
 	ta.CharLimit = 0 // Unlimited
 	ta.ShowLineNumbers = false
+	ta.Prompt = "│ " // Use light blue vertical line as prompt instead of border
+
+	// Style the textarea with dark gray background and white text
+	darkGray := lipgloss.Color("#1a1a1a")
+	white := lipgloss.Color("#ffffff")
+	lightBlue := lipgloss.Color("#00AAFF")
+	placeholderGray := lipgloss.Color("#666666")
+
+	ta.FocusedStyle.Base = lipgloss.NewStyle().
+		Background(darkGray)
+	ta.BlurredStyle.Base = lipgloss.NewStyle().
+		Background(darkGray)
+	ta.FocusedStyle.CursorLine = lipgloss.NewStyle().
+		Background(darkGray)
+	ta.BlurredStyle.CursorLine = lipgloss.NewStyle().
+		Background(darkGray)
+	ta.FocusedStyle.Placeholder = lipgloss.NewStyle().
+		Foreground(placeholderGray).
+		Background(darkGray)
+	ta.BlurredStyle.Placeholder = lipgloss.NewStyle().
+		Foreground(placeholderGray).
+		Background(darkGray)
+	ta.FocusedStyle.Text = lipgloss.NewStyle().
+		Foreground(white).
+		Background(darkGray)
+	ta.BlurredStyle.Text = lipgloss.NewStyle().
+		Foreground(white).
+		Background(darkGray)
+	ta.FocusedStyle.Prompt = lipgloss.NewStyle().
+		Foreground(lightBlue).
+		Background(darkGray)
+	ta.BlurredStyle.Prompt = lipgloss.NewStyle().
+		Foreground(lightBlue).
+		Background(darkGray)
 
 	cmdRegistry := commands.NewRegistry()
 
@@ -1224,17 +1257,33 @@ func (m Model) View() string {
 		)
 	}
 
-	// Separator line above input
-	separator := m.renderSeparator()
-
 	// Command menu (rendered above input if active)
 	var commandMenu string
 	if m.showCommandMenu {
 		commandMenu = m.renderCommandMenu() + "\n"
 	}
 
-	// Input area with light blue left border and padding
-	inputView := textareaBorderStyle.Render(m.textarea.View())
+	// Input area - apply background to fill full width
+	textareaContent := m.textarea.View()
+
+	// Ensure the textarea takes up exactly 3 lines with full width background
+	lines := strings.Split(textareaContent, "\n")
+	paddedLines := make([]string, 0, 3)
+	for i := 0; i < 3; i++ {
+		var line string
+		if i < len(lines) {
+			line = lines[i]
+		} else {
+			line = "│ " // Empty line with prompt
+		}
+		// Pad each line to full width with background
+		paddedLine := lipgloss.NewStyle().
+			Background(lipgloss.Color("#1a1a1a")).
+			Width(m.width).
+			Render(line)
+		paddedLines = append(paddedLines, paddedLine)
+	}
+	inputView := strings.Join(paddedLines, "\n")
 
 	// Help text (now on the right side)
 	var helpStr string
@@ -1276,7 +1325,6 @@ func (m Model) View() string {
 		lipgloss.Left,
 		topBar,
 		messagesView,
-		separator,
 		commandMenu+inputView,
 		bottomBar,
 	)
