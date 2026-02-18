@@ -4,11 +4,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A Go-based autonomous AI coding agent that executes tasks in sessions with a beautiful TUI interface.
-As opposed to [OpenCode](https://github.com/anomalyco/opencode), it does not consume hundreds MB of RAM.
+Lightweight and efficient - as opposed to [OpenCode](https://github.com/anomalyco/opencode), it does not consume hundreds MB of RAM.
 
 Recommended to use [web-app](https://github.com/A2gent/web-app) for full experience (with voice and notifications).
 
-> **Note:** This project uses the Kimi Code API (Anthropic-compatible) as its LLM backend. You will need an API key to use it.
+> **Note:** Supports multiple LLM providers including Anthropic Claude, Kimi, Gemini, LM Studio, and custom endpoints. You will need an API key for your chosen provider.
 
 
 <img width="1600" height="486" alt="Screenshot 2026-02-18 at 02 28 44" src="https://github.com/user-attachments/assets/829a71f2-e5c2-4258-8fbd-74071aa52dec" />
@@ -16,15 +16,50 @@ Recommended to use [web-app](https://github.com/A2gent/web-app) for full experie
 
 
 ## Features
-- **Exposes HTTP API** for web-app to interact with
-- **TUI Interface**: Beautiful terminal UI with scrollable history, multi-line input, and real-time status
-- **Agentic Loop**: Receive task → call LLM with tools → execute tool calls → return results → repeat until complete
-- **Session Persistence**: SQLite-based session storage with resumption support
-- **Session Relationships**: Supports parent/child sessions (`parent_id`) and recurring-job sessions (`job_id`)
-- **Tool System**: Modular, extensible tools (bash, read, write, edit, glob, grep)
-- **Kimi Code**: Uses Kimi Code API (Anthropic-compatible) as the LLM backend
-- **Live Metrics**: Token usage tracking and context window percentage display
-- **File Logging**: All operations logged to file for debugging
+
+### Core Agent Capabilities
+- **Agentic Loop**: Autonomous task execution with tool calling - receive task → call LLM with tools → execute tool calls → return results → repeat until complete
+- **Multi-Provider Support**: Works with Anthropic Claude, Kimi, Google Gemini, LM Studio, and custom OpenAI-compatible endpoints
+- **Auto-Router**: Intelligent provider fallback - automatically switches to backup providers on failure
+- **Comprehensive Tool System**: 
+  - File operations: read, write, edit, replace_lines
+  - Search: glob (file patterns), grep (content search), find_files (with filters)
+  - Execution: bash command execution
+  - Media: screenshot capture, camera photo capture
+  - Extensible architecture for custom tools
+
+### Session Management
+- **SQLite Persistence**: All sessions, messages, and metadata stored in SQLite database
+- **Session Resumption**: Continue previous work exactly where you left off
+- **Session Relationships**: Parent/child sessions and recurring-job sessions
+- **Project Organization**: Group sessions by project
+- **Recurring Jobs**: Schedule and execute automated tasks
+
+### Beautiful TUI Interface
+- **Modern Design**: Clean, minimal interface with ASCII art welcome screen
+- **Real-time Status**: 
+  - Model name display at center top
+  - Token usage and context window percentage
+  - Current working directory
+  - Session timer
+- **Enhanced Input Area**: 
+  - Dark gray background with white text
+  - Light blue left border
+  - Multi-line support (Alt+Enter for new line)
+- **Smart Layout**: Keyboard shortcuts on the right, path on the left
+- **Live Metrics**: Real-time token tracking and memory usage
+
+### HTTP API
+- **Web Integration**: Full REST API for web-app integration
+- **Voice Support**: Speech-to-text with Whisper integration
+- **Notifications**: Push notifications support
+- **Session Management**: Create, list, resume, and manage sessions via API
+
+### Performance & Reliability
+- **Lightweight**: Minimal memory footprint compared to alternatives
+- **Context Management**: Automatic context window tracking and compaction
+- **Error Recovery**: Graceful error handling and provider fallback
+- **File Logging**: Detailed logging for debugging and monitoring
 
 ## Quick Start
 
@@ -34,8 +69,12 @@ git clone <repo-url>
 cd aagent
 just build
 
-# 2. Set your API key
+# 2. Set your API key (choose one provider)
+export ANTHROPIC_API_KEY=sk-ant-...
+# or
 export KIMI_API_KEY=sk-kimi-...
+# or
+export GEMINI_API_KEY=...
 
 # 3. Launch and start coding!
 a2 "Create a hello world Go program"
@@ -58,7 +97,12 @@ Current scope:
 
 - **Go 1.21+** - [Download Go](https://golang.org/dl/)
 - **just** (command runner) - `cargo install just` or [other install methods](https://github.com/casey/just#installation)
-- **API Key** - Get your Kimi Code API key from [kimi.com](https://kimi.com)
+- **API Key** - Choose your provider:
+  - [Anthropic Claude](https://console.anthropic.com/) (recommended)
+  - [Kimi](https://kimi.com)
+  - [Google Gemini](https://ai.google.dev/)
+  - [LM Studio](https://lmstudio.ai/) (local models)
+  - Any OpenAI-compatible endpoint
 
 ### Build from Source
 
@@ -78,10 +122,20 @@ just install
 
 ### Environment Setup
 
-Set your API key (or add to `.env` file in your project or home directory):
+Set your API key for your chosen provider (or add to `.env` file in your project or home directory):
 
 ```bash
+# Anthropic Claude (recommended)
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# Or Kimi
 export KIMI_API_KEY=sk-kimi-...
+
+# Or Google Gemini
+export GEMINI_API_KEY=...
+
+# Or LM Studio (local)
+export LM_STUDIO_BASE_URL=http://localhost:1234/v1
 ```
 
 ### Common Commands
@@ -111,17 +165,27 @@ a2 --continue abc123-def456-789   # Resume from where you left off
 
 ## TUI Interface
 
-The TUI provides an interactive interface with:
+The TUI provides a beautiful, modern interactive interface with:
 
-- **Top Bar**: Task summary on the left, token usage and context window percentage on the right
-- **Message History**: Scrollable view of all conversation messages with timestamps
-- **Status Line**: Loading indicator when processing, human-readable timer showing time since last input
-- **Input Area**: Multi-line text area for entering queries (Alt+Enter for new line, Enter to send)
+- **Top Bar**: 
+  - Left: Session title and ID
+  - Center: Currently selected model (⚡ model-name)
+  - Right: Token usage, context percentage, memory usage, timer, and status
+- **Welcome Screen**: ASCII art "A² BRUTE" logo with sword when starting fresh
+- **Message History**: Scrollable view of all conversation messages with color-coded tool calls and timestamps
+- **Input Area**: 
+  - Dark gray background with white text
+  - Light blue left border (│) for visual distinction
+  - Multi-line support (3 lines, Alt+Enter for new line)
+- **Bottom Bar**:
+  - Left: Current working directory path
+  - Right: Context-aware keyboard shortcuts
 - **Keyboard Shortcuts**:
   - `esc`: Quit
   - `enter`: Send message
   - `alt+enter`: Insert new line in input
-  - `ctrl+c`: Force quit
+  - `ctrl+c`: Cancel current operation (or force quit)
+  - `/`: Open command menu
 
 ## Configuration
 
@@ -143,20 +207,27 @@ Configuration is loaded in order (later overrides earlier):
 
 ### Environment Variables
 
-#### Required
+#### Required (choose one)
 
 | Variable | Description |
 |----------|-------------|
-| `KIMI_API_KEY` | Kimi Code API key |
-| `ANTHROPIC_API_KEY` | Alternative to KIMI_API_KEY |
+| `ANTHROPIC_API_KEY` | Anthropic Claude API key (recommended) |
+| `KIMI_API_KEY` | Kimi API key |
+| `GEMINI_API_KEY` | Google Gemini API key |
+| `OPENAI_API_KEY` | OpenAI API key (or compatible) |
 
 #### Optional
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_BASE_URL` | `https://api.kimi.com/coding/v1` | API endpoint |
-| `AAGENT_MODEL` | `kimi-for-coding` | Default model |
-| `AAGENT_DATA_PATH` | - | Data storage directory |
+| `AAGENT_PROVIDER` | `auto` | LLM provider: `anthropic`, `kimi`, `gemini`, `lmstudio`, `auto-router` |
+| `AAGENT_MODEL` | Provider-specific | Model name (e.g., `claude-sonnet-4`, `kimi-for-coding`) |
+| `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Anthropic API endpoint |
+| `KIMI_BASE_URL` | `https://api.kimi.com/coding/v1` | Kimi API endpoint |
+| `GEMINI_BASE_URL` | `https://generativelanguage.googleapis.com` | Gemini API endpoint |
+| `LM_STUDIO_BASE_URL` | `http://localhost:1234/v1` | LM Studio endpoint |
+| `AAGENT_DATA_PATH` | `~/.local/share/aagent` | Data storage directory |
+| `AAGENT_FALLBACK_PROVIDERS` | - | Comma-separated list of fallback providers |
 
 #### Speech-to-Text (Whisper)
 
@@ -303,15 +374,27 @@ Hot reload details:
 
 ### API Key Issues
 
-**Error:** `KIMI_API_KEY not set`
+**Error:** API key not set
 
 **Solution:** 
 ```bash
+# Set the appropriate API key for your provider
+export ANTHROPIC_API_KEY=sk-ant-your-key-here
+# or
 export KIMI_API_KEY=sk-kimi-your-key-here
+# or
+export GEMINI_API_KEY=your-key-here
 ```
-Or create a `.env` file in your project directory with:
-```
-KIMI_API_KEY=sk-kimi-your-key-here
+Or create a `.env` file in your project directory with your chosen provider's key.
+
+### Provider Issues
+
+**Error:** Provider not available
+
+**Solution:** Use auto-router for automatic fallback:
+```bash
+export AAGENT_PROVIDER=auto-router
+export AAGENT_FALLBACK_PROVIDERS=anthropic,kimi,gemini
 ```
 
 ### Build Issues
