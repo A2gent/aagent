@@ -169,7 +169,33 @@ var (
 
 	commandDescStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#888888"))
+
+	// Textarea border style
+	textareaBorderStyle = lipgloss.NewStyle().
+				BorderLeft(true).
+				BorderStyle(lipgloss.NormalBorder()).
+				BorderForeground(lipgloss.Color("#00AAFF")). // Light blue
+				PaddingLeft(1)
+
+	// Model indicator style
+	modelStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#7D56F4")).
+			Bold(true)
+
+	// Path style
+	pathStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#666666"))
 )
+
+// ASCII art for empty state
+const asciiArt = `
+         █████╗ ██████╗     ██████╗ ██████╗ ██╗   ██╗████████╗███████╗
+        ██╔══██╗╚════██╗    ██╔══██╗██╔══██╗██║   ██║   ██║   ██╔════╝
+        ███████║ █████╔╝    ██████╔╝██████╔╝██║   ██║   ██║   █████╗  
+        ██╔══██║██╔═══╝     ██╔══██╗██╔══██╗██║   ██║   ██║   ██╔══╝  
+        ██║  ██║███████╗    ██████╔╝██║  ██║╚██████╔╝   ██║   ███████╗
+        ╚═╝  ╚═╝╚══════╝    ╚═════╝ ╚═╝  ╚═╝ ╚═════╝    ╚═╝   ╚══════╝
+`
 
 // Tool icons for visual distinction in the TUI
 var toolIcons = map[string]string{
@@ -1142,8 +1168,20 @@ func (m Model) View() string {
 	// Top bar with task summary, stats, session, and time
 	topBar := m.renderTopBar()
 
-	// Messages viewport
-	messagesView := m.viewport.View()
+	// Messages viewport - show ASCII art if no messages
+	var messagesView string
+	if len(m.messages) == 0 {
+		// Center the ASCII art
+		artStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#7D56F4")).
+			Bold(true).
+			Width(m.viewport.Width).
+			Height(m.viewport.Height).
+			Align(lipgloss.Center, lipgloss.Center)
+		messagesView = artStyle.Render(asciiArt)
+	} else {
+		messagesView = m.viewport.View()
+	}
 
 	// Check if we should show sessions list overlay
 	if m.showLogsView {
@@ -1195,10 +1233,10 @@ func (m Model) View() string {
 		commandMenu = m.renderCommandMenu() + "\n"
 	}
 
-	// Input area
-	inputView := m.textarea.View()
+	// Input area with light blue left border and padding
+	inputView := textareaBorderStyle.Render(m.textarea.View())
 
-	// Help text
+	// Help text (now on the right side)
 	var helpStr string
 	if m.showCommandMenu {
 		helpStr = "↑↓: navigate • enter/tab: select • esc: cancel"
@@ -1207,9 +1245,32 @@ func (m Model) View() string {
 	} else {
 		helpStr = "esc: quit • enter: send • alt+enter: new line • /: commands"
 	}
+
+	// Get current working directory
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = "unknown"
+	}
+
+	// Bottom bar with path on left and shortcuts on right
+	pathText := pathStyle.Render(cwd)
 	helpText := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#666666")).
 		Render(helpStr)
+
+	// Calculate space between path and help
+	bottomUsedWidth := lipgloss.Width(pathText) + lipgloss.Width(helpText)
+	bottomSpace := m.width - bottomUsedWidth
+	if bottomSpace < 1 {
+		bottomSpace = 1
+	}
+
+	bottomBar := lipgloss.JoinHorizontal(
+		lipgloss.Left,
+		pathText,
+		strings.Repeat(" ", bottomSpace),
+		helpText,
+	)
 
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
@@ -1217,7 +1278,7 @@ func (m Model) View() string {
 		messagesView,
 		separator,
 		commandMenu+inputView,
-		helpText,
+		bottomBar,
 	)
 }
 
@@ -1309,17 +1370,51 @@ func (m Model) renderTopBar() string {
 		timer,
 	)) + statusIcon
 
-	// Calculate space between
-	usedWidth := lipgloss.Width(taskText) + lipgloss.Width(rightSide)
-	space := m.width - usedWidth
-	if space < 1 {
-		space = 1
+	// Model name in the center
+	modelName := m.agentConfig.Model
+	if modelName == "" {
+		modelName = "default"
+	}
+	modelText := modelStyle.Render("⚡ " + modelName)
+
+	// Calculate spacing to center the model
+	leftWidth := lipgloss.Width(taskText)
+	rightWidth := lipgloss.Width(rightSide)
+	centerWidth := lipgloss.Width(modelText)
+
+	totalUsed := leftWidth + centerWidth + rightWidth
+	if totalUsed >= m.width {
+		// Not enough space for centering, just show left and right
+		space := m.width - leftWidth - rightWidth
+		if space < 1 {
+			space = 1
+		}
+		return lipgloss.JoinHorizontal(
+			lipgloss.Left,
+			taskText,
+			strings.Repeat(" ", space),
+			rightSide,
+		)
+	}
+
+	// Center the model text
+	remainingSpace := m.width - totalUsed
+	leftSpace := (remainingSpace / 2) + 1
+	rightSpace := remainingSpace - leftSpace + 2
+
+	if leftSpace < 1 {
+		leftSpace = 1
+	}
+	if rightSpace < 1 {
+		rightSpace = 1
 	}
 
 	return lipgloss.JoinHorizontal(
 		lipgloss.Left,
 		taskText,
-		strings.Repeat(" ", space),
+		strings.Repeat(" ", leftSpace),
+		modelText,
+		strings.Repeat(" ", rightSpace),
 		rightSide,
 	)
 }
