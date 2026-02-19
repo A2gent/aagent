@@ -34,10 +34,11 @@ func (t *SessionTaskProgressTool) Name() string {
 }
 
 func (t *SessionTaskProgressTool) Description() string {
-	return `Track task progress and planning for the current session. ` +
-		`Manage subtasks with completion state using [ ] for pending and [x] for done. ` +
-		`Actions: get (read), set (overwrite), append (add). ` +
-		`Supports nested tasks via 2-space indentation.`
+	return `Track task progress for the current session. ` +
+		`Format: "- [ ] Task name" (pending) or "- [x] Task name" (completed). ` +
+		`Use 2-space indent for sub-tasks. ` +
+		`Example: "- [x] Step 1\n  - [ ] Sub-task 1.1\n- [ ] Step 2". ` +
+		`Actions: get, set, append.`
 }
 
 func (t *SessionTaskProgressTool) Schema() map[string]interface{} {
@@ -189,6 +190,7 @@ type TaskStats struct {
 }
 
 // parseTaskStats extracts statistics from task progress text
+// Supports both "- [ ] Task" and "[ ] Task" formats
 func parseTaskStats(content string) TaskStats {
 	lines := strings.Split(content, "\n")
 	total := 0
@@ -196,6 +198,10 @@ func parseTaskStats(content string) TaskStats {
 
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
+		// Remove leading "- " if present to normalize format
+		if strings.HasPrefix(trimmed, "- ") {
+			trimmed = trimmed[2:]
+		}
 		if strings.HasPrefix(trimmed, "[ ]") {
 			total++
 		} else if strings.HasPrefix(trimmed, "[x]") || strings.HasPrefix(trimmed, "[X]") {

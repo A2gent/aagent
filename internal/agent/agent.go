@@ -10,11 +10,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/A2gent/brute/internal/llm"
 	"github.com/A2gent/brute/internal/logging"
 	"github.com/A2gent/brute/internal/session"
 	"github.com/A2gent/brute/internal/tools"
+	"github.com/google/uuid"
 )
 
 // Config holds agent configuration
@@ -274,16 +274,22 @@ func (a *Agent) loop(ctx context.Context, sess *session.Session, onEvent func(Ev
 		sess.AddToolResult(sessionResults)
 
 		// Reload session to check if status was changed by tools (e.g., question tool)
+		// Also sync any fields that tools may have updated (e.g., task_progress)
 		// IMPORTANT: Do this BEFORE Save() so we can detect status changes made by tools
 		freshSess, reloadErr := a.sessionManager.Get(sess.ID)
-		if reloadErr == nil && freshSess.Status == session.StatusInputRequired {
-			logging.Info("Session %s requires user input (detected after tool execution), pausing", sess.ID)
-			// Don't save the local sess changes - use the fresh one with input_required status
-			if onEvent != nil {
-				onEvent(Event{Type: EventToolCompleted, Step: step})
-				onEvent(Event{Type: EventStepCompleted, Step: step})
+		if reloadErr == nil {
+			// Sync task_progress from DB (may have been updated by session_task_progress tool)
+			sess.TaskProgress = freshSess.TaskProgress
+
+			if freshSess.Status == session.StatusInputRequired {
+				logging.Info("Session %s requires user input (detected after tool execution), pausing", sess.ID)
+				// Don't save the local sess changes - use the fresh one with input_required status
+				if onEvent != nil {
+					onEvent(Event{Type: EventToolCompleted, Step: step})
+					onEvent(Event{Type: EventStepCompleted, Step: step})
+				}
+				return "", totalUsage, nil
 			}
-			return "", totalUsage, nil
 		}
 
 		// Save session after each step
