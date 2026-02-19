@@ -279,14 +279,19 @@ func (s *Server) setupRoutes() {
 	r.Route("/projects", func(r chi.Router) {
 		r.Get("/", s.handleListProjects)
 		r.Post("/", s.handleCreateProject)
-		r.Get("/{projectID}", s.handleGetProject)
-		r.Put("/{projectID}", s.handleUpdateProject)
-		r.Delete("/{projectID}", s.handleDeleteProject)
+		// Static routes must come before dynamic {projectID} route
 		r.Get("/tree", s.handleListProjectTree)
 		r.Get("/file", s.handleGetProjectFile)
 		r.Post("/file", s.handleUpsertProjectFile)
 		r.Put("/file", s.handleUpsertProjectFile)
 		r.Delete("/file", s.handleDeleteProjectFile)
+		r.Post("/file/move", s.handleMoveProjectFile)
+		r.Post("/folder", s.handleCreateProjectFolder)
+		r.Post("/rename", s.handleRenameProjectEntry)
+		// Dynamic route must come last
+		r.Get("/{projectID}", s.handleGetProject)
+		r.Put("/{projectID}", s.handleUpdateProject)
+		r.Delete("/{projectID}", s.handleDeleteProject)
 	})
 
 	// Recurring jobs endpoints
@@ -311,6 +316,9 @@ func (s *Server) setupRoutes() {
 		r.Post("/file", s.handleUpsertMindFile)
 		r.Put("/file", s.handleUpsertMindFile)
 		r.Delete("/file", s.handleDeleteMindFile)
+		r.Post("/file/move", s.handleMoveMindFile)
+		r.Post("/folder", s.handleCreateMindFolder)
+		r.Post("/rename", s.handleRenameMindEntry)
 	})
 
 	// Skills helpers (folder selection and markdown discovery)
@@ -442,6 +450,7 @@ type ToolResultResponse struct {
 	Content    string                 `json:"content"`
 	IsError    bool                   `json:"is_error"`
 	Metadata   map[string]interface{} `json:"metadata,omitempty"`
+	Name       string                 `json:"name,omitempty"` // Tool name (required by Gemini)
 }
 
 // ChatRequest represents a chat message request
@@ -2348,6 +2357,7 @@ func (s *Server) messagesToResponse(messages []session.Message) []MessageRespons
 					Content:    tr.Content,
 					IsError:    tr.IsError,
 					Metadata:   tr.Metadata,
+					Name:       tr.Name,
 				}
 			}
 		}

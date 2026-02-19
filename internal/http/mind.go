@@ -49,6 +49,37 @@ type UpdateMindFileRequest struct {
 	Content string `json:"content"`
 }
 
+type MoveMindFileRequest struct {
+	FromPath string `json:"from_path"`
+	ToPath   string `json:"to_path"`
+}
+
+type MoveMindFileResponse struct {
+	RootFolder string `json:"root_folder"`
+	FromPath   string `json:"from_path"`
+	ToPath     string `json:"to_path"`
+}
+
+type CreateFolderRequest struct {
+	Path string `json:"path"`
+}
+
+type CreateFolderResponse struct {
+	RootFolder string `json:"root_folder"`
+	Path       string `json:"path"`
+}
+
+type RenameEntryRequest struct {
+	OldPath string `json:"old_path"`
+	NewName string `json:"new_name"`
+}
+
+type RenameEntryResponse struct {
+	RootFolder string `json:"root_folder"`
+	OldPath    string `json:"old_path"`
+	NewPath    string `json:"new_path"`
+}
+
 func (s *Server) handleGetMindConfig(w http.ResponseWriter, r *http.Request) {
 	settings, err := s.store.GetSettings()
 	if err != nil {
@@ -460,6 +491,228 @@ func directoryHasChildren(path string) bool {
 	return false
 }
 
+func (s *Server) handleMoveMindFile(w http.ResponseWriter, r *http.Request) {
+	rootFolder, err := s.loadMindRootFolder()
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	var req MoveMindFileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	fromResolved, fromNormalized, err := resolveMindPath(rootFolder, req.FromPath)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid source path: "+err.Error())
+		return
+	}
+	if fromNormalized == "" {
+		s.errorResponse(w, http.StatusBadRequest, "Source path is required")
+		return
+	}
+
+	fromInfo, err := os.Stat(fromResolved)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			s.errorResponse(w, http.StatusNotFound, "Source does not exist")
+			return
+		}
+		s.errorResponse(w, http.StatusBadRequest, "Failed to access source: "+err.Error())
+		return
+	}
+
+	isDir := fromInfo.IsDir()
+	if !isDir && !isMarkdownFile(fromNormalized) {
+		s.errorResponse(w, http.StatusBadRequest, "Only markdown files and folders can be moved")
+		return
+	}
+
+	toResolved, toNormalized, err := resolveMindPath(rootFolder, req.ToPath)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid destination path: "+err.Error())
+		return
+	}
+	if toNormalized == "" {
+		s.errorResponse(w, http.StatusBadRequest, "Destination path is required")
+		return
+	}
+
+	if !isDir && !isMarkdownFile(toNormalized) {
+		s.errorResponse(w, http.StatusBadRequest, "Destination must be a markdown file")
+		return
+	}
+
+	if fromResolved == toResolved {
+		s.errorResponse(w, http.StatusBadRequest, "Source and destination paths are the same")
+		return
+	}
+
+	if isDir && strings.HasPrefix(toResolved+string(os.PathSeparator), fromResolved+string(os.PathSeparator)) {
+		s.errorResponse(w, http.StatusBadRequest, "Cannot move a folder into itself")
+		return
+	}
+
+	toParentDir := filepath.Dir(toResolved)
+	toParentInfo, err := os.Stat(toParentDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			s.errorResponse(w, http.StatusBadRequest, "Destination folder does not exist")
+			return
+		}
+		s.errorResponse(w, http.StatusBadRequest, "Failed to access destination folder: "+err.Error())
+		return
+	}
+	if !toParentInfo.IsDir() {
+		s.errorResponse(w, http.StatusBadRequest, "Destination parent path is not a folder")
+		return
+	}
+
+	if _, err := os.Stat(toResolved); err == nil {
+		s.errorResponse(w, http.StatusConflict, "A file or folder already exists at the destination path")
+		return
+	} else if !errors.Is(err, os.ErrNotExist) {
+		s.errorResponse(w, http.StatusBadRequest, "Failed to check destination: "+err.Error())
+		return
+	}
+
+	if err := os.Rename(fromResolved, toResolved); err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to move: "+err.Error())
+		return
+	}
+
+	s.jsonResponse(w, http.StatusOK, MoveMindFileResponse{
+		RootFolder: rootFolder,
+		FromPath:   filepath.ToSlash(fromNormalized),
+		ToPath:     filepath.ToSlash(toNormalized),
+	})
+}
+
+func (s *Server) handleCreateMindFolder(w http.ResponseWriter, r *http.Request) {
+	rootFolder, err := s.loadMindRootFolder()
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	var req CreateFolderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	resolvedPath, normalizedRelPath, err := resolveMindPath(rootFolder, req.Path)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if normalizedRelPath == "" {
+		s.errorResponse(w, http.StatusBadRequest, "Folder path is required")
+		return
+	}
+
+	if _, err := os.Stat(resolvedPath); err == nil {
+		s.errorResponse(w, http.StatusConflict, "A file or folder already exists at this path")
+		return
+	} else if !errors.Is(err, os.ErrNotExist) {
+		s.errorResponse(w, http.StatusBadRequest, "Failed to check path: "+err.Error())
+		return
+	}
+
+	if err := os.MkdirAll(resolvedPath, 0o755); err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to create folder: "+err.Error())
+		return
+	}
+
+	s.jsonResponse(w, http.StatusOK, CreateFolderResponse{
+		RootFolder: rootFolder,
+		Path:       filepath.ToSlash(normalizedRelPath),
+	})
+}
+
+func (s *Server) handleRenameMindEntry(w http.ResponseWriter, r *http.Request) {
+	rootFolder, err := s.loadMindRootFolder()
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	var req RenameEntryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	oldResolved, oldNormalized, err := resolveMindPath(rootFolder, req.OldPath)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid path: "+err.Error())
+		return
+	}
+	if oldNormalized == "" {
+		s.errorResponse(w, http.StatusBadRequest, "Path is required")
+		return
+	}
+
+	newName := strings.TrimSpace(req.NewName)
+	if newName == "" {
+		s.errorResponse(w, http.StatusBadRequest, "New name is required")
+		return
+	}
+	if strings.ContainsAny(newName, "/\\") {
+		s.errorResponse(w, http.StatusBadRequest, "Name cannot contain path separators")
+		return
+	}
+
+	info, err := os.Stat(oldResolved)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			s.errorResponse(w, http.StatusNotFound, "File or folder does not exist")
+			return
+		}
+		s.errorResponse(w, http.StatusBadRequest, "Failed to access path: "+err.Error())
+		return
+	}
+
+	if !info.IsDir() && !isMarkdownFile(newName) {
+		s.errorResponse(w, http.StatusBadRequest, "File must have .md or .markdown extension")
+		return
+	}
+
+	parentDir := filepath.Dir(oldResolved)
+	newResolved := filepath.Join(parentDir, newName)
+
+	if oldResolved == newResolved {
+		s.errorResponse(w, http.StatusBadRequest, "New name is the same as the old name")
+		return
+	}
+
+	if _, err := os.Stat(newResolved); err == nil {
+		s.errorResponse(w, http.StatusConflict, "A file or folder with this name already exists")
+		return
+	} else if !errors.Is(err, os.ErrNotExist) {
+		s.errorResponse(w, http.StatusBadRequest, "Failed to check new path: "+err.Error())
+		return
+	}
+
+	if err := os.Rename(oldResolved, newResolved); err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to rename: "+err.Error())
+		return
+	}
+
+	newRelPath, err := filepath.Rel(rootFolder, newResolved)
+	if err != nil {
+		newRelPath = newName
+	}
+
+	s.jsonResponse(w, http.StatusOK, RenameEntryResponse{
+		RootFolder: rootFolder,
+		OldPath:    filepath.ToSlash(oldNormalized),
+		NewPath:    filepath.ToSlash(newRelPath),
+	})
+}
+
 // handleListProjectTree lists files and folders in a project's folder
 func (s *Server) handleListProjectTree(w http.ResponseWriter, r *http.Request) {
 	projectID := r.URL.Query().Get("projectID")
@@ -779,5 +1032,291 @@ func (s *Server) handleDeleteProjectFile(w http.ResponseWriter, r *http.Request)
 	s.jsonResponse(w, http.StatusOK, MindFileDeleteResponse{
 		RootFolder: resolvedRoot,
 		Path:       filepath.ToSlash(normalizedRelPath),
+	})
+}
+
+// handleMoveProjectFile moves a file or folder within a project's folder
+func (s *Server) handleMoveProjectFile(w http.ResponseWriter, r *http.Request) {
+	projectID := r.URL.Query().Get("projectID")
+	if projectID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "projectID is required")
+		return
+	}
+
+	project, err := s.store.GetProject(projectID)
+	if err != nil {
+		s.errorResponse(w, http.StatusNotFound, "Project not found")
+		return
+	}
+
+	if project.Folder == nil || strings.TrimSpace(*project.Folder) == "" {
+		s.errorResponse(w, http.StatusBadRequest, "Project folder is not configured")
+		return
+	}
+
+	rootFolder := strings.TrimSpace(*project.Folder)
+	if !filepath.IsAbs(rootFolder) {
+		rootFolder = filepath.Join(".", rootFolder)
+	}
+	resolvedRoot, err := filepath.Abs(rootFolder)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Project folder path is invalid")
+		return
+	}
+
+	var req MoveMindFileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	fromResolved, fromNormalized, err := resolveMindPath(resolvedRoot, req.FromPath)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid source path: "+err.Error())
+		return
+	}
+	if fromNormalized == "" {
+		s.errorResponse(w, http.StatusBadRequest, "Source path is required")
+		return
+	}
+
+	fromInfo, err := os.Stat(fromResolved)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			s.errorResponse(w, http.StatusNotFound, "Source does not exist")
+			return
+		}
+		s.errorResponse(w, http.StatusBadRequest, "Failed to access source: "+err.Error())
+		return
+	}
+
+	isDir := fromInfo.IsDir()
+	if !isDir && !isMarkdownFile(fromNormalized) {
+		s.errorResponse(w, http.StatusBadRequest, "Only markdown files and folders can be moved")
+		return
+	}
+
+	toResolved, toNormalized, err := resolveMindPath(resolvedRoot, req.ToPath)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid destination path: "+err.Error())
+		return
+	}
+	if toNormalized == "" {
+		s.errorResponse(w, http.StatusBadRequest, "Destination path is required")
+		return
+	}
+
+	if !isDir && !isMarkdownFile(toNormalized) {
+		s.errorResponse(w, http.StatusBadRequest, "Destination must be a markdown file")
+		return
+	}
+
+	if fromResolved == toResolved {
+		s.errorResponse(w, http.StatusBadRequest, "Source and destination paths are the same")
+		return
+	}
+
+	if isDir && strings.HasPrefix(toResolved+string(os.PathSeparator), fromResolved+string(os.PathSeparator)) {
+		s.errorResponse(w, http.StatusBadRequest, "Cannot move a folder into itself")
+		return
+	}
+
+	toParentDir := filepath.Dir(toResolved)
+	toParentInfo, err := os.Stat(toParentDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			s.errorResponse(w, http.StatusBadRequest, "Destination folder does not exist")
+			return
+		}
+		s.errorResponse(w, http.StatusBadRequest, "Failed to access destination folder: "+err.Error())
+		return
+	}
+	if !toParentInfo.IsDir() {
+		s.errorResponse(w, http.StatusBadRequest, "Destination parent path is not a folder")
+		return
+	}
+
+	if _, err := os.Stat(toResolved); err == nil {
+		s.errorResponse(w, http.StatusConflict, "A file or folder already exists at the destination path")
+		return
+	} else if !errors.Is(err, os.ErrNotExist) {
+		s.errorResponse(w, http.StatusBadRequest, "Failed to check destination: "+err.Error())
+		return
+	}
+
+	if err := os.Rename(fromResolved, toResolved); err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to move: "+err.Error())
+		return
+	}
+
+	s.jsonResponse(w, http.StatusOK, MoveMindFileResponse{
+		RootFolder: resolvedRoot,
+		FromPath:   filepath.ToSlash(fromNormalized),
+		ToPath:     filepath.ToSlash(toNormalized),
+	})
+}
+
+func (s *Server) handleCreateProjectFolder(w http.ResponseWriter, r *http.Request) {
+	projectID := r.URL.Query().Get("projectID")
+	if projectID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "projectID is required")
+		return
+	}
+
+	project, err := s.store.GetProject(projectID)
+	if err != nil {
+		s.errorResponse(w, http.StatusNotFound, "Project not found")
+		return
+	}
+
+	if project.Folder == nil || strings.TrimSpace(*project.Folder) == "" {
+		s.errorResponse(w, http.StatusBadRequest, "Project folder is not configured")
+		return
+	}
+
+	rootFolder := strings.TrimSpace(*project.Folder)
+	if !filepath.IsAbs(rootFolder) {
+		rootFolder = filepath.Join(".", rootFolder)
+	}
+	resolvedRoot, err := filepath.Abs(rootFolder)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Project folder path is invalid")
+		return
+	}
+
+	var req CreateFolderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	resolvedPath, normalizedRelPath, err := resolveMindPath(resolvedRoot, req.Path)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if normalizedRelPath == "" {
+		s.errorResponse(w, http.StatusBadRequest, "Folder path is required")
+		return
+	}
+
+	if _, err := os.Stat(resolvedPath); err == nil {
+		s.errorResponse(w, http.StatusConflict, "A file or folder already exists at this path")
+		return
+	} else if !errors.Is(err, os.ErrNotExist) {
+		s.errorResponse(w, http.StatusBadRequest, "Failed to check path: "+err.Error())
+		return
+	}
+
+	if err := os.MkdirAll(resolvedPath, 0o755); err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to create folder: "+err.Error())
+		return
+	}
+
+	s.jsonResponse(w, http.StatusOK, CreateFolderResponse{
+		RootFolder: resolvedRoot,
+		Path:       filepath.ToSlash(normalizedRelPath),
+	})
+}
+
+func (s *Server) handleRenameProjectEntry(w http.ResponseWriter, r *http.Request) {
+	projectID := r.URL.Query().Get("projectID")
+	if projectID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "projectID is required")
+		return
+	}
+
+	project, err := s.store.GetProject(projectID)
+	if err != nil {
+		s.errorResponse(w, http.StatusNotFound, "Project not found")
+		return
+	}
+
+	if project.Folder == nil || strings.TrimSpace(*project.Folder) == "" {
+		s.errorResponse(w, http.StatusBadRequest, "Project folder is not configured")
+		return
+	}
+
+	rootFolder := strings.TrimSpace(*project.Folder)
+	if !filepath.IsAbs(rootFolder) {
+		rootFolder = filepath.Join(".", rootFolder)
+	}
+	resolvedRoot, err := filepath.Abs(rootFolder)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Project folder path is invalid")
+		return
+	}
+
+	var req RenameEntryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	oldResolved, oldNormalized, err := resolveMindPath(resolvedRoot, req.OldPath)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid path: "+err.Error())
+		return
+	}
+	if oldNormalized == "" {
+		s.errorResponse(w, http.StatusBadRequest, "Path is required")
+		return
+	}
+
+	newName := strings.TrimSpace(req.NewName)
+	if newName == "" {
+		s.errorResponse(w, http.StatusBadRequest, "New name is required")
+		return
+	}
+	if strings.ContainsAny(newName, "/\\") {
+		s.errorResponse(w, http.StatusBadRequest, "Name cannot contain path separators")
+		return
+	}
+
+	info, err := os.Stat(oldResolved)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			s.errorResponse(w, http.StatusNotFound, "File or folder does not exist")
+			return
+		}
+		s.errorResponse(w, http.StatusBadRequest, "Failed to access path: "+err.Error())
+		return
+	}
+
+	if !info.IsDir() && !isMarkdownFile(newName) {
+		s.errorResponse(w, http.StatusBadRequest, "File must have .md or .markdown extension")
+		return
+	}
+
+	parentDir := filepath.Dir(oldResolved)
+	newResolved := filepath.Join(parentDir, newName)
+
+	if oldResolved == newResolved {
+		s.errorResponse(w, http.StatusBadRequest, "New name is the same as the old name")
+		return
+	}
+
+	if _, err := os.Stat(newResolved); err == nil {
+		s.errorResponse(w, http.StatusConflict, "A file or folder with this name already exists")
+		return
+	} else if !errors.Is(err, os.ErrNotExist) {
+		s.errorResponse(w, http.StatusBadRequest, "Failed to check new path: "+err.Error())
+		return
+	}
+
+	if err := os.Rename(oldResolved, newResolved); err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to rename: "+err.Error())
+		return
+	}
+
+	newRelPath, err := filepath.Rel(resolvedRoot, newResolved)
+	if err != nil {
+		newRelPath = newName
+	}
+
+	s.jsonResponse(w, http.StatusOK, RenameEntryResponse{
+		RootFolder: resolvedRoot,
+		OldPath:    filepath.ToSlash(oldNormalized),
+		NewPath:    filepath.ToSlash(newRelPath),
 	})
 }
