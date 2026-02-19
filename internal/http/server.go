@@ -193,6 +193,9 @@ func (s *Server) setupRoutes() {
 	// Health check
 	r.Get("/health", s.handleHealth)
 
+	// A2A Agent Card (Well-Known URI per A2A spec)
+	r.Get("/.well-known/agent-card.json", s.handleAgentCard)
+
 	// App settings (tokens/secrets/runtime options)
 	r.Get("/settings", s.handleGetSettings)
 	r.Put("/settings", s.handleUpdateSettings)
