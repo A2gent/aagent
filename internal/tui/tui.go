@@ -131,6 +131,9 @@ var (
 	statusFailedStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#FF0000"))
 
+	statusInputRequiredStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("#9C27B0")) // Purple
+
 	loadingStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FFA500"))
 
@@ -551,6 +554,11 @@ type Model struct {
 	// Session sync tracking
 	lastSyncedMessageCount int
 
+	// Question prompt state
+	showQuestionPrompt  bool
+	pendingQuestion     *session.QuestionData
+	questionOptionIndex int // Selected option index (-1 = custom answer)
+
 	// Error state
 	err error
 }
@@ -726,8 +734,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 
-		// Height calculation: total - topBar(1) - separator(1) - textarea(3) - helpText(1) = total - 6
-		viewportHeight := msg.Height - 6
+		// Height calculation: total - topBar(1) - textarea(3) - bottomBar(1) = total - 5
+		// If question prompt is shown, also subtract its height
+		fixedHeight := 5 // topBar + textarea + bottomBar
+		questionHeight := m.calculateQuestionPromptHeight()
+		viewportHeight := msg.Height - fixedHeight - questionHeight
 		if viewportHeight < 1 {
 			viewportHeight = 1
 		}
@@ -745,6 +756,108 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.SetContent(m.renderMessages())
 
 	case tea.KeyMsg:
+		// Handle question prompt first
+		if m.showQuestionPrompt && m.pendingQuestion != nil {
+			switch msg.Type {
+			case tea.KeyEsc:
+				// Don't allow escaping question prompt - user must answer
+				return m, nil
+			case tea.KeyPgUp, tea.KeyPgDown, tea.KeyHome, tea.KeyEnd:
+				// Allow scrolling viewport even when question is shown
+				m.viewport, vpCmd = m.viewport.Update(msg)
+				return m, vpCmd
+			case tea.KeyUp:
+				// Use Alt+Up for viewport scroll, plain Up for option navigation
+				if msg.Alt {
+					m.viewport, vpCmd = m.viewport.Update(msg)
+					return m, vpCmd
+				}
+				// Navigate up: custom (-1) -> last option -> ... -> first option
+				if m.questionOptionIndex == -1 {
+					// From custom to last option
+					m.questionOptionIndex = len(m.pendingQuestion.Options) - 1
+				} else if m.questionOptionIndex > 0 {
+					m.questionOptionIndex--
+				}
+				return m, nil
+			case tea.KeyDown:
+				// Use Alt+Down for viewport scroll, plain Down for option navigation
+				if msg.Alt {
+					m.viewport, vpCmd = m.viewport.Update(msg)
+					return m, vpCmd
+				}
+				// Navigate down: first option -> ... -> last option -> custom (-1)
+				if m.questionOptionIndex < len(m.pendingQuestion.Options)-1 {
+					m.questionOptionIndex++
+				} else if m.pendingQuestion.Custom {
+					// Go to custom answer position
+					m.questionOptionIndex = -1
+				}
+				return m, nil
+			case tea.KeyEnter:
+				// Submit answer
+				var answer string
+
+				if m.questionOptionIndex == -1 {
+					// Custom answer - use textarea value
+					answer = strings.TrimSpace(m.textarea.Value())
+				} else if m.questionOptionIndex >= 0 && m.questionOptionIndex < len(m.pendingQuestion.Options) {
+					// Selected option
+					answer = m.pendingQuestion.Options[m.questionOptionIndex].Label
+				}
+
+				if answer != "" {
+					// Send answer
+					if err := m.sessionManager.AnswerQuestion(m.session.ID, answer); err != nil {
+						m.messages = append(m.messages, message{
+							role:      "error",
+							content:   fmt.Sprintf("Failed to answer question: %v", err),
+							timestamp: time.Now(),
+						})
+					} else {
+						// Clear question state
+						m.showQuestionPrompt = false
+						m.pendingQuestion = nil
+						m.textarea.Reset() // Clear textarea
+
+						// Recalculate viewport height now that question is hidden
+						fixedHeight := 5 // topBar + textarea + bottomBar
+						questionHeight := m.calculateQuestionPromptHeight()
+						viewportHeight := m.height - fixedHeight - questionHeight
+						if viewportHeight < 1 {
+							viewportHeight = 1
+						}
+						m.viewport.Height = viewportHeight
+
+						// Reload session
+						if sess, err := m.sessionManager.Get(m.session.ID); err == nil {
+							m.session = sess
+							// Resume agent if status is running
+							if sess.Status == session.StatusRunning {
+								m.processing = true
+								m.lastUserInputTime = time.Now()
+								cmd, cancel := m.runAgentResume()
+								m.cancelFunc = cancel
+								m.cancelPending = false
+								cmds = append(cmds, cmd)
+							}
+						}
+					}
+					m.viewport.SetContent(m.renderMessages())
+					m.viewport.GotoBottom()
+				}
+				return m, tea.Batch(cmds...)
+			default:
+				// If custom answer is selected, let textarea handle input
+				if m.questionOptionIndex == -1 && m.pendingQuestion.Custom {
+					m.textarea, taCmd = m.textarea.Update(msg)
+					return m, taCmd
+				}
+				// Otherwise ignore other keys
+				return m, nil
+			}
+		}
+
 		// Handle logs view first
 		if m.showLogsView {
 			switch msg.Type {
@@ -1079,9 +1192,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.memoryMB = msg.memoryMB
 
 	case sessionSyncMsg:
-		if msg.session != nil && !m.processing {
+		if msg.session != nil {
+			// Check if session status changed to input_required
+			if msg.session.Status == session.StatusInputRequired && !m.showQuestionPrompt {
+				// Load pending question
+				question, err := m.sessionManager.GetPendingQuestion(msg.session.ID)
+				if err == nil && question != nil {
+					m.pendingQuestion = question
+					m.showQuestionPrompt = true
+					m.questionOptionIndex = 0
+					m.processing = false // Stop processing, wait for answer
+
+					// Recalculate viewport height now that question is shown
+					fixedHeight := 5 // topBar + textarea + bottomBar
+					questionHeight := m.calculateQuestionPromptHeight()
+					viewportHeight := m.height - fixedHeight - questionHeight
+					if viewportHeight < 1 {
+						viewportHeight = 1
+					}
+					m.viewport.Height = viewportHeight
+				}
+			}
+
 			// Check if there are new messages from external sources (e.g., web app)
-			if len(msg.session.Messages) > m.lastSyncedMessageCount {
+			if !m.processing && len(msg.session.Messages) > m.lastSyncedMessageCount {
 				// Reload messages from the synced session
 				m.session = msg.session
 				m.messages = make([]message, 0, len(msg.session.Messages))
@@ -1100,6 +1234,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.applySessionTokenMetadata(msg.session)
 				m.viewport.SetContent(m.renderMessages())
 				m.viewport.GotoBottom()
+			} else {
+				// Update session reference even if no new messages
+				m.session = msg.session
 			}
 		}
 		// Schedule next sync
@@ -1128,6 +1265,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cancelFunc = nil
 			m.cancelPending = false
 			logging.Debug("TUI: Agent done, processing=%v queuedMessages=%d", m.processing, len(m.queuedMessages))
+
+			// Check if session is waiting for input
+			if freshSess, err := m.sessionManager.Get(m.session.ID); err == nil {
+				m.session = freshSess
+				if freshSess.Status == session.StatusInputRequired {
+					// Load pending question immediately
+					question, qErr := m.sessionManager.GetPendingQuestion(freshSess.ID)
+					if qErr == nil && question != nil {
+						m.pendingQuestion = question
+						m.showQuestionPrompt = true
+						m.questionOptionIndex = 0
+						logging.Debug("TUI: Loaded pending question: %s", question.Header)
+
+						// Recalculate viewport height now that question is shown
+						fixedHeight := 5 // topBar + textarea + bottomBar
+						questionHeight := m.calculateQuestionPromptHeight()
+						viewportHeight := m.height - fixedHeight - questionHeight
+						if viewportHeight < 1 {
+							viewportHeight = 1
+						}
+						m.viewport.Height = viewportHeight
+					}
+				}
+			}
+
 			// Add assistant response message
 			if msg.content != "" {
 				m.messages = append(m.messages, message{
@@ -1257,37 +1419,65 @@ func (m Model) View() string {
 		)
 	}
 
+	// Question prompt (rendered above input if active)
+	var questionPrompt string
+	if m.showQuestionPrompt {
+		questionPrompt = m.renderQuestionPrompt() + "\n"
+	}
+
 	// Command menu (rendered above input if active)
 	var commandMenu string
 	if m.showCommandMenu {
 		commandMenu = m.renderCommandMenu() + "\n"
 	}
 
-	// Input area - apply background to fill full width
-	textareaContent := m.textarea.View()
-
-	// Ensure the textarea takes up exactly 3 lines with full width background
-	lines := strings.Split(textareaContent, "\n")
-	paddedLines := make([]string, 0, 3)
-	for i := 0; i < 3; i++ {
-		var line string
-		if i < len(lines) {
-			line = lines[i]
-		} else {
-			line = "│ " // Empty line with prompt
-		}
-		// Pad each line to full width with background
-		paddedLine := lipgloss.NewStyle().
+	// Input area - show textarea for custom answer, placeholder for option selection
+	var inputView string
+	if m.showQuestionPrompt && m.questionOptionIndex >= 0 {
+		// Option is selected - show placeholder
+		disabledStyle := lipgloss.NewStyle().
 			Background(lipgloss.Color("#1a1a1a")).
-			Width(m.width).
-			Render(line)
-		paddedLines = append(paddedLines, paddedLine)
+			Foreground(lipgloss.Color("#666666")).
+			Width(m.width)
+
+		selectedOption := ""
+		if m.questionOptionIndex < len(m.pendingQuestion.Options) {
+			selectedOption = m.pendingQuestion.Options[m.questionOptionIndex].Label
+		}
+		inputView = disabledStyle.Render("│ Selected: " + selectedOption + " (press Enter to submit, ↓ for custom)")
+	} else {
+		// Normal textarea (for regular input or custom answer)
+		textareaContent := m.textarea.View()
+
+		// Ensure the textarea takes up exactly 3 lines with full width background
+		lines := strings.Split(textareaContent, "\n")
+		paddedLines := make([]string, 0, 3)
+		for i := 0; i < 3; i++ {
+			var line string
+			if i < len(lines) {
+				line = lines[i]
+			} else {
+				line = "│ " // Empty line with prompt
+			}
+			// Pad each line to full width with background
+			paddedLine := lipgloss.NewStyle().
+				Background(lipgloss.Color("#1a1a1a")).
+				Width(m.width).
+				Render(line)
+			paddedLines = append(paddedLines, paddedLine)
+		}
+		inputView = strings.Join(paddedLines, "\n")
 	}
-	inputView := strings.Join(paddedLines, "\n")
 
 	// Help text (now on the right side)
 	var helpStr string
-	if m.showCommandMenu {
+	if m.showQuestionPrompt {
+		if m.pendingQuestion != nil && m.pendingQuestion.Custom {
+			helpStr = "↑↓: navigate • type: custom answer • enter: submit"
+		} else {
+			helpStr = "↑↓: navigate • enter: submit"
+		}
+	} else if m.showCommandMenu {
 		helpStr = "↑↓: navigate • enter/tab: select • esc: cancel"
 	} else if m.processing {
 		helpStr = "ctrl+c: cancel • esc: quit • enter: queue message • /: commands"
@@ -1325,7 +1515,7 @@ func (m Model) View() string {
 		lipgloss.Left,
 		topBar,
 		messagesView,
-		commandMenu+inputView,
+		questionPrompt+commandMenu+inputView,
 		bottomBar,
 	)
 }
@@ -1383,6 +1573,8 @@ func (m Model) renderTopBar() string {
 		statusIcon = statusCompletedStyle.Render("✓")
 	case session.StatusFailed:
 		statusIcon = statusFailedStyle.Render("✗")
+	case session.StatusInputRequired:
+		statusIcon = statusInputRequiredStyle.Render("?")
 	}
 
 	// Token stats
@@ -1793,6 +1985,33 @@ func (m Model) runAgent(input string) (tea.Cmd, context.CancelFunc) {
 	return cmd, cancel
 }
 
+// runAgentResume continues agent execution after answering a question
+func (m Model) runAgentResume() (tea.Cmd, context.CancelFunc) {
+	// Create a cancellable context
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Capture necessary fields for the goroutine
+	agent := m.agent
+	sess := m.session
+
+	cmd := func() tea.Msg {
+		// Agent continues from where it left off
+		// The answer was already added as a user message by AnswerQuestion
+		result, usage, err := agent.Run(ctx, sess, "")
+		if err != nil {
+			return agentResponseMsg{err: err}
+		}
+		return agentResponseMsg{
+			content:      result,
+			done:         true,
+			inputTokens:  usage.InputTokens,
+			outputTokens: usage.OutputTokens,
+		}
+	}
+
+	return cmd, cancel
+}
+
 // generateTitle generates a session title from the conversation
 func (m Model) generateTitle() tea.Cmd {
 	return func() tea.Msg {
@@ -2186,6 +2405,103 @@ func (m Model) renderLogsView() string {
 
 	content := strings.Join(out, "\n")
 	return commandMenuStyle.Width(m.width - 4).Render(content)
+}
+
+// calculateQuestionPromptHeight calculates how many lines the question prompt will take
+func (m Model) calculateQuestionPromptHeight() int {
+	if !m.showQuestionPrompt || m.pendingQuestion == nil {
+		return 0
+	}
+
+	height := 0
+	height += 1                              // Top separator
+	height += 1                              // Header line
+	height += len(m.pendingQuestion.Options) // Options (one per line)
+	if m.pendingQuestion.Custom {
+		height += 1 // Empty line before custom hint
+		height += 1 // Custom hint line
+	}
+	height += 1 // Bottom separator
+
+	return height
+}
+
+// renderQuestionPrompt renders the question prompt overlay
+func (m Model) renderQuestionPrompt() string {
+	if !m.showQuestionPrompt || m.pendingQuestion == nil {
+		return ""
+	}
+
+	var sb strings.Builder
+
+	// Header (compact, one line)
+	questionHeaderStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#FF9800"))
+
+	sb.WriteString(questionHeaderStyle.Render("❓ " + m.pendingQuestion.Header + ": " + m.pendingQuestion.Question))
+	sb.WriteString("\n")
+
+	// Options (compact, one line each)
+	optionStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#AAAAAA"))
+
+	selectedOptionStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#2196F3")).
+		Bold(true)
+
+	for i, opt := range m.pendingQuestion.Options {
+		var icon string
+		var style lipgloss.Style
+
+		if m.pendingQuestion.Multiple {
+			icon = "☐"
+			if i == m.questionOptionIndex {
+				icon = "☑"
+			}
+		} else {
+			icon = "○"
+			if i == m.questionOptionIndex {
+				icon = "◉"
+			}
+		}
+
+		if i == m.questionOptionIndex {
+			style = selectedOptionStyle
+		} else {
+			style = optionStyle
+		}
+
+		text := fmt.Sprintf("  %s %s", icon, opt.Label)
+		sb.WriteString(style.Render(text))
+		sb.WriteString("\n")
+	}
+
+	// Custom answer hint if enabled
+	if m.pendingQuestion.Custom {
+		sb.WriteString("\n")
+
+		// Check if custom field is selected
+		isCustomSelected := m.questionOptionIndex == -1
+
+		var hintStyle lipgloss.Style
+		var hintText string
+		if isCustomSelected {
+			hintStyle = selectedOptionStyle
+			hintText = "  💡 Custom answer (type below) ▼"
+		} else {
+			hintStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888"))
+			hintText = "  💡 Custom answer (press ↓ to select)"
+		}
+		sb.WriteString(hintStyle.Render(hintText))
+	}
+
+	// Simple separator line instead of border (more compact)
+	separator := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#FF9800")).
+		Render(strings.Repeat("─", m.width))
+
+	return separator + "\n" + sb.String() + separator
 }
 
 // renderCommandMenu renders the command menu popup
