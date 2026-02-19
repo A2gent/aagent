@@ -88,9 +88,26 @@ type compactionConfig struct {
 
 // Event describes a streaming update from the agent.
 type Event struct {
-	Type  EventType
-	Step  int
-	Delta string
+	Type       EventType
+	Step       int
+	Delta      string
+	ToolCalls  []ToolCallEvent  // Populated for EventToolExecuting
+	ToolResult *ToolResultEvent // Populated for EventToolCompleted (single result)
+}
+
+// ToolCallEvent represents a tool call being executed.
+type ToolCallEvent struct {
+	ID    string
+	Name  string
+	Input string // JSON string
+}
+
+// ToolResultEvent represents the result of a tool execution.
+type ToolResultEvent struct {
+	ToolCallID string
+	Name       string
+	Content    string
+	IsError    bool
 }
 
 // New creates a new agent
@@ -229,7 +246,15 @@ func (a *Agent) loop(ctx context.Context, sess *session.Session, onEvent func(Ev
 
 		// Execute tools
 		if onEvent != nil {
-			onEvent(Event{Type: EventToolExecuting, Step: step})
+			toolCallEvents := make([]ToolCallEvent, len(response.ToolCalls))
+			for i, tc := range response.ToolCalls {
+				toolCallEvents[i] = ToolCallEvent{
+					ID:    tc.ID,
+					Name:  tc.Name,
+					Input: tc.Input,
+				}
+			}
+			onEvent(Event{Type: EventToolExecuting, Step: step, ToolCalls: toolCallEvents})
 		}
 		toolResults := a.toolManager.ExecuteParallel(ctx, response.ToolCalls)
 
