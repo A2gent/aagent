@@ -137,7 +137,7 @@ func SupportedProviders() []ProviderDefinition {
 			DisplayName:   "Anthropic Claude",
 			DefaultURL:    "https://api.anthropic.com/v1",
 			RequiresKey:   true,
-			DefaultModel:  "claude-sonnet-4-20250514",
+			DefaultModel:  "claude-opus-4-6",
 			ContextWindow: 200000,
 		},
 		{
@@ -145,7 +145,7 @@ func SupportedProviders() []ProviderDefinition {
 			DisplayName:   "Google Gemini",
 			DefaultURL:    "https://generativelanguage.googleapis.com/v1beta/openai",
 			RequiresKey:   true,
-			DefaultModel:  "gemini-2.0-flash",
+			DefaultModel:  "gemini-3-flash-preview",
 			ContextWindow: 1048576,
 		},
 		{

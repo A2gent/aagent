@@ -119,6 +119,7 @@ func (s *Server) registerServerBackedTools(manager *tools.Manager) {
 	manager.Register(newRecurringJobsTool(s))
 	manager.Register(newMCPManageTool(s))
 	manager.RegisterQuestionTool(s.sessionManager)
+	manager.RegisterSessionTaskProgressTool(s.sessionManager)
 }
 
 const thinkingJobIDSettingKey = "A2GENT_THINKING_JOB_ID"
@@ -275,6 +276,7 @@ func (s *Server) setupRoutes() {
 		r.Get("/{sessionID}/question", s.handleGetPendingQuestion)
 		r.Post("/{sessionID}/answer", s.handleAnswerQuestion)
 		r.Post("/{sessionID}/start", s.handleStartSession)
+		r.Get("/{sessionID}/task-progress", s.handleGetTaskProgress)
 	})
 
 	// Projects endpoints (optional grouping for sessions)
@@ -1124,7 +1126,26 @@ func (s *Server) handleListKimiModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListGoogleModels(w http.ResponseWriter, r *http.Request) {
-	s.handleListOpenAICompatibleModels(w, r, config.ProviderGoogle, "Google Gemini")
+	provider := s.config.Providers[string(config.ProviderGoogle)]
+	apiKey := strings.TrimSpace(provider.APIKey)
+	if apiKey == "" {
+		apiKey = s.apiKeyFromEnv(config.ProviderGoogle)
+	}
+
+	baseURL := normalizeOpenAIBaseURL(provider.BaseURL)
+	if baseURL == "" {
+		baseURL = normalizeOpenAIBaseURL(config.GetProviderDefinition(config.ProviderGoogle).DefaultURL)
+	}
+
+	models, err := gemini.ListModels(apiKey, baseURL)
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to list Google models: "+err.Error())
+		return
+	}
+
+	s.jsonResponse(w, http.StatusOK, ListProviderModelsResponse{
+		Models: models,
+	})
 }
 
 func (s *Server) handleListOpenAIModels(w http.ResponseWriter, r *http.Request) {
@@ -1459,6 +1480,61 @@ func (s *Server) handleGetPendingQuestion(w http.ResponseWriter, r *http.Request
 
 	// Always wrap in an object for consistent API
 	s.jsonResponse(w, http.StatusOK, map[string]interface{}{"question": question})
+}
+
+func (s *Server) handleGetTaskProgress(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "sessionID")
+
+	progress, err := s.sessionManager.GetSessionTaskProgress(sessionID)
+	if err != nil {
+		s.errorResponse(w, http.StatusNotFound, "Failed to get task progress: "+err.Error())
+		return
+	}
+
+	// Parse statistics from progress
+	stats := parseTaskProgressStats(progress)
+
+	s.jsonResponse(w, http.StatusOK, map[string]interface{}{
+		"content":         progress,
+		"total_tasks":     stats.Total,
+		"completed_tasks": stats.Completed,
+		"progress_pct":    stats.ProgressPct,
+	})
+}
+
+func parseTaskProgressStats(content string) struct {
+	Total       int
+	Completed   int
+	ProgressPct int
+} {
+	lines := strings.Split(content, "\n")
+	total := 0
+	completed := 0
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[ ]") {
+			total++
+		} else if strings.HasPrefix(trimmed, "[x]") || strings.HasPrefix(trimmed, "[X]") {
+			total++
+			completed++
+		}
+	}
+
+	pct := 0
+	if total > 0 {
+		pct = (completed * 100) / total
+	}
+
+	return struct {
+		Total       int
+		Completed   int
+		ProgressPct int
+	}{
+		Total:       total,
+		Completed:   completed,
+		ProgressPct: pct,
+	}
 }
 
 func (s *Server) handleAnswerQuestion(w http.ResponseWriter, r *http.Request) {
