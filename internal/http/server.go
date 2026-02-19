@@ -30,6 +30,7 @@ import (
 	"github.com/gratheon/aagent/internal/llm/fallback"
 	"github.com/gratheon/aagent/internal/llm/gemini"
 	"github.com/gratheon/aagent/internal/llm/lmstudio"
+	"github.com/gratheon/aagent/internal/llm/retry"
 	"github.com/gratheon/aagent/internal/logging"
 	"github.com/gratheon/aagent/internal/session"
 	skillsLoader "github.com/gratheon/aagent/internal/skills"
@@ -3688,7 +3689,15 @@ func (s *Server) createLLMClient(providerType config.ProviderType, model string)
 	if config.IsFallbackAggregateRef(string(providerType)) || providerType == config.ProviderFallback {
 		return s.createFallbackChainClient(providerType)
 	}
-	return s.createBaseLLMClient(providerType, model)
+	client, err := s.createBaseLLMClient(providerType, model)
+	if err != nil {
+		return nil, err
+	}
+	retries := s.config.LLMRetries
+	if retries <= 0 {
+		retries = retry.DefaultMaxRetries
+	}
+	return retry.Wrap(client, retry.WithMaxRetries(retries)), nil
 }
 
 func (s *Server) createBaseLLMClient(providerType config.ProviderType, model string) (llm.Client, error) {
@@ -3770,7 +3779,11 @@ func (s *Server) createFallbackChainClient(providerRef config.ProviderType) (llm
 			Client: client,
 		})
 	}
-	return fallback.NewClient(nodes), nil
+	retries := s.config.LLMRetries
+	if retries <= 0 {
+		retries = fallback.DefaultMaxRetries
+	}
+	return fallback.NewClient(nodes, fallback.WithMaxRetries(retries)), nil
 }
 
 func normalizeOpenAIBaseURL(raw string) string {

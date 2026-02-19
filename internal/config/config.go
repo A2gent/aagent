@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 )
 
 // Config holds the application configuration
@@ -12,6 +13,7 @@ type Config struct {
 	ActiveProvider     string              `json:"active_provider"` // Provider reference: built-in provider or named fallback aggregate
 	MaxSteps           int                 `json:"max_steps"`
 	Temperature        float64             `json:"temperature"`
+	LLMRetries         int                 `json:"llm_retries"` // Number of retries per LLM provider on transient errors (default 3)
 	DataPath           string              `json:"data_path"`
 	WorkDir            string              `json:"work_dir"`
 	Providers          map[string]Provider `json:"providers"`
@@ -188,6 +190,7 @@ func DefaultConfig() *Config {
 		ActiveProvider: string(ProviderKimi),
 		MaxSteps:       50,
 		Temperature:    0.0,
+		LLMRetries:     3,
 		DataPath:       filepath.Join(homeDir, ".local", "share", "aagent"),
 		WorkDir:        workDir,
 		Providers:      make(map[string]Provider),
@@ -248,6 +251,11 @@ func Load() (*Config, error) {
 	}
 	if dataPath := os.Getenv("AAGENT_DATA_PATH"); dataPath != "" {
 		cfg.DataPath = dataPath
+	}
+	if retriesStr := os.Getenv("AAGENT_LLM_RETRIES"); retriesStr != "" {
+		if retries, err := strconv.Atoi(retriesStr); err == nil && retries >= 0 {
+			cfg.LLMRetries = retries
+		}
 	}
 
 	// Ensure data directory exists

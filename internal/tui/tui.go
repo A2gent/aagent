@@ -26,6 +26,7 @@ import (
 	"github.com/gratheon/aagent/internal/llm/fallback"
 	"github.com/gratheon/aagent/internal/llm/gemini"
 	"github.com/gratheon/aagent/internal/llm/lmstudio"
+	"github.com/gratheon/aagent/internal/llm/retry"
 	"github.com/gratheon/aagent/internal/logging"
 	"github.com/gratheon/aagent/internal/session"
 	"github.com/gratheon/aagent/internal/tools"
@@ -3289,10 +3290,22 @@ func (m Model) createLLMClient(providerType config.ProviderType) llm.Client {
 			if len(nodes) < 2 {
 				return nil, "", fmt.Errorf("%s requires at least two valid fallback model nodes", normalizedRef)
 			}
-			return fallback.NewClient(nodes), "", nil
+			retries := m.appConfig.LLMRetries
+			if retries <= 0 {
+				retries = fallback.DefaultMaxRetries
+			}
+			return fallback.NewClient(nodes, fallback.WithMaxRetries(retries)), "", nil
 		}
 
-		return createDirectClient(targetType, modelOverride)
+		client, model, err := createDirectClient(targetType, modelOverride)
+		if err != nil {
+			return nil, model, err
+		}
+		retries := m.appConfig.LLMRetries
+		if retries <= 0 {
+			retries = retry.DefaultMaxRetries
+		}
+		return retry.Wrap(client, retry.WithMaxRetries(retries)), model, nil
 	}
 
 	providerRef := config.NormalizeProviderRef(string(providerType))
