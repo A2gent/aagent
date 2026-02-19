@@ -756,9 +756,68 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.SetContent(m.renderMessages())
 
 	case tea.KeyMsg:
-		// Handle question prompt first
+		// Handle command menu first (highest priority - works even over question prompt)
+		if m.showCommandMenu {
+			switch msg.Type {
+			case tea.KeyEsc:
+				m.showCommandMenu = false
+				m.textarea.Reset()
+				return m, nil
+			case tea.KeyUp:
+				if m.commandMenuIndex > 0 {
+					m.commandMenuIndex--
+				}
+				return m, nil
+			case tea.KeyDown:
+				if m.commandMenuIndex < len(m.filteredCommands)-1 {
+					m.commandMenuIndex++
+				}
+				return m, nil
+			case tea.KeyEnter, tea.KeyTab:
+				if len(m.filteredCommands) > 0 {
+					selectedCmd := m.filteredCommands[m.commandMenuIndex]
+					m.showCommandMenu = false
+					m.textarea.Reset()
+					return m.executeCommand(selectedCmd.Name)
+				}
+				return m, nil
+			case tea.KeyBackspace:
+				input := m.textarea.Value()
+				if input == "/" || input == "" {
+					m.showCommandMenu = false
+					m.textarea.Reset()
+					return m, nil
+				}
+				// Let textarea handle backspace, then update filter
+				m.textarea, taCmd = m.textarea.Update(msg)
+				newInput := m.textarea.Value()
+				if strings.HasPrefix(newInput, "/") {
+					m.filteredCommands = m.commandRegistry.FilterCommands(newInput[1:])
+					m.commandMenuIndex = 0
+				} else {
+					m.showCommandMenu = false
+				}
+				return m, taCmd
+			default:
+				// Update textarea and filter commands
+				m.textarea, taCmd = m.textarea.Update(msg)
+				input := m.textarea.Value()
+				if strings.HasPrefix(input, "/") {
+					m.filteredCommands = m.commandRegistry.FilterCommands(input[1:])
+					m.commandMenuIndex = 0
+				} else {
+					m.showCommandMenu = false
+				}
+				return m, taCmd
+			}
+		}
+
+		// Handle question prompt
 		if m.showQuestionPrompt && m.pendingQuestion != nil {
 			switch msg.Type {
+			case tea.KeyCtrlC:
+				// Always allow Ctrl+C to exit
+				return m, tea.Quit
 			case tea.KeyEsc:
 				// Don't allow escaping question prompt - user must answer
 				return m, nil
@@ -847,6 +906,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.viewport.GotoBottom()
 				}
 				return m, tea.Batch(cmds...)
+			case tea.KeyRunes:
+				// Allow slash commands even when question is shown
+				if len(msg.Runes) > 0 && msg.Runes[0] == '/' && m.textarea.Value() == "" && m.questionOptionIndex == -1 {
+					m.showCommandMenu = true
+					m.commandMenuIndex = 0
+					m.filteredCommands = m.commandRegistry.GetCommands()
+					return m, nil
+				}
+				// If custom answer is selected, let textarea handle input
+				if m.questionOptionIndex == -1 && m.pendingQuestion.Custom {
+					m.textarea, taCmd = m.textarea.Update(msg)
+					return m, taCmd
+				}
+				// Otherwise ignore other keys
+				return m, nil
 			default:
 				// If custom answer is selected, let textarea handle input
 				if m.questionOptionIndex == -1 && m.pendingQuestion.Custom {
@@ -1025,62 +1099,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, nil
-		}
-
-		// Handle command menu
-		if m.showCommandMenu {
-			switch msg.Type {
-			case tea.KeyEsc:
-				m.showCommandMenu = false
-				m.textarea.Reset()
-				return m, nil
-			case tea.KeyUp:
-				if m.commandMenuIndex > 0 {
-					m.commandMenuIndex--
-				}
-				return m, nil
-			case tea.KeyDown:
-				if m.commandMenuIndex < len(m.filteredCommands)-1 {
-					m.commandMenuIndex++
-				}
-				return m, nil
-			case tea.KeyEnter, tea.KeyTab:
-				if len(m.filteredCommands) > 0 {
-					selectedCmd := m.filteredCommands[m.commandMenuIndex]
-					m.showCommandMenu = false
-					m.textarea.Reset()
-					return m.executeCommand(selectedCmd.Name)
-				}
-				return m, nil
-			case tea.KeyBackspace:
-				input := m.textarea.Value()
-				if input == "/" || input == "" {
-					m.showCommandMenu = false
-					m.textarea.Reset()
-					return m, nil
-				}
-				// Let textarea handle backspace, then update filter
-				m.textarea, taCmd = m.textarea.Update(msg)
-				newInput := m.textarea.Value()
-				if strings.HasPrefix(newInput, "/") {
-					m.filteredCommands = m.commandRegistry.FilterCommands(newInput[1:])
-					m.commandMenuIndex = 0
-				} else {
-					m.showCommandMenu = false
-				}
-				return m, taCmd
-			default:
-				// Update textarea and filter commands
-				m.textarea, taCmd = m.textarea.Update(msg)
-				input := m.textarea.Value()
-				if strings.HasPrefix(input, "/") {
-					m.filteredCommands = m.commandRegistry.FilterCommands(input[1:])
-					m.commandMenuIndex = 0
-				} else {
-					m.showCommandMenu = false
-				}
-				return m, taCmd
-			}
 		}
 
 		switch msg.Type {
