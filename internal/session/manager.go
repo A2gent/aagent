@@ -173,3 +173,61 @@ func (m *Manager) SetSessionStatus(sessionID string, status string) error {
 	sess.SetStatus(Status(status))
 	return m.Save(sess)
 }
+
+// Project represents a project for grouping sessions
+type Project struct {
+	ID        string
+	Name      string
+	Folder    *string
+	IsSystem  bool
+	CreatedAt string
+	UpdatedAt string
+}
+
+// ListProjects returns all projects
+func (m *Manager) ListProjects() ([]*Project, error) {
+	stored, err := m.store.ListProjects()
+	if err != nil {
+		return nil, err
+	}
+
+	projects := make([]*Project, len(stored))
+	for i, sp := range stored {
+		projects[i] = &Project{
+			ID:        sp.ID,
+			Name:      sp.Name,
+			Folder:    sp.Folder,
+			IsSystem:  sp.IsSystem,
+			CreatedAt: sp.CreatedAt.Format("2006-01-02 15:04:05"),
+			UpdatedAt: sp.UpdatedAt.Format("2006-01-02 15:04:05"),
+		}
+	}
+	return projects, nil
+}
+
+// GetProject retrieves a project by ID
+func (m *Manager) GetProject(id string) (*Project, error) {
+	sp, err := m.store.GetProject(id)
+	if err != nil {
+		return nil, err
+	}
+	return &Project{
+		ID:        sp.ID,
+		Name:      sp.Name,
+		Folder:    sp.Folder,
+		IsSystem:  sp.IsSystem,
+		CreatedAt: sp.CreatedAt.Format("2006-01-02 15:04:05"),
+		UpdatedAt: sp.UpdatedAt.Format("2006-01-02 15:04:05"),
+	}, nil
+}
+
+// SetSessionProject associates a session with a project
+func (m *Manager) SetSessionProject(sessionID string, projectID *string) error {
+	sess, err := m.Get(sessionID)
+	if err != nil {
+		return fmt.Errorf("session not found: %w", err)
+	}
+
+	sess.ProjectID = projectID
+	return m.Save(sess)
+}

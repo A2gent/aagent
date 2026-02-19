@@ -547,6 +547,13 @@ type Model struct {
 	modelsMenuIndex int
 	availableModels []string
 
+	// Projects selection state
+	showProjectsMenu    bool
+	projectsMenuIndex   int
+	availableProjects   []*session.Project
+	selectedProjectID   *string
+	selectedProjectName string
+
 	// Config reference for persistence
 	appConfig *config.Config
 
@@ -1133,6 +1140,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// Handle projects menu
+		if m.showProjectsMenu {
+			switch msg.Type {
+			case tea.KeyEsc:
+				m.showProjectsMenu = false
+				m.viewport.SetContent(m.renderMessages())
+				return m, nil
+			case tea.KeyUp:
+				if m.projectsMenuIndex > 0 {
+					m.projectsMenuIndex--
+				}
+				return m, nil
+			case tea.KeyDown:
+				// +1 for "No project" option at index 0
+				if m.projectsMenuIndex < len(m.availableProjects) {
+					m.projectsMenuIndex++
+				}
+				return m, nil
+			case tea.KeyEnter:
+				return m.selectProject()
+			}
+			return m, nil
+		}
+
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			if m.processing {
@@ -1469,6 +1500,16 @@ func (m Model) View() string {
 		)
 	}
 
+	// Check if we should show projects menu overlay
+	if m.showProjectsMenu {
+		projectsView := m.renderProjectsMenu()
+		return lipgloss.JoinVertical(
+			lipgloss.Left,
+			topBar,
+			projectsView,
+		)
+	}
+
 	// Question prompt (rendered above input if active)
 	var questionPrompt string
 	if m.showQuestionPrompt {
@@ -1594,7 +1635,7 @@ func (m Model) renderSeparator() string {
 	return line
 }
 
-// renderTopBar renders the top bar with task summary, token stats, session, and time
+// renderTopBar renders the top bar with task summary, token stats, project/session, and time
 func (m Model) renderTopBar() string {
 	// Use session title if available, otherwise task summary or default
 	summary := m.session.Title
@@ -1608,9 +1649,27 @@ func (m Model) renderTopBar() string {
 	if len(summary) > maxSummaryLen {
 		summary = summary[:maxSummaryLen-3] + "..."
 	}
-	// Session ID (truncated) shown next to session name
-	sessionID := m.session.ID[:8]
-	taskText := taskStyle.Render(summary) + statsStyle.Render(" ["+sessionID+"]")
+
+	// Show project name instead of session ID in the header
+	var contextInfo string
+	if m.selectedProjectName != "" {
+		contextInfo = m.selectedProjectName
+	} else if m.session.ProjectID != nil {
+		// Try to get project name from session's project
+		if project, err := m.sessionManager.GetProject(*m.session.ProjectID); err == nil {
+			contextInfo = project.Name
+			// Cache it for future renders
+			m.selectedProjectID = m.session.ProjectID
+			m.selectedProjectName = project.Name
+		}
+	}
+
+	var taskText string
+	if contextInfo != "" {
+		taskText = statsStyle.Render(contextInfo+" / ") + taskStyle.Render(summary)
+	} else {
+		taskText = taskStyle.Render(summary)
+	}
 
 	// Status indicator
 	var statusIcon string
@@ -2135,6 +2194,8 @@ func (m Model) executeCommand(cmdName string) (tea.Model, tea.Cmd) {
 		return m.createNewSession()
 	case "sessions":
 		return m.showSessions()
+	case "projects":
+		return m.showProjectsSelection()
 	case "provider":
 		return m.showProviderSelection()
 	case "models":
@@ -2865,6 +2926,137 @@ func (m Model) showStaticModels() (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+// showProjectsSelection shows the projects selection menu
+func (m Model) showProjectsSelection() (tea.Model, tea.Cmd) {
+	projects, err := m.sessionManager.ListProjects()
+	if err != nil {
+		m.messages = append(m.messages, message{
+			role:      "error",
+			content:   fmt.Sprintf("Failed to list projects: %v", err),
+			timestamp: time.Now(),
+		})
+		m.viewport.SetContent(m.renderMessages())
+		return m, nil
+	}
+
+	m.availableProjects = projects
+	m.projectsMenuIndex = 0 // 0 = "No project" option
+	m.showProjectsMenu = true
+
+	// Find current project in list (index 0 = no project, real projects start at 1)
+	if m.selectedProjectID != nil {
+		for i, p := range projects {
+			if p.ID == *m.selectedProjectID {
+				m.projectsMenuIndex = i + 1 // +1 because 0 is "No project"
+				break
+			}
+		}
+	}
+
+	return m, nil
+}
+
+// selectProject handles project selection
+func (m Model) selectProject() (tea.Model, tea.Cmd) {
+	if m.projectsMenuIndex == 0 {
+		// "No project" selected
+		m.selectedProjectID = nil
+		m.selectedProjectName = ""
+		m.messages = append(m.messages, message{
+			role:      "system",
+			content:   "Cleared project selection. New sessions will not be associated with any project.",
+			timestamp: time.Now(),
+		})
+	} else {
+		// A project is selected (index - 1 because 0 is "No project")
+		projectIdx := m.projectsMenuIndex - 1
+		if projectIdx < len(m.availableProjects) {
+			project := m.availableProjects[projectIdx]
+			m.selectedProjectID = &project.ID
+			m.selectedProjectName = project.Name
+			m.messages = append(m.messages, message{
+				role:      "system",
+				content:   fmt.Sprintf("Selected project: %s", project.Name),
+				timestamp: time.Now(),
+			})
+
+			// Associate current session with the project if it exists
+			if m.session != nil {
+				m.session.ProjectID = m.selectedProjectID
+				m.sessionManager.Save(m.session)
+			}
+		}
+	}
+
+	m.showProjectsMenu = false
+	m.viewport.SetContent(m.renderMessages())
+	m.viewport.GotoBottom()
+
+	return m, nil
+}
+
+// renderProjectsMenu renders the projects selection menu
+func (m Model) renderProjectsMenu() string {
+	if !m.showProjectsMenu {
+		return ""
+	}
+
+	var items []string
+	items = append(items, lipgloss.NewStyle().Bold(true).Render("Select Project (Enter to confirm, Esc to cancel):"))
+	items = append(items, "")
+
+	// "No project" option
+	noProjectLabel := "  (No project)"
+	if m.projectsMenuIndex == 0 {
+		noProjectLabel = commandSelectedStyle.Render(noProjectLabel)
+	} else {
+		noProjectLabel = commandItemStyle.Render(noProjectLabel)
+	}
+	items = append(items, noProjectLabel)
+
+	// Project options
+	for i, project := range m.availableProjects {
+		label := fmt.Sprintf("  %s", project.Name)
+		if project.Folder != nil && *project.Folder != "" {
+			// Show folder path shortened
+			folder := *project.Folder
+			if len(folder) > 30 {
+				folder = "..." + folder[len(folder)-27:]
+			}
+			label += commandDescStyle.Render(fmt.Sprintf(" (%s)", folder))
+		}
+		if project.IsSystem {
+			label += commandDescStyle.Render(" [system]")
+		}
+
+		// +1 because index 0 is "No project"
+		if m.projectsMenuIndex == i+1 {
+			// Re-render with selection style
+			labelBase := fmt.Sprintf("  %s", project.Name)
+			label = commandSelectedStyle.Render(labelBase)
+			if project.Folder != nil && *project.Folder != "" {
+				folder := *project.Folder
+				if len(folder) > 30 {
+					folder = "..." + folder[len(folder)-27:]
+				}
+				label += commandDescStyle.Render(fmt.Sprintf(" (%s)", folder))
+			}
+			if project.IsSystem {
+				label += commandDescStyle.Render(" [system]")
+			}
+		} else {
+			label = commandItemStyle.Render(label)
+		}
+		items = append(items, label)
+	}
+
+	items = append(items, "")
+	items = append(items, lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Render("  ↑/↓: navigate  enter: select  esc: cancel"))
+
+	content := strings.Join(items, "\n")
+	return commandMenuStyle.Width(m.width - 4).Render(content)
 }
 
 // selectProvider handles provider selection and triggers credential prompts if needed

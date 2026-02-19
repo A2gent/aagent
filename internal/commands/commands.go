@@ -28,6 +28,11 @@ func NewRegistry() *Registry {
 				Aliases:     []string{"s", "list"},
 			},
 			{
+				Name:        "projects",
+				Description: "Select a project for sessions",
+				Aliases:     []string{"proj"},
+			},
+			{
 				Name:        "provider",
 				Description: "Switch LLM provider",
 				Aliases:     []string{"p"},
