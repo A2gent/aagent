@@ -914,8 +914,8 @@ func (s *Server) handleTelegramInboundMessage(
 			logging.Info("Successfully saved session metadata for session %s", sess.ID)
 		}
 	}
-	if err := s.assignTelegramSessionToMyMindProject(sess); err != nil {
-		logging.Warn("Failed to assign My Mind project for Telegram session %s: %v", sess.ID, err)
+	if err := s.assignTelegramSessionToProject(sess, chat.Title); err != nil {
+		logging.Warn("Failed to assign project for Telegram session %s: %v", sess.ID, err)
 	}
 
 	sess.AddUserMessage(userMessage)
@@ -1042,18 +1042,49 @@ func telegramSessionScopeKey(integration *storage.Integration, chatID string, th
 	return fmt.Sprintf("%s:%d", chatID, threadID)
 }
 
-func (s *Server) assignTelegramSessionToMyMindProject(sess *session.Session) error {
-	logging.Info("Attempting to assign My Mind project to session %s", sess.ID)
-	project, err := s.ensureMyMindProject()
+func (s *Server) assignTelegramSessionToProject(sess *session.Session, chatTitle string) error {
+	chatTitle = strings.TrimSpace(chatTitle)
+	logging.Info("Attempting to assign project to session %s (chat title: %q)", sess.ID, chatTitle)
+	
+	// Step 1: Try to find project by chat title
+	if chatTitle != "" {
+		projects, err := s.store.ListProjects()
+		if err != nil {
+			logging.Warn("Failed to list projects for matching: %v", err)
+		} else {
+			for _, project := range projects {
+				if project == nil {
+					continue
+				}
+				if strings.EqualFold(strings.TrimSpace(project.Name), chatTitle) {
+					logging.Info("Found matching project by chat title: id=%s name=%s", project.ID, project.Name)
+					sess.ProjectID = &project.ID
+					err = s.sessionManager.Save(sess)
+					if err != nil {
+						logging.Warn("Failed to save session with project assignment: %v", err)
+						return err
+					}
+					logging.Info("Successfully assigned session %s to project %s (%s)", sess.ID, project.ID, project.Name)
+					return nil
+				}
+			}
+			logging.Info("No project found matching chat title %q", chatTitle)
+		}
+	}
+	
+	// Step 2: Fallback to Knowledge Base project
+	logging.Info("Looking for Knowledge Base project as fallback")
+	project, err := s.ensureKnowledgeBaseProject()
 	if err != nil {
-		logging.Warn("ensureMyMindProject failed: %v", err)
+		logging.Warn("ensureKnowledgeBaseProject failed: %v", err)
 		return err
 	}
 	if project == nil {
-		logging.Info("No My Mind project configured, skipping project assignment")
+		logging.Info("No Knowledge Base project available, skipping project assignment")
 		return nil
 	}
-	logging.Info("Assigning session %s to project %s (%s)", sess.ID, project.ID, project.Name)
+	
+	logging.Info("Assigning session %s to Knowledge Base project %s (%s)", sess.ID, project.ID, project.Name)
 	sess.ProjectID = &project.ID
 	err = s.sessionManager.Save(sess)
 	if err != nil {
@@ -1062,6 +1093,43 @@ func (s *Server) assignTelegramSessionToMyMindProject(sess *session.Session) err
 	}
 	logging.Info("Successfully assigned session %s to project %s", sess.ID, project.ID)
 	return nil
+}
+
+func (s *Server) ensureKnowledgeBaseProject() (*storage.Project, error) {
+	const knowledgeBaseProjectName = "Knowledge Base"
+	
+	projects, err := s.store.ListProjects()
+	if err != nil {
+		logging.Warn("Failed to list projects for Knowledge Base: %v", err)
+		return nil, err
+	}
+	
+	// Look for existing Knowledge Base project
+	for _, project := range projects {
+		if project == nil {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(project.Name), knowledgeBaseProjectName) {
+			logging.Info("Found existing Knowledge Base project: id=%s name=%s", project.ID, project.Name)
+			return project, nil
+		}
+	}
+	
+	// Create Knowledge Base project if not found
+	logging.Info("Knowledge Base project not found, creating new one")
+	now := time.Now()
+	project := &storage.Project{
+		ID:        uuid.New().String(),
+		Name:      knowledgeBaseProjectName,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := s.store.SaveProject(project); err != nil {
+		logging.Warn("Failed to create Knowledge Base project: %v", err)
+		return nil, err
+	}
+	logging.Info("Successfully created Knowledge Base project: id=%s", project.ID)
+	return project, nil
 }
 
 func (s *Server) ensureMyMindProject() (*storage.Project, error) {
