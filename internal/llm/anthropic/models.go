@@ -75,33 +75,38 @@ func fallbackModels() []string {
 		// Claude 4.6 (Latest generation - Feb 2026)
 		"claude-opus-4-6",
 		"claude-sonnet-4-6",
+
+		// Claude 4.5 (Latest generation)
+		"claude-opus-4-5-20251101",
+		"claude-opus-4-5",
+		"claude-sonnet-4-5-20250929",
+		"claude-sonnet-4-5",
 		"claude-haiku-4-5-20251001",
 		"claude-haiku-4-5",
 
-		// Claude 4.5 (Legacy but still available)
-		"claude-sonnet-4-5-20250929",
-		"claude-sonnet-4-5",
-		"claude-opus-4-5-20251101",
-		"claude-opus-4-5",
+		// Claude 4.1 (Advanced reasoning)
 		"claude-opus-4-1-20250805",
 		"claude-opus-4-1",
 
-		// Claude 4.0 (Legacy)
-		"claude-sonnet-4-20250514",
-		"claude-sonnet-4-0",
+		// Claude 4.0 (Solid performance)
 		"claude-opus-4-20250514",
 		"claude-opus-4-0",
+		"claude-sonnet-4-20250514",
+		"claude-sonnet-4-0",
 
-		// Claude 3.7 (Legacy)
+		// Claude 3.7 (Legacy with extended thinking)
 		"claude-3-7-sonnet-20250219",
 		"claude-3-7-sonnet-latest",
 
-		// Claude 3 (Oldest, still available)
-		"claude-3-haiku-20240307",
+		// Claude 3.5 (Legacy)
+		"claude-3-5-sonnet-20241022",
+		"claude-3-5-sonnet-latest",
+		"claude-3-5-haiku-20241022",
+		"claude-3-5-haiku-latest",
 	}
 }
 
 // DefaultModel returns the recommended default model
 func DefaultModel() string {
-	return "claude-sonnet-4-6"
+	return "claude-opus-4-6"
 }

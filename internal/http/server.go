@@ -22,22 +22,22 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 	"github.com/google/uuid"
-	"github.com/gratheon/aagent/internal/agent"
-	"github.com/gratheon/aagent/internal/config"
-	"github.com/gratheon/aagent/internal/jobs"
-	"github.com/gratheon/aagent/internal/llm"
-	"github.com/gratheon/aagent/internal/llm/anthropic"
-	"github.com/gratheon/aagent/internal/llm/fallback"
-	"github.com/gratheon/aagent/internal/llm/gemini"
-	"github.com/gratheon/aagent/internal/llm/lmstudio"
-	"github.com/gratheon/aagent/internal/llm/retry"
-	"github.com/gratheon/aagent/internal/logging"
-	"github.com/gratheon/aagent/internal/session"
-	skillsLoader "github.com/gratheon/aagent/internal/skills"
-	"github.com/gratheon/aagent/internal/speechcache"
-	"github.com/gratheon/aagent/internal/storage"
-	"github.com/gratheon/aagent/internal/tools"
-	"github.com/gratheon/aagent/internal/tools/integrationtools"
+	"github.com/A2gent/brute/internal/agent"
+	"github.com/A2gent/brute/internal/config"
+	"github.com/A2gent/brute/internal/jobs"
+	"github.com/A2gent/brute/internal/llm"
+	"github.com/A2gent/brute/internal/llm/anthropic"
+	"github.com/A2gent/brute/internal/llm/fallback"
+	"github.com/A2gent/brute/internal/llm/gemini"
+	"github.com/A2gent/brute/internal/llm/lmstudio"
+	"github.com/A2gent/brute/internal/llm/retry"
+	"github.com/A2gent/brute/internal/logging"
+	"github.com/A2gent/brute/internal/session"
+	skillsLoader "github.com/A2gent/brute/internal/skills"
+	"github.com/A2gent/brute/internal/speechcache"
+	"github.com/A2gent/brute/internal/storage"
+	"github.com/A2gent/brute/internal/tools"
+	"github.com/A2gent/brute/internal/tools/integrationtools"
 	"github.com/robfig/cron/v3"
 )
 
@@ -119,6 +119,7 @@ func (s *Server) registerServerBackedTools(manager *tools.Manager) {
 	manager.Register(newRecurringJobsTool(s))
 	manager.Register(newMCPManageTool(s))
 	manager.RegisterQuestionTool(s.sessionManager)
+	manager.RegisterSessionTaskProgressTool(s.sessionManager)
 }
 
 const thinkingJobIDSettingKey = "A2GENT_THINKING_JOB_ID"
@@ -275,6 +276,7 @@ func (s *Server) setupRoutes() {
 		r.Get("/{sessionID}/question", s.handleGetPendingQuestion)
 		r.Post("/{sessionID}/answer", s.handleAnswerQuestion)
 		r.Post("/{sessionID}/start", s.handleStartSession)
+		r.Get("/{sessionID}/task-progress", s.handleGetTaskProgress)
 	})
 
 	// Projects endpoints (optional grouping for sessions)
@@ -402,6 +404,7 @@ type SessionResponse struct {
 	OutputTokens         int                          `json:"output_tokens"`
 	CurrentContextTokens int                          `json:"current_context_tokens"`
 	ModelContextWindow   int                          `json:"model_context_window"`
+	TaskProgress         string                       `json:"task_progress,omitempty"`
 	CreatedAt            time.Time                    `json:"created_at"`
 	UpdatedAt            time.Time                    `json:"updated_at"`
 	Messages             []MessageResponse            `json:"messages"`
@@ -518,6 +521,7 @@ type SessionListItem struct {
 	InputTokens        int       `json:"input_tokens"`
 	OutputTokens       int       `json:"output_tokens"`
 	RunDurationSeconds int64     `json:"run_duration_seconds"`
+	TaskProgress       string    `json:"task_progress,omitempty"`
 	CreatedAt          time.Time `json:"created_at"`
 	UpdatedAt          time.Time `json:"updated_at"`
 }
@@ -1124,7 +1128,26 @@ func (s *Server) handleListKimiModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListGoogleModels(w http.ResponseWriter, r *http.Request) {
-	s.handleListOpenAICompatibleModels(w, r, config.ProviderGoogle, "Google Gemini")
+	provider := s.config.Providers[string(config.ProviderGoogle)]
+	apiKey := strings.TrimSpace(provider.APIKey)
+	if apiKey == "" {
+		apiKey = s.apiKeyFromEnv(config.ProviderGoogle)
+	}
+
+	baseURL := normalizeOpenAIBaseURL(provider.BaseURL)
+	if baseURL == "" {
+		baseURL = normalizeOpenAIBaseURL(config.GetProviderDefinition(config.ProviderGoogle).DefaultURL)
+	}
+
+	models, err := gemini.ListModels(apiKey, baseURL)
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to list Google models: "+err.Error())
+		return
+	}
+
+	s.jsonResponse(w, http.StatusOK, ListProviderModelsResponse{
+		Models: models,
+	})
 }
 
 func (s *Server) handleListOpenAIModels(w http.ResponseWriter, r *http.Request) {
@@ -1229,6 +1252,7 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 			InputTokens:        inputTokens,
 			OutputTokens:       outputTokens,
 			RunDurationSeconds: sessionRunDurationSeconds(sess.CreatedAt, sess.UpdatedAt, string(sess.Status)),
+			TaskProgress:       sess.TaskProgress,
 			CreatedAt:          sess.CreatedAt,
 			UpdatedAt:          sess.UpdatedAt,
 		}
@@ -1459,6 +1483,61 @@ func (s *Server) handleGetPendingQuestion(w http.ResponseWriter, r *http.Request
 
 	// Always wrap in an object for consistent API
 	s.jsonResponse(w, http.StatusOK, map[string]interface{}{"question": question})
+}
+
+func (s *Server) handleGetTaskProgress(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "sessionID")
+
+	progress, err := s.sessionManager.GetSessionTaskProgress(sessionID)
+	if err != nil {
+		s.errorResponse(w, http.StatusNotFound, "Failed to get task progress: "+err.Error())
+		return
+	}
+
+	// Parse statistics from progress
+	stats := parseTaskProgressStats(progress)
+
+	s.jsonResponse(w, http.StatusOK, map[string]interface{}{
+		"content":         progress,
+		"total_tasks":     stats.Total,
+		"completed_tasks": stats.Completed,
+		"progress_pct":    stats.ProgressPct,
+	})
+}
+
+func parseTaskProgressStats(content string) struct {
+	Total       int
+	Completed   int
+	ProgressPct int
+} {
+	lines := strings.Split(content, "\n")
+	total := 0
+	completed := 0
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[ ]") {
+			total++
+		} else if strings.HasPrefix(trimmed, "[x]") || strings.HasPrefix(trimmed, "[X]") {
+			total++
+			completed++
+		}
+	}
+
+	pct := 0
+	if total > 0 {
+		pct = (completed * 100) / total
+	}
+
+	return struct {
+		Total       int
+		Completed   int
+		ProgressPct int
+	}{
+		Total:       total,
+		Completed:   completed,
+		ProgressPct: pct,
+	}
 }
 
 func (s *Server) handleAnswerQuestion(w http.ResponseWriter, r *http.Request) {
@@ -2112,6 +2191,7 @@ func (s *Server) handleListJobSessions(w http.ResponseWriter, r *http.Request) {
 			Status:             sess.Status,
 			TotalTokens:        storageSessionTotalTokens(sess),
 			RunDurationSeconds: sessionRunDurationSeconds(sess.CreatedAt, sess.UpdatedAt, sess.Status),
+			TaskProgress:       sess.TaskProgress,
 			CreatedAt:          sess.CreatedAt,
 			UpdatedAt:          sess.UpdatedAt,
 		}
@@ -2415,6 +2495,7 @@ func (s *Server) sessionToResponse(sess *session.Session) SessionResponse {
 		OutputTokens:         outputTokens,
 		CurrentContextTokens: currentContextTokens,
 		ModelContextWindow:   modelContextWindow,
+		TaskProgress:         sess.TaskProgress,
 		CreatedAt:            sess.CreatedAt,
 		UpdatedAt:            sess.UpdatedAt,
 		Messages:             s.messagesToResponse(sess.Messages),

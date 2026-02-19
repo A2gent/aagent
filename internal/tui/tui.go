@@ -17,19 +17,19 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/gratheon/aagent/internal/agent"
-	"github.com/gratheon/aagent/internal/commands"
-	"github.com/gratheon/aagent/internal/config"
-	"github.com/gratheon/aagent/internal/llm"
-	"github.com/gratheon/aagent/internal/llm/anthropic"
-	"github.com/gratheon/aagent/internal/llm/autorouter"
-	"github.com/gratheon/aagent/internal/llm/fallback"
-	"github.com/gratheon/aagent/internal/llm/gemini"
-	"github.com/gratheon/aagent/internal/llm/lmstudio"
-	"github.com/gratheon/aagent/internal/llm/retry"
-	"github.com/gratheon/aagent/internal/logging"
-	"github.com/gratheon/aagent/internal/session"
-	"github.com/gratheon/aagent/internal/tools"
+	"github.com/A2gent/brute/internal/agent"
+	"github.com/A2gent/brute/internal/commands"
+	"github.com/A2gent/brute/internal/config"
+	"github.com/A2gent/brute/internal/llm"
+	"github.com/A2gent/brute/internal/llm/anthropic"
+	"github.com/A2gent/brute/internal/llm/autorouter"
+	"github.com/A2gent/brute/internal/llm/fallback"
+	"github.com/A2gent/brute/internal/llm/gemini"
+	"github.com/A2gent/brute/internal/llm/lmstudio"
+	"github.com/A2gent/brute/internal/llm/retry"
+	"github.com/A2gent/brute/internal/logging"
+	"github.com/A2gent/brute/internal/session"
+	"github.com/A2gent/brute/internal/tools"
 )
 
 // Styles
@@ -2928,11 +2928,42 @@ func (m Model) showStaticModels() (tea.Model, tea.Cmd) {
 	case config.ProviderKimi:
 		m.availableModels = []string{"kimi-k2.5", "kimi-k2", "kimi-for-coding"}
 	case config.ProviderOpenRouter:
-		m.availableModels = []string{"openrouter/auto", "anthropic/claude-sonnet-4", "openai/gpt-4.1-mini"}
+		m.availableModels = []string{
+			"openrouter/auto",
+			"anthropic/claude-opus-4-6",
+			"anthropic/claude-sonnet-4-6",
+			"anthropic/claude-opus-4-5",
+			"anthropic/claude-sonnet-4-5",
+			"openai/gpt-4.1",
+			"openai/gpt-4.1-mini",
+			"google/gemini-3-flash-preview",
+			"google/gemini-2.5-pro",
+			"meta-llama/llama-4-maverick",
+		}
 	case config.ProviderAnthropic:
-		m.availableModels = []string{"claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022"}
+		m.availableModels = []string{
+			"claude-opus-4-6",
+			"claude-sonnet-4-6",
+			"claude-opus-4-5",
+			"claude-opus-4-5-20251101",
+			"claude-sonnet-4-5",
+			"claude-sonnet-4-5-20250929",
+			"claude-haiku-4-5",
+			"claude-opus-4-1",
+			"claude-opus-4-0",
+			"claude-sonnet-4-0",
+		}
 	case config.ProviderGoogle:
-		m.availableModels = []string{"gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-2.0-pro"}
+		m.availableModels = []string{
+			"gemini-3-pro-preview",
+			"gemini-3-flash-preview",
+			"gemini-2.5-pro",
+			"gemini-2.5-flash",
+			"gemini-2.5-flash-image",
+			"gemini-2.5-flash-lite",
+			"gemini-2.0-flash",
+			"gemini-2.0-flash-lite",
+		}
 	case config.ProviderOpenAI:
 		m.availableModels = []string{"gpt-4.1", "gpt-4.1-mini", "gpt-4o-mini"}
 	default:
