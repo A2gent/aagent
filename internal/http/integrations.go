@@ -1300,19 +1300,6 @@ func (s *Server) syncHTTPCreatedSessionToTelegram(ctx context.Context, sessionID
 		}
 	}
 
-	sessionURL := s.telegramSessionURL(selected, sessionID)
-	announce := telegramSessionAnnouncement(sess, initialTask, threadID > 0, sessionURL)
-	sendErr := s.sendTelegramMessage(ctx, botToken, chatID, threadID, announce)
-	if sendErr != nil && threadID > 0 {
-		logging.Warn("Telegram topic send failed for session %s (thread=%d): %s", sessionID, threadID, sanitizeTelegramError(sendErr))
-		sendErr = s.sendTelegramMessage(ctx, botToken, chatID, 0, announce)
-		threadID = 0
-	}
-	if sendErr != nil {
-		logging.Warn("Telegram outbound sync failed for session %s: %s", sessionID, sanitizeTelegramError(sendErr))
-		return
-	}
-
 	if sess.Metadata == nil {
 		sess.Metadata = map[string]interface{}{}
 	}
@@ -1367,16 +1354,18 @@ func (s *Server) inferTelegramChatIDForIntegration(integrationID string) string 
 	return chatID
 }
 
-func telegramTopicNameForSession(sess *session.Session, initialTask string) string {
-	if sess == nil {
-		return "Session"
-	}
 
-	base := strings.TrimSpace(sess.Title)
-	if base == "" {
-		base = strings.TrimSpace(initialTask)
+func telegramTopicNameForSession(sess *session.Session, initialTask string) string {
+	// Prioritize initialTask (first user prompt) for topic name
+	base := strings.TrimSpace(initialTask)
+	
+	// Fallback to session title if no initialTask
+	if base == "" && sess != nil {
+		base = strings.TrimSpace(sess.Title)
 	}
-	if base == "" {
+	
+	// Final fallback to session ID
+	if base == "" && sess != nil {
 		id := strings.TrimSpace(sess.ID)
 		if len(id) >= 8 {
 			base = "Session " + id[:8]
@@ -1385,6 +1374,10 @@ func telegramTopicNameForSession(sess *session.Session, initialTask string) stri
 		} else {
 			base = "Session"
 		}
+	}
+	
+	if base == "" {
+		base = "Session"
 	}
 
 	base = strings.Join(strings.Fields(base), " ")
@@ -1399,42 +1392,6 @@ func telegramTopicNameForSession(sess *session.Session, initialTask string) stri
 		base = "Session"
 	}
 	return base
-}
-
-func telegramSessionAnnouncement(sess *session.Session, initialTask string, inTopic bool, sessionURL string) string {
-	title := ""
-	if sess != nil {
-		title = strings.TrimSpace(sess.Title)
-	}
-	if title == "" {
-		title = strings.TrimSpace(initialTask)
-	}
-	title = strings.Join(strings.Fields(title), " ")
-	if title == "" {
-		title = "New session"
-	}
-	if runes := []rune(title); len(runes) > 180 {
-		title = strings.TrimSpace(string(runes[:180])) + "..."
-	}
-
-	lines := []string{fmt.Sprintf("New Web App session: %s", title)}
-
-	sessionID := ""
-	if sess != nil {
-		sessionID = strings.TrimSpace(sess.ID)
-	}
-	if link := strings.TrimSpace(sessionURL); link != "" {
-		lines = append(lines, "Open: "+link)
-	} else if sessionID != "" {
-		lines = append(lines, "Session ID: "+sessionID)
-	}
-
-	if inTopic {
-		lines = append(lines, "Reply in this topic to continue.")
-	} else {
-		lines = append(lines, "Reply here to continue.")
-	}
-	return strings.Join(lines, "\n")
 }
 
 func (s *Server) telegramSessionURL(integration *storage.Integration, sessionID string) string {
