@@ -1,6 +1,6 @@
 # 🗡️ A²gent/brute terminal agent
 
-[![Go Version](https://img.shields.io/badge/go-1.21+-00ADD8.svg)](https://golang.org)
+[![Go Version](https://img.shields.io/badge/go-1.24+-00ADD8.svg)](https://golang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A Go-based autonomous AI coding agent that executes tasks in sessions with a beautiful TUI interface.
@@ -62,10 +62,9 @@ Works best with [A²gent/caesar](https://github.com/A2gent/caesar) as control ap
 ## Quick Start
 
 ```bash
-# 1. Clone and build
-git clone <repo-url>
-cd aagent
-just build
+# 1. Clone the repository
+git clone https://github.com/A2gent/brute.git
+cd brute
 
 # 2. Set your API key (choose one provider)
 export ANTHROPIC_API_KEY=sk-ant-...
@@ -74,8 +73,10 @@ export KIMI_API_KEY=sk-kimi-...
 # or
 export GEMINI_API_KEY=...
 
-# 3. Launch and start coding!
-a2 "Create a hello world Go program"
+# 3. Build and run!
+just start
+# Or build once, then run the binary directly:
+# just build && ./a2 "Create a hello world Go program"
 ```
 
 ## Session Model (Important)
@@ -93,8 +94,12 @@ Current scope:
 
 ### Prerequisites
 
-- **Go 1.21+** - [Download Go](https://golang.org/dl/)
+- **Go 1.24+** - [Download Go](https://golang.org/dl/)
 - **just** (command runner) - `cargo install just` or [other install methods](https://github.com/casey/just#installation)
+- **Xcode Command Line Tools** (macOS only) - Required for cgo/camera features:
+  ```bash
+  xcode-select --install
+  ```
 - **API Key** - Choose your provider:
   - [Anthropic Claude](https://console.anthropic.com/) (recommended)
   - [Kimi](https://kimi.com)
@@ -106,14 +111,24 @@ Current scope:
 
 ```bash
 # Clone the repository
-git clone <repo-url>
-cd aagent
+git clone https://github.com/A2gent/brute.git
+cd brute
 
-# Build binary
+# Build and run (builds the binary, then executes it)
+just start
+
+# Or build only
 just build
 
-# Install to GOPATH/bin
+# Or install to GOPATH/bin (makes 'a2' available globally)
 just install
+```
+
+### One-liner Install
+
+```bash
+# Clone, build, and run in one command
+git clone https://github.com/A2gent/brute.git && cd brute && just start
 ```
 
 ## Usage
