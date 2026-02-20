@@ -16,16 +16,21 @@ Works best with [A²gent/caesar](https://github.com/A2gent/caesar) as control ap
 ## Features
 
 ### Core Agent Capabilities
-- **Agentic Loop**: Autonomous task execution with tool calling - receive task → call LLM with tools → execute tool calls → return results → repeat until complete
-- **Multi-Provider Support**: Works with Anthropic Claude, Kimi, Google Gemini, LM Studio, and custom OpenAI-compatible endpoints
-- **A²A Basic Protocol**: Supports a2A basic protocol for agent card endpoint
-- **Auto-Router**: Intelligent provider fallback - automatically switches to backup providers on failure
 - **Comprehensive Tool System**: 
   - File operations: read, write, edit, replace_lines
   - Search: glob (file patterns), grep (content search), find_files (with filters)
   - Execution: bash command execution
   - Media: screenshot capture, camera photo capture
   - Extensible architecture for custom tools
+
+### Agentic
+- **Agentic Loop**: Autonomous task execution with tool calling - receive task → call LLM with tools → execute tool calls → return results → repeat until complete
+- **A²A Basic Protocol**: Supports a2A basic protocol for agent card endpoint
+
+### LLM Provider support
+- **Multi-Provider Support**: Works with Anthropic Claude, Kimi, Google Gemini, LM Studio, and custom OpenAI-compatible endpoints
+- **Auto-Router**: Intelligent provider fallback - automatically switches to backup providers on failure
+
 
 ### Session Management
 - **SQLite Persistence**: All sessions, messages, and metadata stored in SQLite database
