@@ -69,6 +69,12 @@ func (w *JSONLWriter) Flush(sess *Session) error {
 	}
 	prevCursor := w.cursor[sess.ID]
 	messages := sess.Messages // slice header copy; underlying array is immutable here
+	if prevCursor > len(messages) {
+		// Cursor is ahead of the session's message list (e.g. the session was
+		// reloaded from storage after a prior flush). Reset so we don't panic.
+		prevCursor = len(messages)
+		w.cursor[sess.ID] = prevCursor
+	}
 	newMessages := messages[prevCursor:]
 	if len(newMessages) == 0 {
 		w.mu.Unlock()
