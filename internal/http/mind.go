@@ -1408,7 +1408,7 @@ func (s *Server) handleProjectGitStatus(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	porcelainOutput, err := runGitCommand(targetRepoRoot, "status", "--porcelain=v1")
+	porcelainOutput, err := runGitCommandPreserveLeading(targetRepoRoot, "status", "--porcelain=v1")
 	if err != nil {
 		s.errorResponse(w, http.StatusBadRequest, "Failed to read git status: "+err.Error())
 		return
@@ -1456,7 +1456,7 @@ func (s *Server) handleProjectGitCommit(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	porcelainOutput, err := runGitCommand(targetRepoRoot, "status", "--porcelain=v1")
+	porcelainOutput, err := runGitCommandPreserveLeading(targetRepoRoot, "status", "--porcelain=v1")
 	if err != nil {
 		s.errorResponse(w, http.StatusBadRequest, "Failed to read git status: "+err.Error())
 		return
@@ -1661,7 +1661,7 @@ func (s *Server) handleProjectGitCommitMessageSuggestion(w http.ResponseWriter, 
 		return
 	}
 
-	porcelainOutput, err := runGitCommand(targetRepoRoot, "status", "--porcelain=v1")
+	porcelainOutput, err := runGitCommandPreserveLeading(targetRepoRoot, "status", "--porcelain=v1")
 	if err != nil {
 		s.errorResponse(w, http.StatusBadRequest, "Failed to read git status: "+err.Error())
 		return
@@ -1863,11 +1863,26 @@ func runGitCommand(projectRoot string, args ...string) (string, error) {
 	return trimmed, nil
 }
 
+func runGitCommandPreserveLeading(projectRoot string, args ...string) (string, error) {
+	commandArgs := append([]string{"-C", projectRoot}, args...)
+	cmd := exec.Command("git", commandArgs...)
+	output, err := cmd.CombinedOutput()
+	text := strings.TrimRight(string(output), "\r\n")
+	if err != nil {
+		trimmed := strings.TrimSpace(text)
+		if trimmed == "" {
+			trimmed = err.Error()
+		}
+		return "", errors.New(trimmed)
+	}
+	return text, nil
+}
+
 func runGitCommandWithExitCode(projectRoot string, args ...string) (string, int, error) {
 	commandArgs := append([]string{"-C", projectRoot}, args...)
 	cmd := exec.Command("git", commandArgs...)
 	output, err := cmd.CombinedOutput()
-	trimmed := strings.TrimSpace(string(output))
+	trimmed := strings.TrimRight(string(output), "\r\n")
 	if err == nil {
 		return trimmed, 0, nil
 	}
@@ -2047,6 +2062,11 @@ func parseGitPorcelain(output string) []ProjectGitChangedFile {
 
 		indexStatus := string(statusCode[0])
 		worktreeStatus := string(statusCode[1])
+		if pathStart == 2 && statusCode[1] == ' ' {
+			// Reconstruct original unstaged-only status from a trimmed " M path" line.
+			indexStatus = " "
+			worktreeStatus = string(statusCode[0])
+		}
 		untracked := statusCode == "??"
 		staged := !untracked && indexStatus != " "
 

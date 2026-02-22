@@ -97,6 +97,7 @@ func (s *connectClientStream) Recv() (*AgentRequest, error) {
 }
 
 const tunnelMethodPath = "/square.tunnel.v1.TunnelService/Connect"
+const inboundTaskTimeout = 2 * time.Minute
 
 type websocketClientStream struct {
 	conn *websocket.Conn
@@ -542,7 +543,9 @@ func (c *TunnelClient) dispatchTask(ctx context.Context, as *activeStream, req *
 		c.logf("Inbound task (request %s)", req.RequestID)
 	}
 
-	payload, err := c.handler.Handle(ctx, req)
+	taskCtx, cancel := context.WithTimeout(ctx, inboundTaskTimeout)
+	defer cancel()
+	payload, err := c.handler.Handle(taskCtx, req)
 
 	resp := &AgentResponse{Kind: KindTaskResponse, RequestID: req.RequestID}
 	if err != nil {
