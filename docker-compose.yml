@@ -1,0 +1,24 @@
+services:
+  brute:
+    image: a2gent-brute:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: a2gent-brute
+    stdin_open: true
+    tty: true
+    read_only: true
+    tmpfs:
+      - /tmp:exec,size=256m
+    ports:
+      - "8080:8080"
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      KIMI_API_KEY: ${KIMI_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      AAGENT_PROVIDER: ${AAGENT_PROVIDER:-}
+      AAGENT_MODEL: ${AAGENT_MODEL:-}
+    volumes:
+      - ./:/workspace
+      - ${HOME}/.a2gent-data:/data

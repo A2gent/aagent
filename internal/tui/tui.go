@@ -13,10 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/A2gent/brute/internal/agent"
 	"github.com/A2gent/brute/internal/commands"
 	"github.com/A2gent/brute/internal/config"
@@ -30,6 +26,10 @@ import (
 	"github.com/A2gent/brute/internal/logging"
 	"github.com/A2gent/brute/internal/session"
 	"github.com/A2gent/brute/internal/tools"
+	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // Styles
@@ -275,9 +275,7 @@ func parseToolCall(tc session.ToolCall, maxWidth int) ToolCallDisplay {
 	case "bash":
 		if cmd, ok := input["command"].(string); ok {
 			// Truncate command if too long
-			if len(cmd) > maxWidth-10 {
-				cmd = cmd[:maxWidth-13] + "..."
-			}
+			cmd = truncateLine(cmd, maxWidth-10)
 			display.Summary = cmd
 		}
 		if workdir, ok := input["workdir"].(string); ok && workdir != "" {
@@ -362,21 +360,30 @@ func parseToolCall(tc session.ToolCall, maxWidth int) ToolCallDisplay {
 
 // shortenPath shortens a path to fit within maxLen
 func shortenPath(path string, maxLen int) string {
-	if len(path) <= maxLen {
+	if maxLen <= 0 {
+		return ""
+	}
+	pathRunes := []rune(path)
+	if len(pathRunes) <= maxLen {
 		return path
+	}
+	if maxLen <= 3 {
+		return string(pathRunes[:maxLen])
 	}
 	// Try to show the filename and as much of the path as possible
 	base := filepath.Base(path)
-	if len(base) >= maxLen-3 {
-		return base[:maxLen-3] + "..."
+	baseRunes := []rune(base)
+	if len(baseRunes) >= maxLen-3 {
+		return string(baseRunes[:maxLen-3]) + "..."
 	}
-	remaining := maxLen - len(base) - 4 // for ".../"
+	remaining := maxLen - len(baseRunes) - 4 // for ".../"
 	if remaining <= 0 {
 		return base
 	}
 	dir := filepath.Dir(path)
-	if len(dir) > remaining {
-		dir = "..." + dir[len(dir)-remaining:]
+	dirRunes := []rune(dir)
+	if len(dirRunes) > remaining {
+		dir = "..." + string(dirRunes[len(dirRunes)-remaining:])
 	}
 	return dir + "/" + base
 }
@@ -413,9 +420,7 @@ func formatDiff(oldStr, newStr string, maxWidth int) string {
 			break
 		}
 		line = strings.TrimRight(line, " \t")
-		if len(line) > maxWidth-6 {
-			line = line[:maxWidth-9] + "..."
-		}
+		line = truncateLine(line, maxWidth-6)
 		sb.WriteString(diffRemoveStyle.Render(fmt.Sprintf("    - %s", line)))
 		sb.WriteString("\n")
 		showCount++
@@ -432,9 +437,7 @@ func formatDiff(oldStr, newStr string, maxWidth int) string {
 			break
 		}
 		line = strings.TrimRight(line, " \t")
-		if len(line) > maxWidth-6 {
-			line = line[:maxWidth-9] + "..."
-		}
+		line = truncateLine(line, maxWidth-6)
 		sb.WriteString(diffAddStyle.Render(fmt.Sprintf("    + %s", line)))
 		sb.WriteString("\n")
 		showCount++
@@ -1649,9 +1652,7 @@ func (m Model) renderTopBar() string {
 		summary = "New Session"
 	}
 	maxSummaryLen := m.width / 3
-	if len(summary) > maxSummaryLen {
-		summary = summary[:maxSummaryLen-3] + "..."
-	}
+	summary = truncateLine(summary, maxSummaryLen)
 
 	// Show project name instead of session ID in the header
 	var contextInfo string
@@ -1691,7 +1692,10 @@ func (m Model) renderTopBar() string {
 
 	// Token stats
 	currentContextTokens := m.currentContextTokenCount()
-	contextPercent := float64(currentContextTokens) / float64(m.contextWindow) * 100
+	contextPercent := 0.0
+	if m.contextWindow > 0 {
+		contextPercent = float64(currentContextTokens) / float64(m.contextWindow) * 100
+	}
 
 	var percentStyle lipgloss.Style
 	switch {
@@ -2009,9 +2013,7 @@ func (m Model) renderMessageWithContext(msg message, prevMsg *message) string {
 						break
 					}
 					line = strings.TrimRight(line, " \t\r")
-					if len(line) > m.width-8 {
-						line = line[:m.width-11] + "..."
-					}
+					line = truncateLine(line, m.width-8)
 					sb.WriteString(toolResultStyle.Render(fmt.Sprintf("    %s", line)) + "\n")
 				}
 			}
@@ -3212,9 +3214,18 @@ func (m Model) createLLMClient(providerType config.ProviderType) llm.Client {
 		if baseURL == "" {
 			baseURL = strings.TrimSpace(providerDef.DefaultURL)
 		}
-		if envURL := strings.TrimSpace(os.Getenv(strings.ToUpper(string(targetType)) + "_BASE_URL")); envURL != "" {
-			baseURL = envURL
-		} else if envURL := strings.TrimSpace(os.Getenv("ANTHROPIC_BASE_URL")); envURL != "" && (targetType == config.ProviderKimi || targetType == config.ProviderAnthropic) {
+		envURLKeys := []string{strings.ToUpper(string(targetType)) + "_BASE_URL"}
+		if targetType == config.ProviderLMStudio {
+			// Accept both legacy and explicit snake_case key for LM Studio.
+			envURLKeys = append([]string{"LM_STUDIO_BASE_URL"}, envURLKeys...)
+		}
+		for _, key := range envURLKeys {
+			if envURL := strings.TrimSpace(os.Getenv(key)); envURL != "" {
+				baseURL = envURL
+				break
+			}
+		}
+		if envURL := strings.TrimSpace(os.Getenv("ANTHROPIC_BASE_URL")); envURL != "" && (targetType == config.ProviderKimi || targetType == config.ProviderAnthropic) {
 			baseURL = envURL
 		}
 

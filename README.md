@@ -79,11 +79,58 @@ export ANTHROPIC_API_KEY=sk-ant-...
 export KIMI_API_KEY=sk-kimi-...
 # or
 export GEMINI_API_KEY=...
+```
 
-# 3. Build and run!
+### Run in Docker (isolated)
+
+Build image:
+
+```bash
+docker build -t a2gent-brute:latest -f Dockerfile .
+```
+
+Run with explicit writable mounts only:
+
+```bash
+docker run --rm -it \
+  --name a2gent-brute \
+  --read-only \
+  --tmpfs /tmp:exec,size=256m \
+  -p 8080:8080 \
+  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  -v "$PWD":/workspace \
+  -v "$HOME/.a2gent-data":/data \
+  a2gent-brute:latest
+```
+
+Or run with Docker Compose:
+
+```bash
+# Start interactive TUI + API server
+docker compose up --build
+
+# Stop and remove container
+docker compose down
+```
+
+Notes:
+- `/workspace` is the only project folder the agent can access.
+- `/data` stores SQLite DB, logs, and config (`AAGENT_DATA_PATH=/data` in the image).
+- You can restrict access further by mounting only specific folders instead of the full project, for example:
+  `-v "$PWD/docs":/workspace/docs:ro -v "$PWD/src":/workspace/src:rw`.
+- For Compose, edit `docker-compose.yml` volumes similarly, for example:
+  `- ./docs:/workspace/docs:ro` and `- ./src:/workspace/src:rw`.
+- To run a one-off task: append it to the command, for example `a2gent-brute:latest "Summarize this repository"`.
+
+### Run natively
+
+```bash
+# Build and run (builds binary, then launches TUI + API server)
 just start
-# Or build once, then run the binary directly:
-# just build && ./a2 "Create a hello world Go program"
+
+# Or build once and run directly
+just build
+./a2
 ```
 
 ## Session Model (Important)

@@ -1,0 +1,7 @@
+.git
+.github
+tmp
+docker
+a2
+aagent
+*.log

@@ -54,6 +54,35 @@ logs:
 logs-follow:
     go run ./cmd/aagent logs -f
 
+# Run Docker compose in API-only mode (default container workflow)
+docker-api:
+    docker compose up --build brute
+
+# Run Docker compose API mode with explicit LM Studio endpoint
+docker-api-lmstudio lmstudio_url:
+    LM_STUDIO_BASE_URL={{lmstudio_url}} docker compose up --build brute
+
+# Stop Docker compose services
+docker-api-down:
+    docker compose down --remove-orphans
+
+# Run interactive TUI inside Docker (attaches your terminal)
+docker-tui:
+    docker compose down --remove-orphans
+    docker compose run --rm --build --service-ports -it brute-tui
+
+# Run TUI service command in non-interactive mode (debug/fallback)
+docker-tui-no-tty:
+    docker compose run --rm --build --service-ports brute-tui server
+
+# Force rebuild Docker image and re-run compose service (use when runtime code changed)
+docker-rerun:
+    docker compose down --remove-orphans
+    docker rm -f a2gent-brute 2>/dev/null || true
+    docker image rm a2gent-brute:latest 2>/dev/null || true
+    docker compose build --no-cache brute
+    docker compose up --force-recreate brute
+
 # Build for all platforms
 build-all:
     GOOS=linux GOARCH=amd64 go build -o {{binary}}-linux-amd64 ./cmd/aagent

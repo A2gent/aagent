@@ -4312,6 +4312,20 @@ func (s *Server) createBaseLLMClient(providerType config.ProviderType, model str
 	if baseURL == "" {
 		baseURL = strings.TrimSpace(def.DefaultURL)
 	}
+	envURLKeys := []string{strings.ToUpper(string(providerType)) + "_BASE_URL"}
+	if providerType == config.ProviderLMStudio {
+		// Accept both legacy and explicit snake_case key for LM Studio.
+		envURLKeys = append([]string{"LM_STUDIO_BASE_URL"}, envURLKeys...)
+	}
+	for _, key := range envURLKeys {
+		if envURL := strings.TrimSpace(os.Getenv(key)); envURL != "" {
+			baseURL = envURL
+			break
+		}
+	}
+	if envURL := strings.TrimSpace(os.Getenv("ANTHROPIC_BASE_URL")); envURL != "" && (providerType == config.ProviderKimi || providerType == config.ProviderAnthropic) {
+		baseURL = envURL
+	}
 	if providerType == config.ProviderOpenAICodex {
 		lower := strings.ToLower(strings.TrimSpace(baseURL))
 		if lower == "" || strings.Contains(lower, "api.openai.com") {

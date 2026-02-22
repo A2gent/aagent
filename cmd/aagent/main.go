@@ -10,7 +10,6 @@ import (
 	"strings"
 	"syscall"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/A2gent/brute/internal/agent"
 	"github.com/A2gent/brute/internal/config"
 	httpserver "github.com/A2gent/brute/internal/http"
@@ -27,6 +26,7 @@ import (
 	"github.com/A2gent/brute/internal/tools"
 	"github.com/A2gent/brute/internal/tools/integrationtools"
 	"github.com/A2gent/brute/internal/tui"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
 )
@@ -132,6 +132,7 @@ func runAgentWithServer(cmd *cobra.Command, args []string) error {
 	} else {
 		logging.Warn("Failed to load persisted settings: %v", err)
 	}
+	applyProviderEnvOverrides(cfg)
 
 	// Initialize LLM client based on config
 	llmClient, err := initLLMClient(cfg)
@@ -287,6 +288,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	} else {
 		logging.Warn("Failed to load persisted settings: %v", err)
 	}
+	applyProviderEnvOverrides(cfg)
 
 	// Initialize LLM client
 	// Use Kimi Code API (Anthropic-compatible) at https://api.kimi.com/coding/v1
@@ -397,16 +399,6 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	logging.Info("Starting aagent HTTP server")
 
-	// Get API key (support both KIMI_API_KEY and ANTHROPIC_API_KEY)
-	apiKey := os.Getenv("KIMI_API_KEY")
-	if apiKey == "" {
-		apiKey = os.Getenv("ANTHROPIC_API_KEY")
-	}
-	if apiKey == "" {
-		logging.Error("KIMI_API_KEY or ANTHROPIC_API_KEY not set")
-		return fmt.Errorf("KIMI_API_KEY or ANTHROPIC_API_KEY environment variable is required")
-	}
-
 	// Initialize storage
 	store, err := storage.NewSQLiteStore(cfg.DataPath)
 	if err != nil {
@@ -418,15 +410,15 @@ func runServer(cmd *cobra.Command, args []string) error {
 	} else {
 		logging.Warn("Failed to load persisted settings: %v", err)
 	}
+	applyProviderEnvOverrides(cfg)
 
-	// Initialize LLM client
-	var llmClient llm.Client
-	baseURL := os.Getenv("ANTHROPIC_BASE_URL")
-	if baseURL == "" {
-		baseURL = "https://api.kimi.com/coding/v1" // Default to Kimi Code API
+	// Initialize LLM client. Do not fail server startup if credentials are not configured yet.
+	llmClient, err := initLLMClient(cfg)
+	if err != nil {
+		logging.Warn("LLM client initialization failed: %v (configure provider/API key via UI or settings)", err)
+		// Placeholder client to keep API server available for post-startup configuration.
+		llmClient = anthropic.NewClientWithBaseURL("", cfg.DefaultModel, "https://api.kimi.com/coding/v1")
 	}
-	logging.Info("Using LLM API: %s model=%s", baseURL, cfg.DefaultModel)
-	llmClient = anthropic.NewClientWithBaseURL(apiKey, cfg.DefaultModel, baseURL)
 
 	// Initialize tool manager
 	toolManager := tools.NewManager(cfg.WorkDir)
@@ -471,9 +463,29 @@ func applySettingsToEnv(settings map[string]string) {
 		if k == "" {
 			continue
 		}
+		// Explicit environment from process/container should have precedence.
+		if existing := strings.TrimSpace(os.Getenv(k)); existing != "" {
+			continue
+		}
 		if err := os.Setenv(k, value); err != nil {
 			logging.Warn("Failed to set env var %q from settings: %v", k, err)
 		}
+	}
+}
+
+func applyProviderEnvOverrides(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	lmStudioURL := strings.TrimSpace(os.Getenv("LM_STUDIO_BASE_URL"))
+	if lmStudioURL == "" {
+		lmStudioURL = strings.TrimSpace(os.Getenv("LMSTUDIO_BASE_URL"))
+	}
+	if lmStudioURL != "" {
+		provider := cfg.Providers[string(config.ProviderLMStudio)]
+		provider.Name = string(config.ProviderLMStudio)
+		provider.BaseURL = lmStudioURL
+		cfg.Providers[string(config.ProviderLMStudio)] = provider
 	}
 }
 
@@ -611,9 +623,18 @@ func initLLMClient(cfg *config.Config) (llm.Client, error) {
 		if baseURL == "" {
 			baseURL = strings.TrimSpace(providerDef.DefaultURL)
 		}
-		if envURL := strings.TrimSpace(os.Getenv(strings.ToUpper(string(providerType)) + "_BASE_URL")); envURL != "" {
-			baseURL = envURL
-		} else if envURL := strings.TrimSpace(os.Getenv("ANTHROPIC_BASE_URL")); envURL != "" && (providerType == config.ProviderKimi || providerType == config.ProviderAnthropic) {
+		envURLKeys := []string{strings.ToUpper(string(providerType)) + "_BASE_URL"}
+		if providerType == config.ProviderLMStudio {
+			// Accept both legacy and explicit snake_case key for LM Studio.
+			envURLKeys = append([]string{"LM_STUDIO_BASE_URL"}, envURLKeys...)
+		}
+		for _, key := range envURLKeys {
+			if envURL := strings.TrimSpace(os.Getenv(key)); envURL != "" {
+				baseURL = envURL
+				break
+			}
+		}
+		if envURL := strings.TrimSpace(os.Getenv("ANTHROPIC_BASE_URL")); envURL != "" && (providerType == config.ProviderKimi || providerType == config.ProviderAnthropic) {
 			baseURL = envURL
 		}
 
