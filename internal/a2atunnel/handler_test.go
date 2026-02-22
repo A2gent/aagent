@@ -8,6 +8,22 @@ import (
 	"github.com/A2gent/brute/internal/storage"
 )
 
+func TestLatestAssistantMessageContent(t *testing.T) {
+	t.Parallel()
+
+	msgs := []session.Message{
+		{Role: "user", Content: "first"},
+		{Role: "assistant", Content: "  "},
+		{Role: "assistant", Content: "answer 1"},
+		{Role: "user", Content: "next"},
+		{Role: "assistant", Content: "answer 2"},
+	}
+	got := latestAssistantMessageContent(msgs)
+	if got != "answer 2" {
+		t.Fatalf("expected latest assistant message, got %q", got)
+	}
+}
+
 func TestResolveSessionByConversationContinuity(t *testing.T) {
 	t.Parallel()
 

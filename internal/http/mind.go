@@ -133,6 +133,14 @@ type ProjectGitCommitMessageResponse struct {
 	Message string `json:"message"`
 }
 
+type ProjectGitPushRequest struct {
+	RepoPath string `json:"repo_path,omitempty"`
+}
+
+type ProjectGitPushResponse struct {
+	Output string `json:"output,omitempty"`
+}
+
 func (s *Server) handleGetMindConfig(w http.ResponseWriter, r *http.Request) {
 	settings, err := s.store.GetSettings()
 	if err != nil {
@@ -1458,18 +1466,24 @@ func (s *Server) handleProjectGitCommit(w http.ResponseWriter, r *http.Request) 
 		s.errorResponse(w, http.StatusConflict, "No changed files")
 		return
 	}
-	stagedCount := 0
-	for _, file := range changedFiles {
-		if file.Staged {
-			stagedCount++
-		}
+
+	stagedOutput, err := runGitCommand(targetRepoRoot, "diff", "--cached", "--name-only")
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Failed to inspect staged files: "+err.Error())
+		return
 	}
-	if stagedCount == 0 {
+	stagedFiles := splitNonEmptyLines(stagedOutput)
+	if len(stagedFiles) == 0 {
 		s.errorResponse(w, http.StatusConflict, "No staged files to commit")
 		return
 	}
 
 	if _, err := runGitCommand(targetRepoRoot, "commit", "-m", message); err != nil {
+		lower := strings.ToLower(err.Error())
+		if strings.Contains(lower, "nothing to commit") || strings.Contains(lower, "no changes added to commit") {
+			s.errorResponse(w, http.StatusConflict, "No staged files to commit")
+			return
+		}
 		s.errorResponse(w, http.StatusBadRequest, "Failed to create commit: "+err.Error())
 		return
 	}
@@ -1483,7 +1497,7 @@ func (s *Server) handleProjectGitCommit(w http.ResponseWriter, r *http.Request) 
 	s.jsonResponse(w, http.StatusOK, ProjectGitCommitResponse{
 		RootFolder:     targetRepoRoot,
 		Commit:         strings.TrimSpace(commit),
-		FilesCommitted: stagedCount,
+		FilesCommitted: len(stagedFiles),
 	})
 }
 
@@ -1733,6 +1747,44 @@ func (s *Server) handleProjectGitCommitMessageSuggestion(w http.ResponseWriter, 
 	s.jsonResponse(w, http.StatusOK, ProjectGitCommitMessageResponse{Message: message})
 }
 
+func (s *Server) handleProjectGitPush(w http.ResponseWriter, r *http.Request) {
+	projectID := strings.TrimSpace(r.URL.Query().Get("projectID"))
+	if projectID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "projectID is required")
+		return
+	}
+
+	resolvedRoot, err := s.resolveProjectRootFolder(projectID)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	var req ProjectGitPushRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	targetRepoRoot, err := resolveProjectGitTargetRoot(resolvedRoot, strings.TrimSpace(req.RepoPath))
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !projectHasGitMetadata(targetRepoRoot) {
+		s.errorResponse(w, http.StatusBadRequest, "Target folder does not contain a .git directory")
+		return
+	}
+
+	output, err := runGitCommand(targetRepoRoot, "push")
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Failed to push: "+err.Error())
+		return
+	}
+
+	s.jsonResponse(w, http.StatusOK, ProjectGitPushResponse{Output: output})
+}
+
 func (s *Server) resolveProjectRootFolder(projectID string) (string, error) {
 	project, err := s.store.GetProject(projectID)
 	if err != nil {
@@ -1950,6 +2002,19 @@ func truncateText(text string, limit int) string {
 		return text[:limit]
 	}
 	return text[:limit-3] + "..."
+}
+
+func splitNonEmptyLines(raw string) []string {
+	lines := strings.Split(raw, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		out = append(out, trimmed)
+	}
+	return out
 }
 
 func parseGitPorcelain(output string) []ProjectGitChangedFile {

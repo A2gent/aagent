@@ -20,9 +20,9 @@ const (
 	MetaA2AConversationID  = "a2a_conversation_id"
 )
 
-// AgentRunnerFactory creates an *agent.Agent for a given tool manager.
-// The closure captures the llm.Client, Config, and session.Manager.
-type AgentRunnerFactory func(toolManager *tools.Manager) *agent.Agent
+// AgentRunnerBuilder creates an *agent.Agent configured for the request.
+// It can resolve provider/model per prompt and session metadata.
+type AgentRunnerBuilder func(ctx context.Context, sess *session.Session, toolManager *tools.Manager, userPrompt string) (*agent.Agent, error)
 
 // ToolManagerFactory creates a tool manager scoped to a session's project.
 type ToolManagerFactory func(sess *session.Session) *tools.Manager
@@ -33,7 +33,7 @@ type ToolManagerFactory func(sess *session.Session) *tools.Manager
 type InboundHandler struct {
 	agentID            string
 	sessionManager     *session.Manager
-	agentFactory       AgentRunnerFactory
+	agentFactory       AgentRunnerBuilder
 	toolManagerFactory ToolManagerFactory
 	// inboundProjectID returns the project ID to assign to inbound sessions.
 	// Called on each request so changes to settings take effect immediately.
@@ -44,7 +44,7 @@ type InboundHandler struct {
 func NewInboundHandler(
 	agentID string,
 	sessionManager *session.Manager,
-	agentFactory AgentRunnerFactory,
+	agentFactory AgentRunnerBuilder,
 	toolManagerFactory ToolManagerFactory,
 	inboundProjectID func() string,
 ) *InboundHandler {
@@ -97,11 +97,19 @@ func (h *InboundHandler) Handle(ctx context.Context, req *AgentRequest) ([]byte,
 
 	// 4. Build an agent scoped to this session and run the loop.
 	toolManager := h.toolManagerFactory(sess)
-	ag := h.agentFactory(toolManager)
+	ag, err := h.agentFactory(ctx, sess, toolManager, p.Task)
+	if err != nil {
+		return nil, fmt.Errorf("failed to configure inbound execution target: %w", err)
+	}
 
 	result, _, runErr := ag.Run(ctx, sess, p.Task)
 	if runErr != nil {
 		return nil, fmt.Errorf("agent run failed: %w", runErr)
+	}
+	if strings.TrimSpace(result) == "" {
+		if fallback := latestAssistantMessageContent(sess.Messages); fallback != "" {
+			result = fallback
+		}
 	}
 
 	// 5. Encode result.
@@ -155,4 +163,17 @@ func (h *InboundHandler) resolveSession(p InboundPayload) (*session.Session, err
 		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
 	return sess, nil
+}
+
+func latestAssistantMessageContent(messages []session.Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != "assistant" {
+			continue
+		}
+		content := strings.TrimSpace(messages[i].Content)
+		if content != "" {
+			return content
+		}
+	}
+	return ""
 }

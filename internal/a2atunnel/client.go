@@ -486,7 +486,7 @@ func (c *TunnelClient) runStream(ctx context.Context) error {
 	as := newActiveStream(&connectClientStream{rawStream})
 	c.setActive(as)
 	c.setState(StateConnected)
-	c.logf("gRPC stream established — agent is live on the A2A network")
+	c.logf("gRPC stream established — awaiting first server message/auth confirmation")
 	return c.runRecvLoop(ctx, as)
 }
 
@@ -508,7 +508,7 @@ func (c *TunnelClient) runWebSocketStream(ctx context.Context) error {
 	as := newActiveStream(&websocketClientStream{conn: conn})
 	c.setActive(as)
 	c.setState(StateConnected)
-	c.logf("WebSocket stream established — agent is live on the A2A network")
+	c.logf("WebSocket stream established — awaiting first server message/auth confirmation")
 	return c.runRecvLoop(ctx, as)
 }
 

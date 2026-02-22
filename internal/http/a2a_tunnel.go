@@ -148,19 +148,49 @@ func (s *Server) getA2AInboundProjectID() string {
 
 // makeA2AAgentFactory returns a factory that constructs an *agent.Agent
 // using the server's active LLM client and current config.
-func (s *Server) makeA2AAgentFactory() a2atunnel.AgentRunnerFactory {
-	return func(toolManager *tools.Manager) *agent.Agent {
-		providerType := config.ProviderType(config.NormalizeProviderRef(s.config.ActiveProvider))
-		model := s.resolveModelForProvider(providerType)
-		// Use the server's shared llmClient — already handles provider routing.
-		cfg := agent.Config{
-			Name:         "brute-a2a",
-			Model:        model,
-			SystemPrompt: s.buildSystemPromptForA2A(),
-			MaxSteps:     s.config.MaxSteps,
-			Temperature:  s.config.Temperature,
+func (s *Server) makeA2AAgentFactory() a2atunnel.AgentRunnerBuilder {
+	return func(ctx context.Context, sess *session.Session, toolManager *tools.Manager, userPrompt string) (*agent.Agent, error) {
+		if sess != nil {
+			if sess.Metadata == nil {
+				sess.Metadata = map[string]interface{}{}
+			}
+			if _, hasProvider := sess.Metadata["provider"]; !hasProvider {
+				providerRef := config.NormalizeProviderRef(s.config.ActiveProvider)
+				autoCfg := s.config.Providers[string(config.ProviderAutoRouter)]
+				if s.autoRouterConfigured(autoCfg) {
+					providerRef = string(config.ProviderAutoRouter)
+				}
+				sess.Metadata["provider"] = providerRef
+				if providerRef != string(config.ProviderAutoRouter) {
+					sess.Metadata["model"] = s.resolveModelForProvider(config.ProviderType(providerRef))
+				}
+				if err := s.sessionManager.Save(sess); err != nil {
+					logging.Warn("Failed to persist inbound A2A provider metadata: %v", err)
+				}
+			}
 		}
-		return agent.New(cfg, s.llmClient, toolManager, s.sessionManager)
+
+		providerType := s.resolveSessionProviderType(sess)
+		model := s.resolveSessionModel(sess, providerType)
+		target, err := s.resolveExecutionTarget(ctx, providerType, model, userPrompt, sess)
+		if err != nil {
+			return nil, err
+		}
+		if setSessionRoutedProviderAndModel(sess, providerType, target.ProviderType, target.Model) {
+			if err := s.sessionManager.Save(sess); err != nil {
+				logging.Warn("Failed to persist inbound A2A routed target metadata: %v", err)
+			}
+		}
+
+		cfg := agent.Config{
+			Name:          "brute-a2a",
+			Model:         target.Model,
+			SystemPrompt:  s.buildSystemPromptForA2A(),
+			MaxSteps:      s.config.MaxSteps,
+			Temperature:   s.config.Temperature,
+			ContextWindow: target.ContextWindow,
+		}
+		return agent.New(cfg, target.Client, toolManager, s.sessionManager), nil
 	}
 }
 
