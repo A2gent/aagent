@@ -91,6 +91,7 @@ func (h *InboundHandler) Handle(ctx context.Context, req *AgentRequest) ([]byte,
 	}
 	sess.AddUserMessage(p.Task)
 	sess.SetStatus(session.StatusRunning)
+	beforeRunCount := len(sess.Messages)
 	if err := h.sessionManager.Save(sess); err != nil {
 		return nil, fmt.Errorf("failed to save session: %w", err)
 	}
@@ -106,9 +107,17 @@ func (h *InboundHandler) Handle(ctx context.Context, req *AgentRequest) ([]byte,
 	if runErr != nil {
 		return nil, fmt.Errorf("agent run failed: %w", runErr)
 	}
+	if sess.Status == session.StatusInputRequired {
+		if question, qErr := h.sessionManager.GetPendingQuestion(sess.ID); qErr == nil && question != nil && strings.TrimSpace(question.Question) != "" {
+			return nil, fmt.Errorf("agent requires user input: %s", strings.TrimSpace(question.Question))
+		}
+		return nil, fmt.Errorf("agent requires user input")
+	}
 	if strings.TrimSpace(result) == "" {
-		if fallback := latestAssistantMessageContent(sess.Messages); fallback != "" {
+		if fallback := latestAssistantMessageContentSince(sess.Messages, beforeRunCount); fallback != "" {
 			result = fallback
+		} else {
+			return nil, fmt.Errorf("agent run produced no assistant response")
 		}
 	}
 
@@ -154,6 +163,10 @@ func (h *InboundHandler) resolveSession(p InboundPayload) (*session.Session, err
 			}
 		}
 		if candidate != nil {
+			full, getErr := h.sessionManager.Get(candidate.ID)
+			if getErr == nil && full != nil {
+				return full, nil
+			}
 			return candidate, nil
 		}
 	}
@@ -165,8 +178,14 @@ func (h *InboundHandler) resolveSession(p InboundPayload) (*session.Session, err
 	return sess, nil
 }
 
-func latestAssistantMessageContent(messages []session.Message) string {
-	for i := len(messages) - 1; i >= 0; i-- {
+func latestAssistantMessageContentSince(messages []session.Message, start int) string {
+	if start < 0 {
+		start = 0
+	}
+	if start > len(messages) {
+		start = len(messages)
+	}
+	for i := len(messages) - 1; i >= start; i-- {
 		if messages[i].Role != "assistant" {
 			continue
 		}

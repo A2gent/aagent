@@ -238,13 +238,17 @@ func (a *Agent) loop(ctx context.Context, sess *session.Session, onEvent func(Ev
 		// Check if we have tool calls
 		if len(response.ToolCalls) == 0 {
 			// No tool calls - agent is done
-			sess.AddAssistantMessage(response.Content, nil)
+			finalContent := strings.TrimSpace(response.Content)
+			if finalContent == "" {
+				finalContent = a.fallbackAssistantContentFromRecentTools(sess)
+			}
+			sess.AddAssistantMessage(finalContent, nil)
 			sess.SetStatus(session.StatusCompleted)
 			a.sessionManager.Save(sess)
 			if onEvent != nil {
 				onEvent(Event{Type: EventStepCompleted, Step: step})
 			}
-			return response.Content, totalUsage, nil
+			return finalContent, totalUsage, nil
 		}
 
 		// Convert tool calls for session storage
@@ -307,6 +311,11 @@ func (a *Agent) loop(ctx context.Context, sess *session.Session, onEvent func(Ev
 
 			if freshSess.Status == session.StatusInputRequired {
 				logging.Info("Session %s requires user input (detected after tool execution), pausing", sess.ID)
+				// Keep caller-visible session state in sync with DB state set by tools.
+				sess.Status = freshSess.Status
+				sess.Metadata = freshSess.Metadata
+				sess.TaskProgress = freshSess.TaskProgress
+				sess.UpdatedAt = freshSess.UpdatedAt
 				// Don't save the local sess changes - use the fresh one with input_required status
 				if onEvent != nil {
 					onEvent(Event{Type: EventToolCompleted, Step: step})
@@ -327,6 +336,31 @@ func (a *Agent) loop(ctx context.Context, sess *session.Session, onEvent func(Ev
 			onEvent(Event{Type: EventStepCompleted, Step: step})
 		}
 	}
+}
+
+func (a *Agent) fallbackAssistantContentFromRecentTools(sess *session.Session) string {
+	if sess == nil {
+		return "I finished tool execution but produced no final text response."
+	}
+	for i := len(sess.Messages) - 1; i >= 0; i-- {
+		msg := sess.Messages[i]
+		if msg.Role != "tool" || len(msg.ToolResults) == 0 {
+			continue
+		}
+		for _, tr := range msg.ToolResults {
+			content := strings.TrimSpace(tr.Content)
+			if content == "" || tr.IsError {
+				continue
+			}
+			const maxLen = 1200
+			runes := []rune(content)
+			if len(runes) > maxLen {
+				content = string(runes[:maxLen]) + "..."
+			}
+			return content
+		}
+	}
+	return "I finished tool execution but produced no final text response."
 }
 
 func (a *Agent) callLLM(ctx context.Context, request *llm.ChatRequest, step int, onEvent func(Event)) (*llm.ChatResponse, error) {
