@@ -108,8 +108,8 @@ func TestTelegramPromptFromInboundMessage_TextAndCaptionWithoutMedia(t *testing.
 	if err != nil {
 		t.Fatalf("unexpected error for text message: %v", err)
 	}
-	if textPrompt != "hello from text" {
-		t.Fatalf("expected text prompt, got %q", textPrompt)
+	if textPrompt == nil || textPrompt.text != "hello from text" {
+		t.Fatalf("expected text prompt, got %#v", textPrompt)
 	}
 
 	captionPrompt, err := s.telegramPromptFromInboundMessage(
@@ -121,7 +121,7 @@ func TestTelegramPromptFromInboundMessage_TextAndCaptionWithoutMedia(t *testing.
 	if err != nil {
 		t.Fatalf("unexpected error for caption-only message: %v", err)
 	}
-	if captionPrompt != "caption only" {
-		t.Fatalf("expected caption prompt, got %q", captionPrompt)
+	if captionPrompt == nil || captionPrompt.text != "caption only" {
+		t.Fatalf("expected caption prompt, got %#v", captionPrompt)
 	}
 }

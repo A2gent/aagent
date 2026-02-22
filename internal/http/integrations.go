@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,7 +23,7 @@ import (
 	"github.com/A2gent/brute/internal/logging"
 	"github.com/A2gent/brute/internal/session"
 	"github.com/A2gent/brute/internal/storage"
-	"github.com/A2gent/brute/internal/stt/whispercpp"
+	"github.com/A2gent/brute/internal/tools/integrationtools"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 )
@@ -110,6 +111,7 @@ const telegramSyncedMessageCountMetadataKey = "telegram_synced_message_count"
 const myMindProjectName = "My Mind"
 const telegramMaxMessageRunes = 3900
 const telegramMaxInboundAudioBytes = 25 * 1024 * 1024
+const telegramMaxCaptionRunes = 1024
 
 var telegramBotTokenPattern = regexp.MustCompile(`bot[0-9]{5,}:[A-Za-z0-9_-]{20,}`)
 
@@ -682,7 +684,7 @@ func (s *Server) processTelegramDuplexIntegrations(ctx context.Context) {
 				continue
 			}
 
-			userPrompt, err := s.telegramPromptFromInboundMessage(ctx, botToken, integration, message)
+			inboundPrompt, err := s.telegramPromptFromInboundMessage(ctx, botToken, integration, message)
 			if err != nil {
 				logging.Warn("Telegram inbound media processing failed for integration %s: %s", integration.ID, sanitizeTelegramError(err))
 				failureReply := telegramInboundFailureReply(err)
@@ -691,7 +693,7 @@ func (s *Server) processTelegramDuplexIntegrations(ctx context.Context) {
 				}
 				continue
 			}
-			if strings.TrimSpace(userPrompt) == "" {
+			if strings.TrimSpace(inboundPrompt.text) == "" {
 				logging.Debug(
 					"Telegram update skipped for integration %s: no text/caption/audio prompt (chat=%d type=%s thread=%d update=%d)",
 					integration.ID,
@@ -710,7 +712,7 @@ func (s *Server) processTelegramDuplexIntegrations(ctx context.Context) {
 				message.Chat.Type,
 				message.MessageThreadID,
 				update.UpdateID,
-				len([]rune(userPrompt)),
+				len([]rune(inboundPrompt.text)),
 			)
 
 			result, err := s.handleTelegramInboundMessage(
@@ -718,7 +720,8 @@ func (s *Server) processTelegramDuplexIntegrations(ctx context.Context) {
 				integration,
 				message.Chat,
 				message.MessageThreadID,
-				userPrompt,
+				inboundPrompt.text,
+				inboundPrompt.metadata,
 			)
 			if err != nil {
 				logging.Warn("Telegram duplex handling failed for integration %s: %s", integration.ID, sanitizeTelegramError(err))
@@ -748,7 +751,7 @@ func (s *Server) processTelegramDuplexIntegrations(ctx context.Context) {
 
 				// Send actual reply to the new topic
 				logging.Info("Sending agent reply to new topic %d", result.createdThread)
-				if err := s.sendTelegramMessage(ctx, botToken, messageChatID, result.createdThread, reply); err != nil {
+				if err := s.sendTelegramConfiguredReply(ctx, integration, botToken, messageChatID, result.createdThread, reply, result.sessionID); err != nil {
 					logging.Warn("Telegram reply send to new topic failed for integration %s: %s", integration.ID, sanitizeTelegramError(err))
 					continue
 				}
@@ -761,7 +764,7 @@ func (s *Server) processTelegramDuplexIntegrations(ctx context.Context) {
 				)
 			} else {
 				// Normal reply to same thread
-				if err := s.sendTelegramMessage(ctx, botToken, messageChatID, message.MessageThreadID, reply); err != nil {
+				if err := s.sendTelegramConfiguredReply(ctx, integration, botToken, messageChatID, message.MessageThreadID, reply, result.sessionID); err != nil {
 					logging.Warn("Telegram reply send failed for integration %s: %s", integration.ID, sanitizeTelegramError(err))
 					continue
 				}
@@ -782,19 +785,31 @@ func (s *Server) telegramPromptFromInboundMessage(
 	botToken string,
 	integration *storage.Integration,
 	message *telegramMessagePayload,
-) (string, error) {
+) (*telegramInboundPrompt, error) {
 	if message == nil {
-		return "", nil
+		return &telegramInboundPrompt{}, nil
 	}
 	text := strings.TrimSpace(message.Text)
 	if text != "" {
-		return text, nil
+		return &telegramInboundPrompt{
+			text: text,
+			metadata: map[string]interface{}{
+				"inbound_channel":      "telegram",
+				"inbound_message_type": "text",
+			},
+		}, nil
 	}
 
 	caption := strings.TrimSpace(message.Caption)
 	fileID, mediaKind := telegramAudioFileIDForMessage(message)
 	if fileID == "" {
-		return caption, nil
+		return &telegramInboundPrompt{
+			text: caption,
+			metadata: map[string]interface{}{
+				"inbound_channel":      "telegram",
+				"inbound_message_type": "caption",
+			},
+		}, nil
 	}
 	logging.Info("Telegram inbound %s detected: chat=%d thread=%d has_caption=%v", mediaKind, message.Chat.ID, message.MessageThreadID, caption != "")
 	if !telegramVoiceTranscriptionEnabled(integration) {
@@ -803,18 +818,24 @@ func (s *Server) telegramPromptFromInboundMessage(
 			integrationID = integration.ID
 		}
 		logging.Info("Telegram inbound %s transcription disabled for integration %s", mediaKind, integrationID)
-		return caption, nil
+		return &telegramInboundPrompt{
+			text: caption,
+			metadata: map[string]interface{}{
+				"inbound_channel":      "telegram",
+				"inbound_message_type": mediaKind,
+			},
+		}, nil
 	}
 
 	audioPath, cleanup, err := s.downloadTelegramFile(ctx, botToken, fileID)
 	if err != nil {
-		return "", fmt.Errorf("failed to download %s message: %w", mediaKind, err)
+		return nil, fmt.Errorf("failed to download %s message: %w", mediaKind, err)
 	}
 	defer cleanup()
 
 	normalizedPath, normalizedCleanup, err := convertAudioToWAVForWhisper(ctx, audioPath)
 	if err != nil {
-		return "", fmt.Errorf("failed to normalize %s message audio: %w", mediaKind, err)
+		return nil, fmt.Errorf("failed to normalize %s message audio: %w", mediaKind, err)
 	}
 	if normalizedCleanup != nil {
 		defer normalizedCleanup()
@@ -823,24 +844,36 @@ func (s *Server) telegramPromptFromInboundMessage(
 		logging.Info("Telegram inbound %s converted to WAV for whisper: source=%s target=%s", mediaKind, audioPath, normalizedPath)
 	}
 
-	transcript, err := whispercpp.TranscribeWithOptions(
+	transcript, err := s.transcribeTelegramAudioWithWhisperTool(
 		ctx,
 		normalizedPath,
 		telegramTranscriptionLanguage(integration),
 		telegramTranscriptionTranslateFlag(integration),
 	)
 	if err != nil {
-		return "", fmt.Errorf("failed to transcribe %s message: %w", mediaKind, err)
+		return nil, fmt.Errorf("failed to transcribe %s message: %w", mediaKind, err)
 	}
 	transcript = strings.TrimSpace(transcript)
 	logging.Info("Telegram inbound %s transcription completed: chat=%d thread=%d transcript_len=%d", mediaKind, message.Chat.ID, message.MessageThreadID, len([]rune(transcript)))
+	metadata, metadataErr := s.telegramInboundAudioMetadataForMessage(normalizedPath, mediaKind)
+	if metadataErr != nil {
+		logging.Warn("Telegram inbound %s audio clip cache failed: %v", mediaKind, metadataErr)
+	}
+	if metadata == nil {
+		metadata = map[string]interface{}{}
+	}
+	metadata["inbound_channel"] = "telegram"
+	metadata["inbound_message_type"] = mediaKind
 	if transcript == "" {
-		return caption, nil
+		return &telegramInboundPrompt{text: caption, metadata: metadata}, nil
 	}
 	if caption == "" {
-		return transcript, nil
+		return &telegramInboundPrompt{text: transcript, metadata: metadata}, nil
 	}
-	return caption + "\n\nVoice transcript:\n" + transcript, nil
+	return &telegramInboundPrompt{
+		text:     caption + "\n\nVoice transcript:\n" + transcript,
+		metadata: metadata,
+	}, nil
 }
 
 func telegramAudioFileIDForMessage(message *telegramMessagePayload) (string, string) {
@@ -894,6 +927,311 @@ func telegramTranscriptionTranslateFlag(integration *storage.Integration) *bool 
 		return nil
 	}
 	return parseOptionalBool(integration.Config["transcribe_translate_to_english"])
+}
+
+func (s *Server) transcribeTelegramAudioWithWhisperTool(
+	ctx context.Context,
+	audioPath string,
+	language string,
+	translateToEnglish *bool,
+) (string, error) {
+	tool := integrationtools.NewWhisperSTTTool(strings.TrimSpace(s.config.WorkDir))
+	payload := map[string]interface{}{
+		"audio_path": audioPath,
+	}
+	if lang := strings.TrimSpace(language); lang != "" {
+		payload["language"] = lang
+	}
+	if translateToEnglish != nil {
+		payload["translate_to_english"] = *translateToEnglish
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode whisper_stt payload: %w", err)
+	}
+
+	logging.Info("Telegram inbound transcription via whisper_stt tool")
+	res, err := tool.Execute(ctx, raw)
+	if err != nil {
+		return "", fmt.Errorf("whisper_stt execution failed: %w", err)
+	}
+	if res == nil {
+		return "", fmt.Errorf("whisper_stt returned empty result")
+	}
+	if !res.Success {
+		return "", fmt.Errorf("whisper_stt failed: %s", strings.TrimSpace(res.Error))
+	}
+	if transcript, ok := res.Metadata["transcript"].(string); ok && strings.TrimSpace(transcript) != "" {
+		return strings.TrimSpace(transcript), nil
+	}
+	out := strings.TrimSpace(res.Output)
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Text:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "Text:")), nil
+		}
+	}
+	return "", fmt.Errorf("whisper_stt returned no transcript")
+}
+
+func (s *Server) telegramInboundAudioMetadataForMessage(audioPath string, mediaKind string) (map[string]interface{}, error) {
+	if s.speechClips == nil {
+		return nil, fmt.Errorf("speech clip cache is unavailable")
+	}
+	audio, err := os.ReadFile(audioPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed reading inbound audio: %w", err)
+	}
+	if len(audio) == 0 {
+		return nil, fmt.Errorf("inbound audio payload is empty")
+	}
+	contentType := strings.TrimSpace(http.DetectContentType(audio))
+	if contentType == "" || !strings.HasPrefix(contentType, "audio/") {
+		contentType = "audio/wav"
+	}
+	clipID := s.speechClips.Save(contentType, audio)
+	if clipID == "" {
+		return nil, fmt.Errorf("failed to cache inbound audio clip")
+	}
+	return map[string]interface{}{
+		"inbound_audio_clip": map[string]interface{}{
+			"clip_id":      clipID,
+			"content_type": contentType,
+			"source":       "telegram",
+			"kind":         strings.TrimSpace(mediaKind),
+		},
+	}, nil
+}
+
+func telegramAgentPromptContext(userMessage string, metadata map[string]interface{}) string {
+	userMessage = strings.TrimSpace(userMessage)
+	if userMessage == "" {
+		return ""
+	}
+	msgType := "text"
+	if metadata != nil {
+		if raw, ok := metadata["inbound_message_type"].(string); ok && strings.TrimSpace(raw) != "" {
+			msgType = strings.TrimSpace(raw)
+		}
+	}
+	return fmt.Sprintf("[Inbound channel: Telegram | message type: %s]\n%s", msgType, userMessage)
+}
+
+func telegramReplyMode(integration *storage.Integration) string {
+	if integration == nil {
+		return "text"
+	}
+	raw := strings.ToLower(strings.TrimSpace(integration.Config["reply_mode"]))
+	switch raw {
+	case "text", "voice", "both":
+		return raw
+	default:
+		return "text"
+	}
+}
+
+func (s *Server) sendTelegramConfiguredReply(
+	ctx context.Context,
+	integration *storage.Integration,
+	botToken string,
+	chatID string,
+	threadID int64,
+	reply string,
+	sessionID string,
+) error {
+	reply = strings.TrimSpace(reply)
+	if reply == "" {
+		return nil
+	}
+	mode := telegramReplyMode(integration)
+
+	sendText := mode == "text" || mode == "both"
+	sendVoice := mode == "voice" || mode == "both"
+
+	if sendText {
+		parts := splitTelegramText(reply, telegramMaxMessageRunes)
+		for _, part := range parts {
+			if err := s.sendTelegramMessage(ctx, botToken, chatID, threadID, part); err != nil {
+				return err
+			}
+		}
+	}
+
+	if sendVoice {
+		audio, err := s.synthesizeTelegramReplyAudio(ctx, reply)
+		if err != nil {
+			logging.Warn("Telegram voice reply synthesis failed (mode=%s): %v", mode, err)
+			if !sendText {
+				parts := splitTelegramText(reply, telegramMaxMessageRunes)
+				for _, part := range parts {
+					if sendErr := s.sendTelegramMessage(ctx, botToken, chatID, threadID, part); sendErr != nil {
+						return sendErr
+					}
+				}
+			}
+			return nil
+		}
+		if err := s.sendTelegramAudio(ctx, botToken, chatID, threadID, audio.data, "reply.wav", ""); err != nil {
+			logging.Warn("Telegram voice reply sendAudio failed: %v", err)
+			if !sendText {
+				parts := splitTelegramText(reply, telegramMaxMessageRunes)
+				for _, part := range parts {
+					if sendErr := s.sendTelegramMessage(ctx, botToken, chatID, threadID, part); sendErr != nil {
+						return sendErr
+					}
+				}
+			}
+			return nil
+		}
+		if sessionID != "" {
+			s.attachTelegramReplyAudioMetadata(sessionID, audio.clipID, audio.contentType)
+		}
+	}
+
+	return nil
+}
+
+func (s *Server) synthesizeTelegramReplyAudio(ctx context.Context, reply string) (*telegramReplyAudio, error) {
+	tool := integrationtools.NewPiperTTSTool(strings.TrimSpace(s.config.WorkDir), s.speechClips)
+	params := map[string]interface{}{
+		"text":            reply,
+		"output_mode":     "stream",
+		"auto_play_audio": false,
+	}
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode piper_tts payload: %w", err)
+	}
+	res, err := tool.Execute(ctx, raw)
+	if err != nil {
+		return nil, fmt.Errorf("piper_tts execution failed: %w", err)
+	}
+	if res == nil || !res.Success {
+		msg := "piper_tts returned unsuccessful result"
+		if res != nil && strings.TrimSpace(res.Error) != "" {
+			msg = res.Error
+		}
+		return nil, fmt.Errorf("%s", msg)
+	}
+	audioMeta, ok := res.Metadata["audio_clip"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("piper_tts did not return audio_clip metadata")
+	}
+	clipID, _ := audioMeta["clip_id"].(string)
+	clipID = strings.TrimSpace(clipID)
+	if clipID == "" {
+		return nil, fmt.Errorf("piper_tts returned empty audio clip id")
+	}
+	if s.speechClips == nil {
+		return nil, fmt.Errorf("speech clip cache is unavailable")
+	}
+	contentType, data, found := s.speechClips.Load(clipID)
+	if !found {
+		return nil, fmt.Errorf("generated audio clip %s not found in cache", clipID)
+	}
+	return &telegramReplyAudio{
+		clipID:      clipID,
+		contentType: contentType,
+		data:        data,
+	}, nil
+}
+
+func (s *Server) sendTelegramAudio(
+	ctx context.Context,
+	botToken string,
+	chatID string,
+	threadID int64,
+	audio []byte,
+	filename string,
+	caption string,
+) error {
+	if len(audio) == 0 {
+		return fmt.Errorf("audio payload is empty")
+	}
+	if strings.TrimSpace(filename) == "" {
+		filename = "reply.wav"
+	}
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	_ = writer.WriteField("chat_id", chatID)
+	if threadID > 0 {
+		_ = writer.WriteField("message_thread_id", strconv.FormatInt(threadID, 10))
+	}
+	caption = strings.TrimSpace(caption)
+	if caption != "" {
+		_ = writer.WriteField("caption", truncateRunes(caption, telegramMaxCaptionRunes))
+	}
+	part, err := writer.CreateFormFile("audio", filename)
+	if err != nil {
+		return fmt.Errorf("failed to create telegram audio multipart field: %w", err)
+	}
+	if _, err := part.Write(audio); err != nil {
+		return fmt.Errorf("failed to write telegram audio payload: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("failed to finalize telegram audio multipart payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		fmt.Sprintf("https://api.telegram.org/bot%s/sendAudio", botToken),
+		&body,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to build sendAudio request: %w", err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("sendAudio request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("failed to decode sendAudio response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK || !result.OK {
+		msg := strings.TrimSpace(result.Description)
+		if msg == "" {
+			msg = resp.Status
+		}
+		return fmt.Errorf("telegram sendAudio failed: %s", msg)
+	}
+	return nil
+}
+
+func (s *Server) attachTelegramReplyAudioMetadata(sessionID, clipID, contentType string) {
+	sessionID = strings.TrimSpace(sessionID)
+	clipID = strings.TrimSpace(clipID)
+	if sessionID == "" || clipID == "" {
+		return
+	}
+	sess, err := s.sessionManager.Get(sessionID)
+	if err != nil || sess == nil || len(sess.Messages) == 0 {
+		return
+	}
+	for i := len(sess.Messages) - 1; i >= 0; i-- {
+		if sess.Messages[i].Role != "assistant" {
+			continue
+		}
+		if sess.Messages[i].Metadata == nil {
+			sess.Messages[i].Metadata = map[string]interface{}{}
+		}
+		sess.Messages[i].Metadata["audio_clip"] = map[string]interface{}{
+			"clip_id":      clipID,
+			"content_type": strings.TrimSpace(contentType),
+			"source":       "telegram_reply",
+		}
+		_ = s.sessionManager.Save(sess)
+		return
+	}
 }
 
 func (s *Server) downloadTelegramFile(ctx context.Context, botToken string, fileID string) (string, func(), error) {
@@ -1131,6 +1469,18 @@ func telegramRetryAfterSeconds(err error) int {
 type telegramInboundResponse struct {
 	reply         string
 	createdThread int64 // if > 0, a new topic was created
+	sessionID     string
+}
+
+type telegramInboundPrompt struct {
+	text     string
+	metadata map[string]interface{}
+}
+
+type telegramReplyAudio struct {
+	clipID      string
+	contentType string
+	data        []byte
 }
 
 func (s *Server) handleTelegramInboundMessage(
@@ -1139,6 +1489,7 @@ func (s *Server) handleTelegramInboundMessage(
 	chat telegramChatPayload,
 	threadID int64,
 	userMessage string,
+	userMessageMetadata map[string]interface{},
 ) (*telegramInboundResponse, error) {
 	if handled, reply := handleTelegramSlashCommand(userMessage); handled {
 		return &telegramInboundResponse{reply: reply}, nil
@@ -1237,10 +1588,17 @@ func (s *Server) handleTelegramInboundMessage(
 	}
 
 	sess.AddUserMessage(userMessage)
+	if len(userMessageMetadata) > 0 && len(sess.Messages) > 0 {
+		last := len(sess.Messages) - 1
+		if sess.Messages[last].Role == "user" {
+			sess.Messages[last].Metadata = userMessageMetadata
+		}
+	}
+	llmUserMessage := telegramAgentPromptContext(userMessage, userMessageMetadata)
 
 	providerType := s.resolveSessionProviderType(sess)
 	model := s.resolveSessionModel(sess, providerType)
-	target, err := s.resolveExecutionTarget(ctx, providerType, model, userMessage, sess)
+	target, err := s.resolveExecutionTarget(ctx, providerType, model, llmUserMessage, sess)
 	if err != nil {
 		sess.AddAssistantMessage(fmt.Sprintf("Unable to start request: %s", err.Error()), nil)
 		sess.SetStatus(session.StatusFailed)
@@ -1258,7 +1616,7 @@ func (s *Server) handleTelegramInboundMessage(
 	}
 	ag := agent.New(agentConfig, target.Client, s.toolManagerForSession(sess), s.sessionManager)
 
-	response, _, err := ag.Run(ctx, sess, userMessage)
+	response, _, err := ag.Run(ctx, sess, llmUserMessage)
 	if err != nil {
 		sess.AddAssistantMessage(fmt.Sprintf("Request failed: %s", err.Error()), nil)
 		sess.SetStatus(session.StatusFailed)
@@ -1266,7 +1624,7 @@ func (s *Server) handleTelegramInboundMessage(
 		return nil, fmt.Errorf("agent run failed: %w", err)
 	}
 
-	result := &telegramInboundResponse{reply: response}
+	result := &telegramInboundResponse{reply: response, sessionID: sess.ID}
 	if newSession && createdThreadID > 0 {
 		result.createdThread = createdThreadID
 	}
@@ -1330,7 +1688,11 @@ func (s *Server) findTelegramSession(integrationID string, chatID string, scopeK
 				}
 			}
 		}
-		return sess, nil
+		fullSess, getErr := s.sessionManager.Get(sess.ID)
+		if getErr != nil {
+			return nil, fmt.Errorf("failed to load matched telegram session %s: %w", sess.ID, getErr)
+		}
+		return fullSess, nil
 	}
 	return nil, nil
 }
