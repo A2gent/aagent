@@ -1590,6 +1590,80 @@ func (s *Server) handleProjectGitUnstageFile(w http.ResponseWriter, r *http.Requ
 	s.jsonResponse(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+func (s *Server) handleProjectGitDiscardFile(w http.ResponseWriter, r *http.Request) {
+	projectID := strings.TrimSpace(r.URL.Query().Get("projectID"))
+	if projectID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "projectID is required")
+		return
+	}
+
+	resolvedRoot, err := s.resolveProjectRootFolder(projectID)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	var req ProjectGitFileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	targetRepoRoot, err := resolveProjectGitTargetRoot(resolvedRoot, strings.TrimSpace(req.RepoPath))
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !projectHasGitMetadata(targetRepoRoot) {
+		s.errorResponse(w, http.StatusBadRequest, "Target folder does not contain a .git directory")
+		return
+	}
+
+	normalizedPath, err := resolveGitRepoFilePath(targetRepoRoot, req.Path)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	statusOutput, statusErr := runGitCommandPreserveLeading(targetRepoRoot, "status", "--porcelain=v1", "--", normalizedPath)
+	if statusErr != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Failed to read file git status: "+statusErr.Error())
+		return
+	}
+	statusFiles := parseGitPorcelain(statusOutput)
+	var fileStatus *ProjectGitChangedFile
+	for i := range statusFiles {
+		if filepath.ToSlash(strings.TrimSpace(statusFiles[i].Path)) == filepath.ToSlash(normalizedPath) {
+			fileStatus = &statusFiles[i]
+			break
+		}
+	}
+	if fileStatus == nil {
+		s.errorResponse(w, http.StatusConflict, "File has no changes to discard")
+		return
+	}
+
+	fullPath := filepath.Join(targetRepoRoot, filepath.FromSlash(normalizedPath))
+	if fileStatus.Untracked || fileStatus.IndexStatus == "A" {
+		if _, rmErr := runGitCommand(targetRepoRoot, "rm", "--cached", "--ignore-unmatch", "--", normalizedPath); rmErr != nil {
+			logging.Warn("git rm --cached ignore-unmatch failed for discard path %s: %v", normalizedPath, rmErr)
+		}
+		if removeErr := os.Remove(fullPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			s.errorResponse(w, http.StatusBadRequest, "Failed to discard file: "+removeErr.Error())
+			return
+		}
+		s.jsonResponse(w, http.StatusOK, map[string]string{"status": "ok"})
+		return
+	}
+
+	if _, restoreErr := runGitCommand(targetRepoRoot, "restore", "--staged", "--worktree", "--", normalizedPath); restoreErr != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Failed to discard file changes: "+restoreErr.Error())
+		return
+	}
+
+	s.jsonResponse(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
 func (s *Server) handleProjectGitFileDiff(w http.ResponseWriter, r *http.Request) {
 	projectID := strings.TrimSpace(r.URL.Query().Get("projectID"))
 	if projectID == "" {

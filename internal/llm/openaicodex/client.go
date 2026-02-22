@@ -372,7 +372,7 @@ func buildInputItems(messages []llm.Message) []responsesInputItem {
 					Type: "message",
 					Role: "assistant",
 					Content: []responsesInputText{
-						{Type: "input_text", Text: content},
+						{Type: "output_text", Text: content},
 					},
 				})
 			}

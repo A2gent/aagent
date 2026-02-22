@@ -330,6 +330,7 @@ func (s *Server) setupRoutes() {
 		r.Get("/git/diff", s.handleProjectGitFileDiff)
 		r.Post("/git/stage", s.handleProjectGitStageFile)
 		r.Post("/git/unstage", s.handleProjectGitUnstageFile)
+		r.Post("/git/discard", s.handleProjectGitDiscardFile)
 		r.Post("/git/commit-message", s.handleProjectGitCommitMessageSuggestion)
 		r.Post("/git/push", s.handleProjectGitPush)
 		r.Post("/git/commit", s.handleProjectGitCommit)
