@@ -76,7 +76,7 @@ func TranscribeWithOptions(ctx context.Context, audioPath string, language strin
 		"-of", outputPrefix,
 		"-nt",
 	}
-	if lang != "auto" {
+	if lang != "" {
 		args = append(args, "-l", lang)
 	}
 	if cfg.Threads > 0 {

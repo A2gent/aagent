@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -795,7 +796,13 @@ func (s *Server) telegramPromptFromInboundMessage(
 	if fileID == "" {
 		return caption, nil
 	}
+	logging.Info("Telegram inbound %s detected: chat=%d thread=%d has_caption=%v", mediaKind, message.Chat.ID, message.MessageThreadID, caption != "")
 	if !telegramVoiceTranscriptionEnabled(integration) {
+		integrationID := ""
+		if integration != nil {
+			integrationID = integration.ID
+		}
+		logging.Info("Telegram inbound %s transcription disabled for integration %s", mediaKind, integrationID)
 		return caption, nil
 	}
 
@@ -805,9 +812,20 @@ func (s *Server) telegramPromptFromInboundMessage(
 	}
 	defer cleanup()
 
+	normalizedPath, normalizedCleanup, err := convertAudioToWAVForWhisper(ctx, audioPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to normalize %s message audio: %w", mediaKind, err)
+	}
+	if normalizedCleanup != nil {
+		defer normalizedCleanup()
+	}
+	if normalizedPath != audioPath {
+		logging.Info("Telegram inbound %s converted to WAV for whisper: source=%s target=%s", mediaKind, audioPath, normalizedPath)
+	}
+
 	transcript, err := whispercpp.TranscribeWithOptions(
 		ctx,
-		audioPath,
+		normalizedPath,
 		telegramTranscriptionLanguage(integration),
 		telegramTranscriptionTranslateFlag(integration),
 	)
@@ -815,6 +833,7 @@ func (s *Server) telegramPromptFromInboundMessage(
 		return "", fmt.Errorf("failed to transcribe %s message: %w", mediaKind, err)
 	}
 	transcript = strings.TrimSpace(transcript)
+	logging.Info("Telegram inbound %s transcription completed: chat=%d thread=%d transcript_len=%d", mediaKind, message.Chat.ID, message.MessageThreadID, len([]rune(transcript)))
 	if transcript == "" {
 		return caption, nil
 	}
@@ -966,6 +985,64 @@ func (s *Server) downloadTelegramFile(ctx context.Context, botToken string, file
 		return "", func() {}, fmt.Errorf("failed to close downloaded audio file: %w", err)
 	}
 	return tmp.Name(), cleanup, nil
+}
+
+func convertAudioToWAVForWhisper(ctx context.Context, inputPath string) (string, func(), error) {
+	inputPath = strings.TrimSpace(inputPath)
+	if inputPath == "" {
+		return "", nil, fmt.Errorf("input audio path is empty")
+	}
+
+	ext := strings.ToLower(strings.TrimSpace(filepath.Ext(inputPath)))
+	if ext == ".wav" || ext == ".wave" {
+		return inputPath, nil, nil
+	}
+
+	ffmpegPath, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		logging.Warn("ffmpeg not found in PATH; passing original audio file to whisper: %s", inputPath)
+		return inputPath, nil, nil
+	}
+
+	tmp, err := os.CreateTemp("", "a2gent-telegram-audio-*.wav")
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create temporary wav file: %w", err)
+	}
+	outputPath := tmp.Name()
+	_ = tmp.Close()
+	cleanup := func() { _ = os.Remove(outputPath) }
+
+	cmd := exec.CommandContext(
+		ctx,
+		ffmpegPath,
+		"-y",
+		"-i", inputPath,
+		"-ac", "1",
+		"-ar", "16000",
+		"-f", "wav",
+		outputPath,
+	)
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Run(); err != nil {
+		detail := strings.TrimSpace(output.String())
+		if detail == "" {
+			detail = err.Error()
+		}
+		cleanup()
+		return "", nil, fmt.Errorf("ffmpeg conversion failed: %s", truncateRunes(detail, 1000))
+	}
+
+	if info, statErr := os.Stat(outputPath); statErr != nil || info.IsDir() || info.Size() == 0 {
+		cleanup()
+		if statErr != nil {
+			return "", nil, fmt.Errorf("ffmpeg conversion produced invalid output: %v", statErr)
+		}
+		return "", nil, fmt.Errorf("ffmpeg conversion produced empty output")
+	}
+
+	return outputPath, cleanup, nil
 }
 
 func primaryTelegramMessage(update telegramUpdatePayload) *telegramMessagePayload {
