@@ -27,14 +27,20 @@ package a2atunnel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 )
@@ -430,6 +436,7 @@ func (c *TunnelClient) Run(ctx context.Context) {
 
 		c.setState(StateConnecting)
 		c.logf("Connecting to Square at %s…", c.squareAddr)
+		c.logConnectivityDiagnostics(ctx)
 
 		if err := c.runStream(ctx); err != nil {
 			if ctx.Err() != nil {
@@ -439,7 +446,7 @@ func (c *TunnelClient) Run(ctx context.Context) {
 				return
 			}
 			c.setState(StateDisconnected)
-			c.logf("Tunnel error: %v", err)
+			c.logf("Tunnel error [%s]: %v", classifyConnectivityError(err), err)
 		} else {
 			c.setActive(nil)
 			c.setState(StateDisconnected)
@@ -604,4 +611,116 @@ func (c *TunnelClient) IsConnected() bool {
 	c.stateMu.RLock()
 	defer c.stateMu.RUnlock()
 	return c.state == StateConnected
+}
+
+func (c *TunnelClient) logConnectivityDiagnostics(ctx context.Context) {
+	host, port, err := endpointHostPort(c.squareAddr, c.transport)
+	if err != nil {
+		c.logf("Connectivity preflight: endpoint parse failed for %q (%v)", c.squareAddr, err)
+		return
+	}
+	c.logf("Connectivity preflight: target host=%s port=%s transport=%s", host, port, c.transport)
+
+	if ip := net.ParseIP(host); ip != nil {
+		c.logf("Connectivity preflight: host is an IP literal (%s), skipping DNS lookup", ip.String())
+	} else {
+		resolverCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		start := time.Now()
+		ips, lookupErr := net.DefaultResolver.LookupIPAddr(resolverCtx, host)
+		cancel()
+		if lookupErr != nil {
+			c.logf("Connectivity preflight: DNS lookup failed for %s (%s): %v", host, classifyConnectivityError(lookupErr), lookupErr)
+		} else {
+			list := make([]string, 0, len(ips))
+			for _, ip := range ips {
+				list = append(list, ip.IP.String())
+			}
+			c.logf("Connectivity preflight: DNS resolved %s in %s -> %s", host, time.Since(start).Round(time.Millisecond), strings.Join(list, ", "))
+		}
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	start := time.Now()
+	conn, dialErr := (&net.Dialer{}).DialContext(probeCtx, "tcp", net.JoinHostPort(host, port))
+	if dialErr != nil {
+		c.logf("Connectivity preflight: TCP probe to %s:%s failed after %s (%s): %v", host, port, time.Since(start).Round(time.Millisecond), classifyConnectivityError(dialErr), dialErr)
+		return
+	}
+	_ = conn.Close()
+	c.logf("Connectivity preflight: TCP probe to %s:%s succeeded in %s", host, port, time.Since(start).Round(time.Millisecond))
+}
+
+func endpointHostPort(endpoint string, transport Transport) (string, string, error) {
+	if transport == TransportWebSocket {
+		u, err := url.Parse(endpoint)
+		if err != nil {
+			return "", "", err
+		}
+		host := u.Hostname()
+		if host == "" {
+			return "", "", fmt.Errorf("missing hostname")
+		}
+		port := u.Port()
+		if port == "" {
+			switch strings.ToLower(u.Scheme) {
+			case "wss":
+				port = "443"
+			case "ws":
+				port = "80"
+			default:
+				return "", "", fmt.Errorf("missing port and unsupported scheme %q", u.Scheme)
+			}
+		}
+		return host, port, nil
+	}
+
+	host, port, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return "", "", err
+	}
+	if host == "" || port == "" {
+		return "", "", fmt.Errorf("missing host or port")
+	}
+	return host, port, nil
+}
+
+func classifyConnectivityError(err error) string {
+	if err == nil {
+		return "none"
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "no such host"):
+		return "dns"
+	case strings.Contains(msg, "connection refused"):
+		return "port-closed"
+	case strings.Contains(msg, "network is unreachable"), strings.Contains(msg, "no route to host"):
+		return "routing"
+	case strings.Contains(msg, "context deadline exceeded"), strings.Contains(msg, "i/o timeout"):
+		return "timeout"
+	case strings.Contains(msg, "tls"):
+		return "tls"
+	case strings.Contains(msg, "http status 401"), strings.Contains(msg, "http status 403"), strings.Contains(msg, "unauthorized"), strings.Contains(msg, "forbidden"):
+		return "auth"
+	}
+
+	if st, ok := status.FromError(err); ok {
+		switch st.Code() {
+		case codes.Unauthenticated, codes.PermissionDenied:
+			return "auth"
+		case codes.Unimplemented, codes.InvalidArgument, codes.FailedPrecondition:
+			return "protocol"
+		case codes.Unavailable, codes.DeadlineExceeded:
+			return "transport"
+		}
+	}
+
+	return "unknown"
 }
