@@ -71,6 +71,7 @@ func NewManager(workDir string) *Manager {
 
 	// Register built-in tools
 	m.Register(NewBashTool(workDir))
+	m.Register(NewCodeExecutionTool(workDir))
 	m.Register(NewReadTool(workDir))
 	m.Register(NewWriteTool(workDir))
 	m.Register(NewEditTool(workDir))

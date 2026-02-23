@@ -964,6 +964,7 @@ Guidelines:
 
 Available tools allow you to:
 - Execute shell commands (bash)
+- Execute secure Python data processing snippets (code_execution)
 - Read file contents (read)
 - Write new files (write)
 - Edit existing files with string replacement (edit)
