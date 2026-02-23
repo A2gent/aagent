@@ -62,9 +62,9 @@ func (s *Server) handleAgentCard(w http.ResponseWriter, r *http.Request) {
 		Description: "AI agent for software engineering tasks with tool execution capabilities including file operations, shell commands, web search, browser automation, and integrations.",
 		SupportedInterfaces: []AgentInterface{
 			{
-				URL:             baseURL,
+				URL:             baseURL + "/a2a/messages/send",
 				ProtocolBinding: "HTTP+JSON",
-				ProtocolVersion: "0.1",
+				ProtocolVersion: "0.1-bridge",
 			},
 		},
 		Version:          version,
