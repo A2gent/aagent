@@ -30,6 +30,7 @@ import (
 
 const (
 	a2aInboundProjectIDSettingKey = "A2A_INBOUND_PROJECT_ID"
+	a2aInboundSubAgentIDSettingKey = "A2A_INBOUND_SUB_AGENT_ID"
 	a2aOutboundSessionKey         = "a2a_outbound"
 	a2aOutboundTargetAgentIDKey   = "a2a_target_agent_id"
 	a2aOutboundTargetAgentNameKey = "a2a_target_agent_name"
@@ -74,6 +75,7 @@ func (s *Server) startA2ATunnel(apiKey, transport, squareAddr string) {
 		s.makeA2AAgentFactory(),
 		s.toolManagerForSession,
 		s.getA2AInboundProjectID,
+		s.getA2AInboundSubAgentID,
 	)
 
 	client := a2atunnel.NewWithTransport(squareAddr, apiKey, handler, a2atunnel.Transport(transport))
@@ -146,6 +148,16 @@ func (s *Server) getA2AInboundProjectID() string {
 	return strings.TrimSpace(settings[a2aInboundProjectIDSettingKey])
 }
 
+// getA2AInboundSubAgentID returns the configured sub-agent ID for inbound A2A
+// sessions, or "" if the main agent should handle requests.
+func (s *Server) getA2AInboundSubAgentID() string {
+	settings, err := s.store.GetSettings()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(settings[a2aInboundSubAgentIDSettingKey])
+}
+
 // makeA2AAgentFactory returns a factory that constructs an *agent.Agent
 // using the server's active LLM client and current config.
 func (s *Server) makeA2AAgentFactory() a2atunnel.AgentRunnerBuilder {
@@ -153,6 +165,27 @@ func (s *Server) makeA2AAgentFactory() a2atunnel.AgentRunnerBuilder {
 		if sess != nil {
 			if sess.Metadata == nil {
 				sess.Metadata = map[string]interface{}{}
+			}
+			metadataChanged := false
+			if rawSubAgentID, ok := sess.Metadata["sub_agent_id"].(string); ok && strings.TrimSpace(rawSubAgentID) != "" {
+				subAgentID := strings.TrimSpace(rawSubAgentID)
+				if sa, saErr := s.store.GetSubAgent(subAgentID); saErr == nil {
+					sess.Metadata["sub_agent_name"] = sa.Name
+					metadataChanged = true
+					if strings.TrimSpace(sa.Provider) != "" {
+						sess.Metadata["provider"] = config.NormalizeProviderRef(sa.Provider)
+						metadataChanged = true
+					}
+					if strings.TrimSpace(sa.Model) != "" {
+						sess.Metadata["model"] = strings.TrimSpace(sa.Model)
+						metadataChanged = true
+					}
+				} else {
+					logging.Warn("Failed to resolve inbound A2A sub-agent %s: %v", subAgentID, saErr)
+					delete(sess.Metadata, "sub_agent_id")
+					delete(sess.Metadata, "sub_agent_name")
+					metadataChanged = true
+				}
 			}
 			if _, hasProvider := sess.Metadata["provider"]; !hasProvider {
 				providerRef := config.NormalizeProviderRef(s.config.ActiveProvider)
@@ -164,6 +197,9 @@ func (s *Server) makeA2AAgentFactory() a2atunnel.AgentRunnerBuilder {
 				if providerRef != string(config.ProviderAutoRouter) {
 					sess.Metadata["model"] = s.resolveModelForProvider(config.ProviderType(providerRef))
 				}
+				metadataChanged = true
+			}
+			if metadataChanged {
 				if err := s.sessionManager.Save(sess); err != nil {
 					logging.Warn("Failed to persist inbound A2A provider metadata: %v", err)
 				}
@@ -185,13 +221,33 @@ func (s *Server) makeA2AAgentFactory() a2atunnel.AgentRunnerBuilder {
 		cfg := agent.Config{
 			Name:          "brute-a2a",
 			Model:         target.Model,
-			SystemPrompt:  s.buildSystemPromptForA2A(),
+			SystemPrompt:  s.buildSystemPromptForA2ASession(sess),
 			MaxSteps:      s.config.MaxSteps,
 			Temperature:   s.config.Temperature,
 			ContextWindow: target.ContextWindow,
 		}
 		return agent.New(cfg, target.Client, toolManager, s.sessionManager), nil
 	}
+}
+
+func (s *Server) buildSystemPromptForA2ASession(sess *session.Session) string {
+	if sess != nil && sess.Metadata != nil {
+		if subAgentID, ok := sess.Metadata["sub_agent_id"].(string); ok && strings.TrimSpace(subAgentID) != "" {
+			if sa, err := s.store.GetSubAgent(strings.TrimSpace(subAgentID)); err == nil && sa != nil {
+				snapshot := s.composeSubAgentSystemPromptSnapshot(sa, sess)
+				if snapshot != nil {
+					attachSessionSystemPromptSnapshot(sess, snapshot)
+					if err := s.sessionManager.Save(sess); err != nil {
+						logging.Warn("Failed to persist inbound A2A sub-agent system prompt snapshot: %v", err)
+					}
+					if strings.TrimSpace(snapshot.CombinedPrompt) != "" {
+						return strings.TrimSpace(snapshot.CombinedPrompt)
+					}
+				}
+			}
+		}
+	}
+	return s.buildSystemPromptForA2A()
 }
 
 // buildSystemPromptForA2A builds a system prompt for inbound A2A sessions.

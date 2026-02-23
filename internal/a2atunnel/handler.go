@@ -38,6 +38,9 @@ type InboundHandler struct {
 	// inboundProjectID returns the project ID to assign to inbound sessions.
 	// Called on each request so changes to settings take effect immediately.
 	inboundProjectID func() string
+	// inboundSubAgentID returns the sub-agent ID to assign to inbound sessions.
+	// Called on each request so changes to settings take effect immediately.
+	inboundSubAgentID func() string
 }
 
 // NewInboundHandler constructs an InboundHandler.
@@ -47,6 +50,7 @@ func NewInboundHandler(
 	agentFactory AgentRunnerBuilder,
 	toolManagerFactory ToolManagerFactory,
 	inboundProjectID func() string,
+	inboundSubAgentID func() string,
 ) *InboundHandler {
 	return &InboundHandler{
 		agentID:            agentID,
@@ -54,6 +58,7 @@ func NewInboundHandler(
 		agentFactory:       agentFactory,
 		toolManagerFactory: toolManagerFactory,
 		inboundProjectID:   inboundProjectID,
+		inboundSubAgentID:  inboundSubAgentID,
 	}
 }
 
@@ -70,6 +75,10 @@ func (h *InboundHandler) Handle(ctx context.Context, req *AgentRequest) ([]byte,
 
 	// 2. Resolve base project (dynamic — reads current settings).
 	projectID := h.inboundProjectID()
+	subAgentID := ""
+	if h.inboundSubAgentID != nil {
+		subAgentID = strings.TrimSpace(h.inboundSubAgentID())
+	}
 
 	// 3. Resolve or create a session stamped with A2A origin metadata.
 	sess, err := h.resolveSession(p)
@@ -88,6 +97,12 @@ func (h *InboundHandler) Handle(ctx context.Context, req *AgentRequest) ([]byte,
 	}
 	if projectID != "" {
 		sess.ProjectID = &projectID
+	}
+	if subAgentID != "" {
+		sess.Metadata["sub_agent_id"] = subAgentID
+	} else {
+		delete(sess.Metadata, "sub_agent_id")
+		delete(sess.Metadata, "sub_agent_name")
 	}
 	if pending, _ := h.sessionManager.GetPendingQuestion(sess.ID); pending != nil && sess.Status == session.StatusInputRequired {
 		if err := h.sessionManager.AnswerQuestion(sess.ID, p.Task); err != nil {
