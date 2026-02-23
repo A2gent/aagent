@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -140,8 +141,19 @@ type ProjectGitPushRequest struct {
 	RepoPath string `json:"repo_path,omitempty"`
 }
 
+type ProjectGitInitRequest struct {
+	RepoPath  string `json:"repo_path,omitempty"`
+	RemoteURL string `json:"remote_url,omitempty"`
+}
+
 type ProjectGitPushResponse struct {
 	Output string `json:"output,omitempty"`
+}
+
+type ProjectGitInitResponse struct {
+	RootFolder string `json:"root_folder"`
+	HasGit     bool   `json:"has_git"`
+	RemoteURL  string `json:"remote_url,omitempty"`
 }
 
 func (s *Server) handleGetMindConfig(w http.ResponseWriter, r *http.Request) {
@@ -1878,11 +1890,84 @@ func (s *Server) handleProjectGitPush(w http.ResponseWriter, r *http.Request) {
 
 	output, err := runGitCommand(targetRepoRoot, "push")
 	if err != nil {
+		lower := strings.ToLower(err.Error())
+		if strings.Contains(lower, "no upstream branch") || strings.Contains(lower, "has no upstream branch") {
+			branchName, branchErr := runGitCommand(targetRepoRoot, "rev-parse", "--abbrev-ref", "HEAD")
+			if branchErr != nil {
+				s.errorResponse(w, http.StatusBadRequest, "Push failed (no upstream), and current branch could not be detected: "+branchErr.Error())
+				return
+			}
+			branch := strings.TrimSpace(branchName)
+			if branch == "" || branch == "HEAD" {
+				s.errorResponse(w, http.StatusBadRequest, "Push failed: no upstream branch and current branch is detached")
+				return
+			}
+			output, err = runGitCommand(targetRepoRoot, "push", "--set-upstream", "origin", branch)
+			if err != nil {
+				s.errorResponse(w, http.StatusBadRequest, "Failed to push with upstream setup: "+err.Error())
+				return
+			}
+			s.jsonResponse(w, http.StatusOK, ProjectGitPushResponse{Output: output})
+			return
+		}
 		s.errorResponse(w, http.StatusBadRequest, "Failed to push: "+err.Error())
 		return
 	}
 
 	s.jsonResponse(w, http.StatusOK, ProjectGitPushResponse{Output: output})
+}
+
+func (s *Server) handleProjectGitInit(w http.ResponseWriter, r *http.Request) {
+	projectID := strings.TrimSpace(r.URL.Query().Get("projectID"))
+	if projectID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "projectID is required")
+		return
+	}
+
+	resolvedRoot, err := s.resolveProjectRootFolder(projectID)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	var req ProjectGitInitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	targetRepoRoot, err := resolveProjectGitTargetRoot(resolvedRoot, strings.TrimSpace(req.RepoPath))
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if projectHasGitMetadata(targetRepoRoot) {
+		s.errorResponse(w, http.StatusConflict, "Target folder is already a Git repository")
+		return
+	}
+
+	if _, err := runGitCommand(targetRepoRoot, "init"); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Failed to initialize git repository: "+err.Error())
+		return
+	}
+	// Ensure first push can auto-establish upstream for new branches.
+	if _, err := runGitCommand(targetRepoRoot, "config", "push.autoSetupRemote", "true"); err != nil {
+		logging.Warn("Failed to set push.autoSetupRemote for %s: %v", targetRepoRoot, err)
+	}
+
+	remoteURL := strings.TrimSpace(req.RemoteURL)
+	if remoteURL != "" {
+		if _, err := runGitCommand(targetRepoRoot, "remote", "add", "origin", remoteURL); err != nil {
+			s.errorResponse(w, http.StatusBadRequest, "Repository initialized, but failed to add remote origin: "+err.Error())
+			return
+		}
+	}
+
+	s.jsonResponse(w, http.StatusOK, ProjectGitInitResponse{
+		RootFolder: targetRepoRoot,
+		HasGit:     true,
+		RemoteURL:  remoteURL,
+	})
 }
 
 func (s *Server) resolveProjectRootFolder(projectID string) (string, error) {
@@ -2190,6 +2275,7 @@ func parseGitPorcelain(output string) []ProjectGitChangedFile {
 		if pathPart == "" {
 			continue
 		}
+		pathPart = decodeGitPath(pathPart)
 
 		indexStatus := string(statusCode[0])
 		worktreeStatus := string(statusCode[1])
@@ -2211,4 +2297,29 @@ func parseGitPorcelain(output string) []ProjectGitChangedFile {
 		})
 	}
 	return files
+}
+
+func decodeGitPath(pathPart string) string {
+	trimmed := strings.TrimSpace(pathPart)
+	if trimmed == "" {
+		return trimmed
+	}
+
+	// Git may return paths in C-style quoted format with octal escapes,
+	// e.g. "00-\320\230...". Decode those so UI gets readable UTF-8 names.
+	if strings.HasPrefix(trimmed, "\"") && strings.HasSuffix(trimmed, "\"") {
+		if decoded, err := strconv.Unquote(trimmed); err == nil {
+			return decoded
+		}
+	}
+
+	// Fallback for edge cases where git produced escapes without outer quotes.
+	if strings.Contains(trimmed, "\\") {
+		quoted := "\"" + strings.ReplaceAll(trimmed, "\"", "\\\"") + "\""
+		if decoded, err := strconv.Unquote(quoted); err == nil {
+			return decoded
+		}
+	}
+
+	return trimmed
 }

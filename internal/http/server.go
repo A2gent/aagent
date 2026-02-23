@@ -327,6 +327,7 @@ func (s *Server) setupRoutes() {
 		// Static routes must come before dynamic {projectID} route
 		r.Get("/tree", s.handleListProjectTree)
 		r.Get("/git/status", s.handleProjectGitStatus)
+		r.Post("/git/init", s.handleProjectGitInit)
 		r.Get("/git/diff", s.handleProjectGitFileDiff)
 		r.Post("/git/stage", s.handleProjectGitStageFile)
 		r.Post("/git/unstage", s.handleProjectGitUnstageFile)
@@ -2911,6 +2912,10 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 		project.Name = name
 	}
 	if req.Folder != nil {
+		if project.ID == storage.SystemProjectSoulID {
+			s.errorResponse(w, http.StatusBadRequest, "Soul project folder is tied to the agent data path")
+			return
+		}
 		project.Folder = normalizeFolder(req.Folder)
 	}
 	project.UpdatedAt = time.Now()

@@ -4,7 +4,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -12,12 +14,17 @@ import (
 
 // SQLiteStore implements Store using SQLite
 type SQLiteStore struct {
-	db *sql.DB
+	db       *sql.DB
+	dataPath string
 }
 
 // NewSQLiteStore creates a new SQLite store
 func NewSQLiteStore(dataPath string) (*SQLiteStore, error) {
-	dbPath := filepath.Join(dataPath, "aagent.db")
+	resolvedDataPath, err := filepath.Abs(dataPath)
+	if err != nil {
+		resolvedDataPath = dataPath
+	}
+	dbPath := filepath.Join(resolvedDataPath, "aagent.db")
 
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -29,7 +36,7 @@ func NewSQLiteStore(dataPath string) (*SQLiteStore, error) {
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0)
 
-	store := &SQLiteStore{db: db}
+	store := &SQLiteStore{db: db, dataPath: resolvedDataPath}
 	if err := store.migrate(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to migrate database: %w", err)
@@ -186,6 +193,7 @@ func (s *SQLiteStore) migrate() error {
 const (
 	SystemProjectKBID    = "system-kb"
 	SystemProjectAgentID = "system-agent"
+	SystemProjectSoulID  = "system-soul"
 )
 
 // seedSystemProjects creates the system projects if they don't exist.
@@ -194,9 +202,11 @@ func (s *SQLiteStore) seedSystemProjects() error {
 	systemProjects := []struct {
 		id   string
 		name string
+		folder *string
 	}{
-		{SystemProjectKBID, "Knowledge Base"},
-		{SystemProjectAgentID, "Agent"},
+		{SystemProjectKBID, "Knowledge Base", nil},
+		{SystemProjectAgentID, "Body", nil},
+		{SystemProjectSoulID, "Soul", &s.dataPath},
 	}
 
 	now := time.Now()
@@ -208,8 +218,59 @@ func (s *SQLiteStore) seedSystemProjects() error {
 		if err != nil {
 			return fmt.Errorf("failed to seed system project %s: %w", p.id, err)
 		}
+		// Keep canonical names in sync for existing installations and pin Soul folder.
+		if p.id == SystemProjectSoulID {
+			if _, err := s.db.Exec(`
+				UPDATE projects
+				SET name = ?, is_system = 1, folder = ?, updated_at = ?
+				WHERE id = ?
+			`, p.name, p.folder, now, p.id); err != nil {
+				return fmt.Errorf("failed to update system project %s metadata: %w", p.id, err)
+			}
+			if err := s.ensureSoulProjectDefaults(); err != nil {
+				return fmt.Errorf("failed to apply soul project defaults: %w", err)
+			}
+			continue
+		}
+		if _, err := s.db.Exec(`
+			UPDATE projects
+			SET name = ?, is_system = 1, updated_at = ?
+			WHERE id = ?
+		`, p.name, now, p.id); err != nil {
+			return fmt.Errorf("failed to update system project %s metadata: %w", p.id, err)
+		}
 	}
 	return nil
+}
+
+const soulGitignoreManagedBlock = "# A2gent Soul defaults\nlogs/\n*.log\n"
+
+func (s *SQLiteStore) ensureSoulProjectDefaults() error {
+	if strings.TrimSpace(s.dataPath) == "" {
+		return nil
+	}
+
+	if err := os.MkdirAll(s.dataPath, 0o755); err != nil {
+		return err
+	}
+
+	gitignorePath := filepath.Join(s.dataPath, ".gitignore")
+	existing, err := os.ReadFile(gitignorePath)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	content := string(existing)
+	if strings.Contains(content, "# A2gent Soul defaults") {
+		return nil
+	}
+
+	if content != "" && !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	content += soulGitignoreManagedBlock
+
+	return os.WriteFile(gitignorePath, []byte(content), 0o644)
 }
 
 // SaveSession saves a session to the database

@@ -166,14 +166,25 @@ just apple-system-stop
 
 ## 5. Configuration
 
-### 5.1 Config Files
+### 5.1 Config File
 
-Loaded in order (later overrides earlier):
+Canonical location (single-folder layout with DB/logs):
 
 | Location | Scope |
 |---|---|
-| `.aagent/config.json` | project-level |
-| `~/.config/aagent/config.json` | user-level |
+| `$AAGENT_DATA_PATH/config.json` | user-level |
+
+Defaults:
+
+- `AAGENT_DATA_PATH=~/.local/share/aagent`
+- config: `~/.local/share/aagent/config.json`
+- database: `~/.local/share/aagent/aagent.db`
+- logs: `~/.local/share/aagent/logs/`
+
+Backward-compatible read fallbacks are still supported:
+
+- `.aagent/config.json`
+- `~/.config/aagent/config.json`
 
 ### 5.2 `.env` Loading
 

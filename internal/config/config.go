@@ -191,7 +191,6 @@ type ToolsConfig struct {
 
 // DefaultConfig returns the default configuration
 func DefaultConfig() *Config {
-	homeDir, _ := os.UserHomeDir()
 	workDir, _ := os.Getwd()
 
 	return &Config{
@@ -200,7 +199,7 @@ func DefaultConfig() *Config {
 		MaxSteps:       50,
 		Temperature:    0.0,
 		LLMRetries:     3,
-		DataPath:       filepath.Join(homeDir, ".local", "share", "aagent"),
+		DataPath:       resolveDataPath(),
 		WorkDir:        workDir,
 		Providers:      make(map[string]Provider),
 		Tools: ToolsConfig{
@@ -213,6 +212,14 @@ func DefaultConfig() *Config {
 			Task:  "allow",
 		},
 	}
+}
+
+func resolveDataPath() string {
+	if dataPath := os.Getenv("AAGENT_DATA_PATH"); dataPath != "" {
+		return dataPath
+	}
+	homeDir, _ := os.UserHomeDir()
+	return filepath.Join(homeDir, ".local", "share", "aagent")
 }
 
 // GetActiveProvider returns the configuration for the currently active provider
@@ -236,28 +243,15 @@ func (c *Config) IsValidProvider(ptype ProviderType) bool {
 
 // GetConfigPath returns the path where config should be saved
 func GetConfigPath() string {
-	homeDir, _ := os.UserHomeDir()
-	return filepath.Join(homeDir, ".config", "aagent", "config.json")
+	if path := os.Getenv("AAGENT_CONFIG_PATH"); path != "" {
+		return path
+	}
+	return filepath.Join(resolveDataPath(), "config.json")
 }
 
 // Load loads configuration from file and environment
 func Load() (*Config, error) {
 	cfg := DefaultConfig()
-
-	// Try to load from config file
-	configPaths := []string{
-		".aagent/config.json",
-		filepath.Join(os.Getenv("HOME"), ".config", "aagent", "config.json"),
-	}
-
-	for _, path := range configPaths {
-		if data, err := os.ReadFile(path); err == nil {
-			if err := json.Unmarshal(data, cfg); err != nil {
-				return nil, err
-			}
-			break
-		}
-	}
 
 	// Override with environment variables
 	if model := os.Getenv("AAGENT_MODEL"); model != "" {
@@ -269,6 +263,24 @@ func Load() (*Config, error) {
 	if retriesStr := os.Getenv("AAGENT_LLM_RETRIES"); retriesStr != "" {
 		if retries, err := strconv.Atoi(retriesStr); err == nil && retries >= 0 {
 			cfg.LLMRetries = retries
+		}
+	}
+
+	// Try to load from config file. Prefer single-folder location next to DB
+	// while retaining legacy paths for backward compatibility.
+	homeDir, _ := os.UserHomeDir()
+	configPaths := []string{
+		GetConfigPath(),
+		".aagent/config.json",
+		filepath.Join(homeDir, ".config", "aagent", "config.json"),
+	}
+
+	for _, path := range configPaths {
+		if data, err := os.ReadFile(path); err == nil {
+			if err := json.Unmarshal(data, cfg); err != nil {
+				return nil, err
+			}
+			break
 		}
 	}
 
