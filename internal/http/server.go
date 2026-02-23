@@ -105,17 +105,32 @@ func (s *Server) resolveSessionWorkDir(sess *session.Session) string {
 
 func (s *Server) toolManagerForSession(sess *session.Session) *tools.Manager {
 	workDir := s.resolveSessionWorkDir(sess)
+	settings, err := s.store.GetSettings()
+	if err != nil {
+		settings = map[string]string{}
+	}
+	disabledTools := resolveDisabledToolNames(settings)
+
 	defaultDir := strings.TrimSpace(s.config.WorkDir)
 	if defaultDir == "" {
 		defaultDir = "."
 	}
-	if workDir == defaultDir {
+	if workDir == defaultDir && len(disabledTools) == 0 {
 		return s.toolManager
 	}
 
-	manager := tools.NewManager(workDir)
-	integrationtools.Register(manager, s.store, s.speechClips)
-	s.registerServerBackedTools(manager)
+	var manager *tools.Manager
+	if workDir == defaultDir {
+		manager = s.toolManager.Clone()
+	} else {
+		manager = tools.NewManager(workDir)
+		integrationtools.Register(manager, s.store, s.speechClips)
+		s.registerServerBackedTools(manager)
+	}
+
+	for toolName := range disabledTools {
+		manager.Unregister(toolName)
+	}
 	return manager
 }
 
@@ -146,6 +161,7 @@ const externalMarkdownSkillsInstructionBlockType = "external_markdown_skills"
 const mcpServersInstructionBlockType = "mcp_servers"
 const skillsFolderSettingKey = "AAGENT_SKILLS_FOLDER"
 const externalMarkdownDisabledSkillsSettingKey = "A2GENT_EXTERNAL_MARKDOWN_DISABLED_SKILLS"
+const disabledToolsSettingKey = "A2GENT_DISABLED_TOOLS"
 const defaultDynamicInstructionFile = "AGENTS.md"
 const maxDynamicInstructionBytes = 32 * 1024
 const sessionSystemPromptSnapshotMetadataKey = "system_prompt_snapshot"
@@ -3401,6 +3417,34 @@ func resolveThinkingInstructionBlocksFromSettings(settings map[string]string) []
 		return []configuredInstructionBlock{{Type: "text", Value: textValue, Enabled: &enabled}}
 	}
 	return []configuredInstructionBlock{}
+}
+
+func resolveDisabledToolNames(settings map[string]string) map[string]struct{} {
+	disabled := make(map[string]struct{})
+	if settings == nil {
+		return disabled
+	}
+
+	raw := strings.TrimSpace(settings[disabledToolsSettingKey])
+	if raw == "" {
+		return disabled
+	}
+
+	entries := make([]string, 0)
+	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+		entries = strings.FieldsFunc(raw, func(r rune) bool {
+			return r == ',' || r == '\n'
+		})
+	}
+
+	for _, entry := range entries {
+		name := strings.TrimSpace(entry)
+		if name == "" {
+			continue
+		}
+		disabled[name] = struct{}{}
+	}
+	return disabled
 }
 
 func isThinkingSessionWithSettings(sess *session.Session, settings map[string]string) bool {

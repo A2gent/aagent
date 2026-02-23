@@ -35,6 +35,25 @@ type Manager struct {
 	mu      sync.RWMutex
 }
 
+// Clone creates a shallow copy of the manager preserving tool registrations.
+func (m *Manager) Clone() *Manager {
+	if m == nil {
+		return nil
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	cloned := &Manager{
+		tools:   make(map[string]Tool, len(m.tools)),
+		workDir: m.workDir,
+	}
+	for name, tool := range m.tools {
+		cloned.tools[name] = tool
+	}
+	return cloned
+}
+
 // WorkDir returns manager work directory.
 func (m *Manager) WorkDir() string {
 	if m == nil {
@@ -87,6 +106,13 @@ func (m *Manager) Register(tool Tool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.tools[tool.Name()] = tool
+}
+
+// Unregister removes a tool by name.
+func (m *Manager) Unregister(name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.tools, name)
 }
 
 // Get returns a tool by name

@@ -59,6 +59,7 @@ type BuiltInSkill struct {
 	Name        string `json:"name"`
 	Kind        string `json:"kind"`
 	Description string `json:"description"`
+	Enabled     bool   `json:"enabled"`
 }
 
 type BuiltInSkillResponse struct {
@@ -86,6 +87,11 @@ type IntegrationBackedSkillsResponse struct {
 
 func (s *Server) handleListBuiltInSkills(w http.ResponseWriter, r *http.Request) {
 	skills := make([]BuiltInSkill, 0, 16)
+	settings, err := s.store.GetSettings()
+	if err != nil {
+		settings = map[string]string{}
+	}
+	disabledTools := resolveDisabledToolNames(settings)
 
 	toolDefinitions := s.toolManager.GetDefinitions()
 	logging.Debug("handleListBuiltInSkills: Got %d tool definitions", len(toolDefinitions))
@@ -101,11 +107,17 @@ func (s *Server) handleListBuiltInSkills(w http.ResponseWriter, r *http.Request)
 			Name:        definition.Name,
 			Kind:        "tool",
 			Description: strings.TrimSpace(definition.Description),
+			Enabled:     !isToolDisabled(definition.Name, disabledTools),
 		})
 	}
 	logging.Debug("handleListBuiltInSkills: Returning %d built-in skills", len(skills))
 
 	s.jsonResponse(w, http.StatusOK, BuiltInSkillResponse{Skills: skills})
+}
+
+func isToolDisabled(toolName string, disabledTools map[string]struct{}) bool {
+	_, disabled := disabledTools[strings.TrimSpace(toolName)]
+	return disabled
 }
 
 func (s *Server) handleListIntegrationBackedSkills(w http.ResponseWriter, r *http.Request) {

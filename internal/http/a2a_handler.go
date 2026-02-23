@@ -45,8 +45,8 @@ func (s *Server) handleAgentCard(w http.ResponseWriter, r *http.Request) {
 
 	// Get tools from tool manager
 	var agentTools []AgentTool
-	if s.toolManager != nil {
-		toolDefs := s.toolManager.GetDefinitions()
+	if manager := s.toolManagerForSession(nil); manager != nil {
+		toolDefs := manager.GetDefinitions()
 		agentTools = make([]AgentTool, len(toolDefs))
 		for i, def := range toolDefs {
 			agentTools[i] = AgentTool{
