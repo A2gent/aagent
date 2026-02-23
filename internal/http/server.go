@@ -112,13 +112,20 @@ func (s *Server) toolManagerForSession(sess *session.Session) *tools.Manager {
 	disabledTools := resolveDisabledToolNames(settings)
 
 	// Check if session uses a sub-agent with tool filtering
+	isSubAgentSession := false
 	var subAgentEnabledTools []string
 	if sess != nil && sess.Metadata != nil {
 		if saID, ok := sess.Metadata["sub_agent_id"].(string); ok && saID != "" {
+			isSubAgentSession = true
 			if sa, saErr := s.store.GetSubAgent(saID); saErr == nil && len(sa.EnabledTools) > 0 {
 				subAgentEnabledTools = sa.EnabledTools
 			}
 		}
+	}
+	// Sub-agent sessions must not inherit the main-agent disabled tool list.
+	// Their available tools are controlled by the sub-agent config itself.
+	if isSubAgentSession {
+		disabledTools = map[string]struct{}{}
 	}
 
 	defaultDir := strings.TrimSpace(s.config.WorkDir)
