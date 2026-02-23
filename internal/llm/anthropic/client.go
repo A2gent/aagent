@@ -173,6 +173,7 @@ type anthropicMessage struct {
 type contentBlock struct {
 	Type      string `json:"type"`
 	Text      string `json:"text,omitempty"`
+	Source    any    `json:"source,omitempty"`
 	ID        string `json:"id,omitempty"`
 	Name      string `json:"name,omitempty"`
 	Input     any    `json:"input,omitempty"`
@@ -412,6 +413,10 @@ func (c *Client) Chat(ctx context.Context, request *llm.ChatRequest) (*llm.ChatR
 		switch block.Type {
 		case "text":
 			textParts = append(textParts, block.Text)
+		case "image":
+			if img := contentBlockToImage(block); img != nil {
+				response.Images = append(response.Images, *img)
+			}
 		case "tool_use":
 			inputJSON, _ := json.Marshal(block.Input)
 			response.ToolCalls = append(response.ToolCalls, llm.ToolCall{
@@ -627,6 +632,28 @@ func (c *Client) ChatStream(ctx context.Context, request *llm.ChatRequest, onEve
 
 // convertMessage converts an LLM message to Anthropic format
 func (c *Client) convertMessage(msg llm.Message) anthropicMessage {
+	if msg.Role == "user" && len(msg.Images) > 0 {
+		blocks := make([]contentBlock, 0, len(msg.Images)+1)
+		if strings.TrimSpace(msg.Content) != "" {
+			blocks = append(blocks, contentBlock{
+				Type: "text",
+				Text: msg.Content,
+			})
+		}
+		for _, img := range msg.Images {
+			if block := llmImageToAnthropicBlock(img); block != nil {
+				blocks = append(blocks, *block)
+			}
+		}
+		if len(blocks) == 0 {
+			return anthropicMessage{Role: msg.Role, Content: msg.Content}
+		}
+		return anthropicMessage{
+			Role:    msg.Role,
+			Content: blocks,
+		}
+	}
+
 	if msg.Role == "tool" {
 		// Tool results need special handling
 		blocks := make([]contentBlock, 0, len(msg.ToolResults))
@@ -721,6 +748,56 @@ func (c *Client) convertMessage(msg llm.Message) anthropicMessage {
 	return anthropicMessage{
 		Role:    msg.Role,
 		Content: msg.Content,
+	}
+}
+
+func llmImageToAnthropicBlock(img llm.Image) *contentBlock {
+	mediaType := strings.TrimSpace(img.MediaType)
+	dataBase64 := strings.TrimSpace(img.DataBase64)
+	if mediaType == "" {
+		mediaType = "image/png"
+	}
+	if dataBase64 == "" {
+		if dataURL := strings.TrimSpace(img.URL); strings.HasPrefix(strings.ToLower(dataURL), "data:") {
+			dataPartIdx := strings.Index(dataURL, ",")
+			if dataPartIdx > 0 {
+				header := dataURL[:dataPartIdx]
+				if strings.HasPrefix(strings.ToLower(header), "data:") {
+					if semi := strings.Index(header, ";"); semi > 5 {
+						mediaType = header[5:semi]
+					}
+				}
+				dataBase64 = dataURL[dataPartIdx+1:]
+			}
+		}
+	}
+	if dataBase64 == "" {
+		return nil
+	}
+	return &contentBlock{
+		Type: "image",
+		Source: map[string]interface{}{
+			"type":       "base64",
+			"media_type": mediaType,
+			"data":       dataBase64,
+		},
+	}
+}
+
+func contentBlockToImage(block contentBlock) *llm.Image {
+	sourceMap, ok := block.Source.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	mediaType := strings.TrimSpace(asString(sourceMap["media_type"]))
+	dataBase64 := strings.TrimSpace(asString(sourceMap["data"]))
+	if mediaType == "" && dataBase64 == "" {
+		return nil
+	}
+	return &llm.Image{
+		MediaType:  mediaType,
+		DataBase64: dataBase64,
+		URL:        llm.Image{MediaType: mediaType, DataBase64: dataBase64}.DataURL(),
 	}
 }
 

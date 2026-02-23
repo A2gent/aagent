@@ -436,12 +436,13 @@ func (s *Server) Run(ctx context.Context) error {
 
 // CreateSessionRequest represents a request to create a new session
 type CreateSessionRequest struct {
-	AgentID   string `json:"agent_id"`
-	Task      string `json:"task,omitempty"`
-	Provider  string `json:"provider,omitempty"`
-	Model     string `json:"model,omitempty"`
-	ProjectID string `json:"project_id,omitempty"`
-	Queued    bool   `json:"queued,omitempty"` // If true, create session without starting it
+	AgentID   string                `json:"agent_id"`
+	Task      string                `json:"task,omitempty"`
+	Images    []MessageImagePayload `json:"images,omitempty"`
+	Provider  string                `json:"provider,omitempty"`
+	Model     string                `json:"model,omitempty"`
+	ProjectID string                `json:"project_id,omitempty"`
+	Queued    bool                  `json:"queued,omitempty"` // If true, create session without starting it
 }
 
 // CreateSessionResponse represents a response after creating a session
@@ -520,12 +521,20 @@ type SystemPromptBlockSnapshotPayload struct {
 type MessageResponse struct {
 	Role         string                 `json:"role"`
 	Content      string                 `json:"content"`
+	Images       []MessageImagePayload  `json:"images,omitempty"`
 	ToolCalls    []ToolCallResponse     `json:"tool_calls,omitempty"`
 	ToolResults  []ToolResultResponse   `json:"tool_results,omitempty"`
 	Metadata     map[string]interface{} `json:"metadata,omitempty"`
 	Timestamp    time.Time              `json:"timestamp"`
 	InputTokens  int                    `json:"input_tokens,omitempty"`
 	OutputTokens int                    `json:"output_tokens,omitempty"`
+}
+
+type MessageImagePayload struct {
+	Name       string `json:"name,omitempty"`
+	MediaType  string `json:"media_type,omitempty"`
+	DataBase64 string `json:"data_base64,omitempty"`
+	URL        string `json:"url,omitempty"`
 }
 
 // ToolCallResponse represents a tool call
@@ -549,7 +558,8 @@ type ToolResultResponse struct {
 
 // ChatRequest represents a chat message request
 type ChatRequest struct {
-	Message string `json:"message"`
+	Message string                `json:"message"`
+	Images  []MessageImagePayload `json:"images,omitempty"`
 }
 
 // ChatResponse represents a chat response
@@ -1427,6 +1437,11 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if req.AgentID == "" {
 		req.AgentID = "build" // Default agent
 	}
+	images, imagesErr := normalizeIncomingImages(req.Images)
+	if imagesErr != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid images payload: "+imagesErr.Error())
+		return
+	}
 	req.ProjectID = strings.TrimSpace(req.ProjectID)
 	if req.ProjectID != "" {
 		if _, err := s.store.GetProject(req.ProjectID); err != nil {
@@ -1448,11 +1463,11 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If an initial task is provided, add it as the first message
-	if req.Task != "" {
-		sess.AddUserMessage(req.Task)
+	// If an initial task/images are provided, add them as the first message.
+	if req.Task != "" || len(images) > 0 {
+		sess.AddUserMessageWithImages(req.Task, images)
 		// Repeat initial prompt if enabled and under 600 characters
-		if len(req.Task) < 600 {
+		if req.Task != "" && len(images) == 0 && len(req.Task) < 600 {
 			settings, err := s.store.GetSettings()
 			if err == nil {
 				repeatEnabled := strings.TrimSpace(settings[repeatInitialPromptSettingKey])
@@ -1891,8 +1906,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Message == "" {
-		s.errorResponse(w, http.StatusBadRequest, "Message is required")
+	images, err := normalizeIncomingImages(req.Images)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid images payload: "+err.Error())
+		return
+	}
+
+	if strings.TrimSpace(req.Message) == "" && len(images) == 0 {
+		s.errorResponse(w, http.StatusBadRequest, "Message or images are required")
 		return
 	}
 
@@ -1905,7 +1926,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	defer s.queueTelegramSessionMessageSync(sess.ID)
 
 	// Add user message to session
-	sess.AddUserMessage(req.Message)
+	sess.AddUserMessageWithImages(req.Message, images)
 	sess.SetStatus(session.StatusRunning)
 	if err := s.sessionManager.Save(sess); err != nil {
 		s.errorResponse(w, http.StatusInternalServerError, "Failed to update session: "+err.Error())
@@ -1921,7 +1942,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	providerType := s.resolveSessionProviderType(sess)
 	model := s.resolveSessionModel(sess, providerType)
-	target, err := s.resolveExecutionTarget(runCtx, providerType, model, req.Message, sess)
+	routingPrompt := messageForRouting(req.Message, len(images))
+	target, err := s.resolveExecutionTarget(runCtx, providerType, model, routingPrompt, sess)
 	if err != nil {
 		sess.AddAssistantMessage(fmt.Sprintf("Unable to start request: %s", err.Error()), nil)
 		sess.SetStatus(session.StatusFailed)
@@ -1993,8 +2015,14 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Message == "" {
-		s.errorResponse(w, http.StatusBadRequest, "Message is required")
+	images, err := normalizeIncomingImages(req.Images)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid images payload: "+err.Error())
+		return
+	}
+
+	if strings.TrimSpace(req.Message) == "" && len(images) == 0 {
+		s.errorResponse(w, http.StatusBadRequest, "Message or images are required")
 		return
 	}
 
@@ -2013,8 +2041,8 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	if lastUserMsg != req.Message {
-		sess.AddUserMessage(req.Message)
+	if lastUserMsg != req.Message || !sameMessageImages(lastUserMessageImages(sess), images) {
+		sess.AddUserMessageWithImages(req.Message, images)
 	}
 	sess.SetStatus(session.StatusRunning)
 	if err := s.sessionManager.Save(sess); err != nil {
@@ -2031,7 +2059,8 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 
 	providerType := s.resolveSessionProviderType(sess)
 	model := s.resolveSessionModel(sess, providerType)
-	target, err := s.resolveExecutionTarget(runCtx, providerType, model, req.Message, sess)
+	routingPrompt := messageForRouting(req.Message, len(images))
+	target, err := s.resolveExecutionTarget(runCtx, providerType, model, routingPrompt, sess)
 	if err != nil {
 		sess.AddAssistantMessage(fmt.Sprintf("Unable to start request: %s", err.Error()), nil)
 		sess.SetStatus(session.StatusFailed)
@@ -2802,6 +2831,7 @@ func (s *Server) messagesToResponse(messages []session.Message) []MessageRespons
 		msg := MessageResponse{
 			Role:      m.Role,
 			Content:   m.Content,
+			Images:    sessionImagesToPayload(m.Images),
 			Metadata:  m.Metadata,
 			Timestamp: m.Timestamp,
 		}
@@ -2834,6 +2864,102 @@ func (s *Server) messagesToResponse(messages []session.Message) []MessageRespons
 		resp[i] = msg
 	}
 	return resp
+}
+
+func normalizeIncomingImages(images []MessageImagePayload) ([]session.ImageAttachment, error) {
+	if len(images) == 0 {
+		return nil, nil
+	}
+	const maxImages = 8
+	if len(images) > maxImages {
+		return nil, fmt.Errorf("too many images: max %d", maxImages)
+	}
+	out := make([]session.ImageAttachment, 0, len(images))
+	for idx, raw := range images {
+		img := session.ImageAttachment{
+			Name:       strings.TrimSpace(raw.Name),
+			MediaType:  strings.TrimSpace(raw.MediaType),
+			DataBase64: strings.TrimSpace(raw.DataBase64),
+			URL:        strings.TrimSpace(raw.URL),
+		}
+		if img.DataBase64 == "" && img.URL == "" {
+			return nil, fmt.Errorf("image %d has neither data_base64 nor url", idx+1)
+		}
+		if img.MediaType == "" && strings.HasPrefix(strings.ToLower(img.URL), "data:") {
+			parts := strings.SplitN(img.URL, ";", 2)
+			if len(parts) > 0 {
+				img.MediaType = strings.TrimPrefix(parts[0], "data:")
+			}
+		}
+		if img.MediaType == "" {
+			img.MediaType = "image/png"
+		}
+		if img.DataBase64 != "" && len(img.DataBase64) > 15*1024*1024 {
+			return nil, fmt.Errorf("image %d payload too large", idx+1)
+		}
+		out = append(out, img)
+	}
+	return out, nil
+}
+
+func sessionImagesToPayload(images []session.ImageAttachment) []MessageImagePayload {
+	if len(images) == 0 {
+		return nil
+	}
+	out := make([]MessageImagePayload, 0, len(images))
+	for _, img := range images {
+		out = append(out, MessageImagePayload{
+			Name:       img.Name,
+			MediaType:  img.MediaType,
+			DataBase64: img.DataBase64,
+			URL:        img.URL,
+		})
+	}
+	return out
+}
+
+func lastUserMessageImages(sess *session.Session) []session.ImageAttachment {
+	if sess == nil {
+		return nil
+	}
+	for i := len(sess.Messages) - 1; i >= 0; i-- {
+		if sess.Messages[i].Role == "user" {
+			return sess.Messages[i].Images
+		}
+	}
+	return nil
+}
+
+func sameMessageImages(a, b []session.ImageAttachment) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if strings.TrimSpace(a[i].Name) != strings.TrimSpace(b[i].Name) {
+			return false
+		}
+		if strings.TrimSpace(a[i].MediaType) != strings.TrimSpace(b[i].MediaType) {
+			return false
+		}
+		if strings.TrimSpace(a[i].DataBase64) != strings.TrimSpace(b[i].DataBase64) {
+			return false
+		}
+		if strings.TrimSpace(a[i].URL) != strings.TrimSpace(b[i].URL) {
+			return false
+		}
+	}
+	return true
+}
+
+func messageForRouting(text string, imageCount int) string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed != "" {
+		return trimmed
+	}
+	if imageCount > 0 {
+		return fmt.Sprintf("[User sent %d image(s)]", imageCount)
+	}
+	return ""
 }
 
 func (s *Server) jsonResponse(w http.ResponseWriter, status int, data interface{}) {

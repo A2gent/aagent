@@ -77,7 +77,7 @@ type openAIRequest struct {
 
 type openAIMessage struct {
 	Role       string           `json:"role"`
-	Content    string           `json:"content,omitempty"`
+	Content    any              `json:"content,omitempty"`
 	ToolCalls  []openAIToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string           `json:"tool_call_id,omitempty"`
 }
@@ -294,8 +294,10 @@ func (c *Client) Chat(ctx context.Context, request *llm.ChatRequest) (*llm.ChatR
 	}
 
 	choice := oaiResp.Choices[0]
+	responseText, responseImages := parseOpenAIContent(choice.Message.Content)
 	response := &llm.ChatResponse{
-		Content:    choice.Message.Content,
+		Content:    responseText,
+		Images:     responseImages,
 		StopReason: choice.FinishReason,
 		Usage: llm.TokenUsage{
 			InputTokens:  oaiResp.Usage.PromptTokens,
@@ -575,10 +577,98 @@ func (c *Client) convertMessage(msg llm.Message) []openAIMessage {
 	}
 
 	// Simple text message
+	if msg.Role == "user" && len(msg.Images) > 0 {
+		return []openAIMessage{{
+			Role:    msg.Role,
+			Content: buildOpenAIUserContent(msg.Content, msg.Images),
+		}}
+	}
 	return []openAIMessage{{
 		Role:    msg.Role,
 		Content: msg.Content,
 	}}
+}
+
+func buildOpenAIUserContent(text string, images []llm.Image) []map[string]interface{} {
+	parts := make([]map[string]interface{}, 0, len(images)+1)
+	if strings.TrimSpace(text) != "" {
+		parts = append(parts, map[string]interface{}{
+			"type": "text",
+			"text": text,
+		})
+	}
+	for _, img := range images {
+		url := strings.TrimSpace(img.URL)
+		if url == "" {
+			url = img.DataURL()
+		}
+		if url == "" {
+			continue
+		}
+		parts = append(parts, map[string]interface{}{
+			"type": "image_url",
+			"image_url": map[string]interface{}{
+				"url": url,
+			},
+		})
+	}
+	if len(parts) == 0 && strings.TrimSpace(text) != "" {
+		parts = append(parts, map[string]interface{}{
+			"type": "text",
+			"text": text,
+		})
+	}
+	return parts
+}
+
+func parseOpenAIContent(content any) (string, []llm.Image) {
+	switch v := content.(type) {
+	case string:
+		return v, nil
+	case []interface{}:
+		return parseOpenAIContentParts(v)
+	default:
+		return "", nil
+	}
+}
+
+func parseOpenAIContentParts(parts []interface{}) (string, []llm.Image) {
+	var builder strings.Builder
+	images := make([]llm.Image, 0)
+	for _, raw := range parts {
+		part, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		partType := strings.TrimSpace(asString(part["type"]))
+		switch partType {
+		case "text", "output_text", "input_text":
+			text := asString(part["text"])
+			if text != "" {
+				if builder.Len() > 0 {
+					builder.WriteString("\n")
+				}
+				builder.WriteString(text)
+			}
+		case "image_url", "output_image":
+			imageURL := ""
+			if imageObj, ok := part["image_url"].(map[string]interface{}); ok {
+				imageURL = strings.TrimSpace(asString(imageObj["url"]))
+			}
+			if imageURL == "" {
+				imageURL = strings.TrimSpace(asString(part["url"]))
+			}
+			if imageURL != "" {
+				images = append(images, llm.Image{URL: imageURL})
+			}
+		}
+	}
+	return builder.String(), images
+}
+
+func asString(v interface{}) string {
+	s, _ := v.(string)
+	return s
 }
 
 // Ensure Client implements llm.Client

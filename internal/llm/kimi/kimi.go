@@ -56,7 +56,7 @@ type kimiRequest struct {
 
 type kimiMessage struct {
 	Role       string         `json:"role"`
-	Content    string         `json:"content"`
+	Content    any            `json:"content"`
 	ToolCalls  []kimiToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string         `json:"tool_call_id,omitempty"`
 	Name       string         `json:"name,omitempty"`
@@ -223,8 +223,10 @@ func (c *Client) Chat(ctx context.Context, request *llm.ChatRequest) (*llm.ChatR
 	choice := kimiResp.Choices[0].Message
 
 	// Convert response
+	responseText, responseImages := parseKimiContent(choice.Content)
 	response := &llm.ChatResponse{
-		Content: choice.Content,
+		Content: responseText,
+		Images:  responseImages,
 		Usage: llm.TokenUsage{
 			InputTokens:  kimiResp.Usage.PromptTokens,
 			OutputTokens: kimiResp.Usage.CompletionTokens,
@@ -465,10 +467,92 @@ func (c *Client) convertMessage(msg llm.Message) []kimiMessage {
 	}
 
 	// Simple text message
+	if msg.Role == "user" && len(msg.Images) > 0 {
+		return []kimiMessage{{
+			Role:    msg.Role,
+			Content: buildKimiUserContent(msg.Content, msg.Images),
+		}}
+	}
 	return []kimiMessage{{
 		Role:    msg.Role,
 		Content: msg.Content,
 	}}
+}
+
+func buildKimiUserContent(text string, images []llm.Image) []map[string]interface{} {
+	parts := make([]map[string]interface{}, 0, len(images)+1)
+	if strings.TrimSpace(text) != "" {
+		parts = append(parts, map[string]interface{}{
+			"type": "text",
+			"text": text,
+		})
+	}
+	for _, img := range images {
+		url := strings.TrimSpace(img.URL)
+		if url == "" {
+			url = img.DataURL()
+		}
+		if url == "" {
+			continue
+		}
+		parts = append(parts, map[string]interface{}{
+			"type": "image_url",
+			"image_url": map[string]interface{}{
+				"url": url,
+			},
+		})
+	}
+	return parts
+}
+
+func parseKimiContent(content any) (string, []llm.Image) {
+	switch v := content.(type) {
+	case string:
+		return v, nil
+	case []interface{}:
+		return parseKimiContentParts(v)
+	default:
+		return "", nil
+	}
+}
+
+func parseKimiContentParts(parts []interface{}) (string, []llm.Image) {
+	var builder strings.Builder
+	images := make([]llm.Image, 0)
+	for _, raw := range parts {
+		part, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		partType := strings.TrimSpace(kimiAsString(part["type"]))
+		switch partType {
+		case "text", "output_text", "input_text":
+			text := kimiAsString(part["text"])
+			if text != "" {
+				if builder.Len() > 0 {
+					builder.WriteString("\n")
+				}
+				builder.WriteString(text)
+			}
+		case "image_url", "output_image":
+			imageURL := ""
+			if imageObj, ok := part["image_url"].(map[string]interface{}); ok {
+				imageURL = strings.TrimSpace(kimiAsString(imageObj["url"]))
+			}
+			if imageURL == "" {
+				imageURL = strings.TrimSpace(kimiAsString(part["url"]))
+			}
+			if imageURL != "" {
+				images = append(images, llm.Image{URL: imageURL})
+			}
+		}
+	}
+	return builder.String(), images
+}
+
+func kimiAsString(v interface{}) string {
+	s, _ := v.(string)
+	return s
 }
 
 // Ensure Client implements llm.Client

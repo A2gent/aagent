@@ -41,7 +41,7 @@ type responsesRequest struct {
 type responsesInputItem struct {
 	Type      string                 `json:"type,omitempty"`
 	Role      string                 `json:"role,omitempty"`
-	Content   []responsesInputText   `json:"content,omitempty"`
+	Content   []responsesInputPart   `json:"content,omitempty"`
 	CallID    string                 `json:"call_id,omitempty"`
 	Name      string                 `json:"name,omitempty"`
 	Arguments string                 `json:"arguments,omitempty"`
@@ -49,9 +49,10 @@ type responsesInputItem struct {
 	Metadata  map[string]interface{} `json:"metadata,omitempty"`
 }
 
-type responsesInputText struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+type responsesInputPart struct {
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	ImageURL string `json:"image_url,omitempty"`
 }
 
 type responsesTool struct {
@@ -84,8 +85,9 @@ type responsesOutputItem struct {
 	Arguments string `json:"arguments,omitempty"`
 	Role      string `json:"role,omitempty"`
 	Content   []struct {
-		Type string `json:"type"`
-		Text string `json:"text,omitempty"`
+		Type     string `json:"type"`
+		Text     string `json:"text,omitempty"`
+		ImageURL string `json:"image_url,omitempty"`
 	} `json:"content,omitempty"`
 }
 
@@ -327,6 +329,11 @@ func parseResponseObject(parsed responsesResponse) (*llm.ChatResponse, error) {
 				switch block.Type {
 				case "output_text", "text", "input_text":
 					contentBuilder.WriteString(block.Text)
+				case "output_image", "image":
+					imageURL := strings.TrimSpace(block.ImageURL)
+					if imageURL != "" {
+						result.Images = append(result.Images, llm.Image{URL: imageURL})
+					}
 				}
 			}
 		case "function_call":
@@ -371,7 +378,7 @@ func buildInputItems(messages []llm.Message) []responsesInputItem {
 				items = append(items, responsesInputItem{
 					Type: "message",
 					Role: "assistant",
-					Content: []responsesInputText{
+					Content: []responsesInputPart{
 						{Type: "output_text", Text: content},
 					},
 				})
@@ -385,15 +392,30 @@ func buildInputItems(messages []llm.Message) []responsesInputItem {
 				})
 			}
 		default:
-			if content == "" {
+			if content == "" && len(msg.Images) == 0 {
+				continue
+			}
+			parts := make([]responsesInputPart, 0, len(msg.Images)+1)
+			if content != "" {
+				parts = append(parts, responsesInputPart{Type: "input_text", Text: content})
+			}
+			for _, img := range msg.Images {
+				url := strings.TrimSpace(img.URL)
+				if url == "" {
+					url = img.DataURL()
+				}
+				if url == "" {
+					continue
+				}
+				parts = append(parts, responsesInputPart{Type: "input_image", ImageURL: url})
+			}
+			if len(parts) == 0 {
 				continue
 			}
 			items = append(items, responsesInputItem{
-				Type: "message",
-				Role: role,
-				Content: []responsesInputText{
-					{Type: "input_text", Text: content},
-				},
+				Type:    "message",
+				Role:    role,
+				Content: parts,
 			})
 		}
 	}

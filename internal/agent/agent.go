@@ -242,7 +242,7 @@ func (a *Agent) loop(ctx context.Context, sess *session.Session, onEvent func(Ev
 			if finalContent == "" {
 				finalContent = a.fallbackAssistantContentFromRecentTools(sess)
 			}
-			sess.AddAssistantMessage(finalContent, nil)
+			sess.AddAssistantMessageWithImagesAndMetadata(finalContent, llmImagesToSession(response.Images), nil, nil)
 			sess.SetStatus(session.StatusCompleted)
 			a.sessionManager.Save(sess)
 			if onEvent != nil {
@@ -269,7 +269,7 @@ func (a *Agent) loop(ctx context.Context, sess *session.Session, onEvent func(Ev
 		}
 
 		// Add assistant message with tool calls
-		sess.AddAssistantMessage(response.Content, sessionToolCalls)
+		sess.AddAssistantMessageWithImagesAndMetadata(response.Content, llmImagesToSession(response.Images), sessionToolCalls, nil)
 
 		// Execute tools
 		if onEvent != nil {
@@ -420,6 +420,7 @@ func (a *Agent) buildRequest(sess *session.Session) *llm.ChatRequest {
 		msg := llm.Message{
 			Role:    m.Role,
 			Content: m.Content,
+			Images:  sessionImagesToLLM(m.Images),
 		}
 
 		// Convert tool calls
@@ -469,6 +470,7 @@ func (a *Agent) buildCompactionRequest(sess *session.Session, prompt string) *ll
 		msg := llm.Message{
 			Role:    m.Role,
 			Content: m.Content,
+			Images:  sessionImagesToLLM(m.Images),
 		}
 
 		if len(m.ToolCalls) > 0 {
@@ -904,6 +906,38 @@ func metadataSetString(sess *session.Session, key string, value string) {
 		sess.Metadata = map[string]interface{}{}
 	}
 	sess.Metadata[key] = value
+}
+
+func sessionImagesToLLM(images []session.ImageAttachment) []llm.Image {
+	if len(images) == 0 {
+		return nil
+	}
+	out := make([]llm.Image, 0, len(images))
+	for _, img := range images {
+		out = append(out, llm.Image{
+			Name:       img.Name,
+			MediaType:  img.MediaType,
+			DataBase64: img.DataBase64,
+			URL:        img.URL,
+		})
+	}
+	return out
+}
+
+func llmImagesToSession(images []llm.Image) []session.ImageAttachment {
+	if len(images) == 0 {
+		return nil
+	}
+	out := make([]session.ImageAttachment, 0, len(images))
+	for _, img := range images {
+		out = append(out, session.ImageAttachment{
+			Name:       img.Name,
+			MediaType:  img.MediaType,
+			DataBase64: img.DataBase64,
+			URL:        img.URL,
+		})
+	}
+	return out
 }
 
 // DefaultSystemPrompt returns the built-in baseline system prompt.

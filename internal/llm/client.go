@@ -28,8 +28,17 @@ type ChatRequest struct {
 type Message struct {
 	Role        string       `json:"role"` // "user", "assistant", "tool"
 	Content     string       `json:"content"`
+	Images      []Image      `json:"images,omitempty"`
 	ToolCalls   []ToolCall   `json:"tool_calls,omitempty"`
 	ToolResults []ToolResult `json:"tool_results,omitempty"`
+}
+
+// Image represents an image attachment passed to/from an LLM.
+type Image struct {
+	Name       string `json:"name,omitempty"`
+	MediaType  string `json:"media_type,omitempty"`
+	DataBase64 string `json:"data_base64,omitempty"`
+	URL        string `json:"url,omitempty"`
 }
 
 // ToolCall represents a tool invocation
@@ -59,6 +68,7 @@ type ToolDefinition struct {
 // ChatResponse represents a chat completion response
 type ChatResponse struct {
 	Content    string
+	Images     []Image
 	ToolCalls  []ToolCall
 	Usage      TokenUsage
 	StopReason string

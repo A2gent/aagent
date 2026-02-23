@@ -56,7 +56,7 @@ type geminiRequest struct {
 
 type geminiMessage struct {
 	Role       string           `json:"role"`
-	Content    string           `json:"content,omitempty"`
+	Content    any              `json:"content,omitempty"`
 	ToolCalls  []geminiToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string           `json:"tool_call_id,omitempty"`
 	Name       string           `json:"name,omitempty"` // Function name for tool results
@@ -265,8 +265,10 @@ func (c *Client) Chat(ctx context.Context, request *llm.ChatRequest) (*llm.ChatR
 	}
 
 	choice := geminiResp.Choices[0]
+	responseText, responseImages := parseGeminiContent(choice.Message.Content)
 	response := &llm.ChatResponse{
-		Content:    choice.Message.Content,
+		Content:    responseText,
+		Images:     responseImages,
 		StopReason: choice.FinishReason,
 		Usage: llm.TokenUsage{
 			InputTokens:  geminiResp.Usage.PromptTokens,
@@ -541,10 +543,92 @@ func (c *Client) convertMessage(msg llm.Message) []geminiMessage {
 	}
 
 	// Simple text message
+	if msg.Role == "user" && len(msg.Images) > 0 {
+		return []geminiMessage{{
+			Role:    msg.Role,
+			Content: buildGeminiUserContent(msg.Content, msg.Images),
+		}}
+	}
 	return []geminiMessage{{
 		Role:    msg.Role,
 		Content: msg.Content,
 	}}
+}
+
+func buildGeminiUserContent(text string, images []llm.Image) []map[string]interface{} {
+	parts := make([]map[string]interface{}, 0, len(images)+1)
+	if strings.TrimSpace(text) != "" {
+		parts = append(parts, map[string]interface{}{
+			"type": "text",
+			"text": text,
+		})
+	}
+	for _, img := range images {
+		url := strings.TrimSpace(img.URL)
+		if url == "" {
+			url = img.DataURL()
+		}
+		if url == "" {
+			continue
+		}
+		parts = append(parts, map[string]interface{}{
+			"type": "image_url",
+			"image_url": map[string]interface{}{
+				"url": url,
+			},
+		})
+	}
+	return parts
+}
+
+func parseGeminiContent(content any) (string, []llm.Image) {
+	switch v := content.(type) {
+	case string:
+		return v, nil
+	case []interface{}:
+		return parseGeminiContentParts(v)
+	default:
+		return "", nil
+	}
+}
+
+func parseGeminiContentParts(parts []interface{}) (string, []llm.Image) {
+	var builder strings.Builder
+	images := make([]llm.Image, 0)
+	for _, raw := range parts {
+		part, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		partType := strings.TrimSpace(geminiAsString(part["type"]))
+		switch partType {
+		case "text", "output_text", "input_text":
+			text := geminiAsString(part["text"])
+			if text != "" {
+				if builder.Len() > 0 {
+					builder.WriteString("\n")
+				}
+				builder.WriteString(text)
+			}
+		case "image_url", "output_image":
+			imageURL := ""
+			if imageObj, ok := part["image_url"].(map[string]interface{}); ok {
+				imageURL = strings.TrimSpace(geminiAsString(imageObj["url"]))
+			}
+			if imageURL == "" {
+				imageURL = strings.TrimSpace(geminiAsString(part["url"]))
+			}
+			if imageURL != "" {
+				images = append(images, llm.Image{URL: imageURL})
+			}
+		}
+	}
+	return builder.String(), images
+}
+
+func geminiAsString(v interface{}) string {
+	s, _ := v.(string)
+	return s
 }
 
 func (c *Client) convertMessages(messages []llm.Message) []geminiMessage {
