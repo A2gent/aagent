@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/A2gent/brute/internal/agent"
 	"github.com/A2gent/brute/internal/config"
 	"github.com/A2gent/brute/internal/jobs"
@@ -22,6 +21,7 @@ import (
 	"github.com/A2gent/brute/internal/session"
 	"github.com/A2gent/brute/internal/storage"
 	"github.com/A2gent/brute/internal/tools"
+	"github.com/google/uuid"
 	"github.com/robfig/cron/v3"
 )
 
@@ -37,11 +37,12 @@ type Scheduler struct {
 	toolManager    *tools.Manager
 	config         *config.Config
 
-	ticker   *time.Ticker
-	stopChan chan struct{}
-	wg       sync.WaitGroup
-	mu       sync.Mutex
-	running  bool
+	ticker      *time.Ticker
+	stopChan    chan struct{}
+	wg          sync.WaitGroup
+	mu          sync.Mutex
+	running     bool
+	runningJobs map[string]struct{}
 }
 
 // NewScheduler creates a new scheduler instance
@@ -59,6 +60,7 @@ func NewScheduler(
 		toolManager:    toolManager,
 		config:         cfg,
 		stopChan:       make(chan struct{}),
+		runningJobs:    make(map[string]struct{}),
 	}
 }
 
@@ -128,10 +130,24 @@ func (s *Scheduler) checkAndRunDueJobs(ctx context.Context) {
 	logging.Info("Found %d due job(s) to execute", len(jobs))
 
 	for _, job := range jobs {
+		s.mu.Lock()
+		if _, ok := s.runningJobs[job.ID]; ok {
+			s.mu.Unlock()
+			logging.Info("Skipping due job %s (%s): execution already in progress", job.Name, job.ID)
+			continue
+		}
+		s.runningJobs[job.ID] = struct{}{}
+		s.mu.Unlock()
+
 		// Run each job in a separate goroutine
 		s.wg.Add(1)
 		go func(job *storage.RecurringJob) {
-			defer s.wg.Done()
+			defer func() {
+				s.mu.Lock()
+				delete(s.runningJobs, job.ID)
+				s.mu.Unlock()
+				s.wg.Done()
+			}()
 			s.executeJob(ctx, job)
 		}(job)
 	}
@@ -141,6 +157,7 @@ func (s *Scheduler) checkAndRunDueJobs(ctx context.Context) {
 func (s *Scheduler) executeJob(ctx context.Context, job *storage.RecurringJob) {
 	logging.Info("Executing job: %s (%s)", job.Name, job.ID)
 	now := time.Now()
+	defer s.rescheduleJobAfterAttempt(job, now)
 
 	// Create execution record
 	exec := &storage.JobExecution{
@@ -249,17 +266,21 @@ func (s *Scheduler) executeJob(ctx context.Context, job *storage.RecurringJob) {
 		logging.Error("Failed to update execution record for job %s: %v", job.ID, err)
 	}
 
-	// Update job's last run time and calculate next run
-	job.LastRunAt = &now
-	nextRun, err := s.calculateNextRun(job.ScheduleCron, now)
+}
+
+func (s *Scheduler) rescheduleJobAfterAttempt(job *storage.RecurringJob, attemptedAt time.Time) {
+	job.LastRunAt = &attemptedAt
+	nextRun, err := s.calculateNextRun(job.ScheduleCron, attemptedAt)
 	if err == nil {
 		job.NextRunAt = &nextRun
 		logging.Info("Job %s next run scheduled for: %s", job.Name, nextRun.Format(time.RFC3339))
+	} else {
+		logging.Error("Failed to calculate next run for job %s: %v", job.ID, err)
 	}
-	job.UpdatedAt = now
+	job.UpdatedAt = time.Now()
 
 	if err := s.store.SaveJob(job); err != nil {
-		logging.Error("Failed to update job %s after execution: %v", job.ID, err)
+		logging.Error("Failed to update job %s after execution attempt: %v", job.ID, err)
 	}
 }
 
