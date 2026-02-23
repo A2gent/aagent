@@ -171,6 +171,18 @@ func (s *SQLiteStore) migrate() error {
 		`ALTER TABLE projects ADD COLUMN folder TEXT`,
 		// Migration: Add task_progress column to sessions
 		`ALTER TABLE sessions ADD COLUMN task_progress TEXT`,
+		// Sub-agents table
+		`CREATE TABLE IF NOT EXISTS sub_agents (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			provider TEXT NOT NULL DEFAULT '',
+			model TEXT NOT NULL DEFAULT '',
+			enabled_tools TEXT NOT NULL DEFAULT '[]',
+			created_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL
+		)`,
+		// Migration: Add instruction_blocks column to sub_agents
+		`ALTER TABLE sub_agents ADD COLUMN instruction_blocks TEXT NOT NULL DEFAULT '[]'`,
 	}
 
 	for _, m := range migrations {
@@ -1212,6 +1224,105 @@ func (s *SQLiteStore) ListMCPServers() ([]*MCPServer, error) {
 // DeleteMCPServer deletes an MCP server by id.
 func (s *SQLiteStore) DeleteMCPServer(id string) error {
 	_, err := s.db.Exec(`DELETE FROM mcp_servers WHERE id = ?`, id)
+	return err
+}
+
+// --- Sub-Agents CRUD ---
+
+// SaveSubAgent saves a sub-agent to the database.
+func (s *SQLiteStore) SaveSubAgent(sa *SubAgent) error {
+	enabledToolsJSON, err := json.Marshal(sa.EnabledTools)
+	if err != nil {
+		return fmt.Errorf("failed to encode enabled tools: %w", err)
+	}
+	instrBlocks := sa.InstructionBlocks
+	if instrBlocks == "" {
+		instrBlocks = "[]"
+	}
+
+	_, err = s.db.Exec(`
+		INSERT INTO sub_agents (id, name, provider, model, enabled_tools, instruction_blocks, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			name = excluded.name,
+			provider = excluded.provider,
+			model = excluded.model,
+			enabled_tools = excluded.enabled_tools,
+			instruction_blocks = excluded.instruction_blocks,
+			updated_at = excluded.updated_at
+	`, sa.ID, sa.Name, sa.Provider, sa.Model, string(enabledToolsJSON), instrBlocks, sa.CreatedAt, sa.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("failed to save sub-agent: %w", err)
+	}
+	return nil
+}
+
+// GetSubAgent retrieves a sub-agent by ID.
+func (s *SQLiteStore) GetSubAgent(id string) (*SubAgent, error) {
+	var sa SubAgent
+	var enabledToolsJSON string
+
+	err := s.db.QueryRow(`
+		SELECT id, name, provider, model, enabled_tools, instruction_blocks, created_at, updated_at
+		FROM sub_agents WHERE id = ?
+	`, id).Scan(&sa.ID, &sa.Name, &sa.Provider, &sa.Model, &enabledToolsJSON, &sa.InstructionBlocks, &sa.CreatedAt, &sa.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("sub-agent not found: %s", id)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if enabledToolsJSON != "" {
+		if err := json.Unmarshal([]byte(enabledToolsJSON), &sa.EnabledTools); err != nil {
+			return nil, fmt.Errorf("failed to decode enabled tools: %w", err)
+		}
+	}
+	if sa.EnabledTools == nil {
+		sa.EnabledTools = []string{}
+	}
+
+	return &sa, nil
+}
+
+// ListSubAgents returns all sub-agents ordered by name.
+func (s *SQLiteStore) ListSubAgents() ([]*SubAgent, error) {
+	rows, err := s.db.Query(`
+		SELECT id, name, provider, model, enabled_tools, instruction_blocks, created_at, updated_at
+		FROM sub_agents
+		ORDER BY name COLLATE NOCASE ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var agents []*SubAgent
+	for rows.Next() {
+		var sa SubAgent
+		var enabledToolsJSON string
+		if err := rows.Scan(&sa.ID, &sa.Name, &sa.Provider, &sa.Model, &enabledToolsJSON, &sa.InstructionBlocks, &sa.CreatedAt, &sa.UpdatedAt); err != nil {
+			return nil, err
+		}
+
+		if enabledToolsJSON != "" {
+			if err := json.Unmarshal([]byte(enabledToolsJSON), &sa.EnabledTools); err != nil {
+				return nil, fmt.Errorf("failed to decode enabled tools: %w", err)
+			}
+		}
+		if sa.EnabledTools == nil {
+			sa.EnabledTools = []string{}
+		}
+
+		agents = append(agents, &sa)
+	}
+
+	return agents, nil
+}
+
+// DeleteSubAgent deletes a sub-agent by ID.
+func (s *SQLiteStore) DeleteSubAgent(id string) error {
+	_, err := s.db.Exec(`DELETE FROM sub_agents WHERE id = ?`, id)
 	return err
 }
 

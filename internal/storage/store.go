@@ -89,6 +89,18 @@ type MCPServer struct {
 	UpdatedAt           time.Time
 }
 
+// SubAgent represents a reusable sub-agent configuration.
+type SubAgent struct {
+	ID                string
+	Name              string
+	Provider          string   // LLM provider type (e.g., "anthropic", "openai")
+	Model             string   // Optional model override
+	EnabledTools      []string // Tool names to enable (empty = all tools)
+	InstructionBlocks string   // JSON-encoded instruction blocks array
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+}
+
 // Project represents a session grouping container optionally tied to a folder.
 type Project struct {
 	ID        string
@@ -141,6 +153,12 @@ type Store interface {
 	GetMCPServer(id string) (*MCPServer, error)
 	ListMCPServers() ([]*MCPServer, error)
 	DeleteMCPServer(id string) error
+
+	// Sub-agent operations
+	SaveSubAgent(sa *SubAgent) error
+	GetSubAgent(id string) (*SubAgent, error)
+	ListSubAgents() ([]*SubAgent, error)
+	DeleteSubAgent(id string) error
 
 	// Close closes the store
 	Close() error

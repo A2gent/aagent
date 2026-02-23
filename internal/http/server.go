@@ -111,11 +111,21 @@ func (s *Server) toolManagerForSession(sess *session.Session) *tools.Manager {
 	}
 	disabledTools := resolveDisabledToolNames(settings)
 
+	// Check if session uses a sub-agent with tool filtering
+	var subAgentEnabledTools []string
+	if sess != nil && sess.Metadata != nil {
+		if saID, ok := sess.Metadata["sub_agent_id"].(string); ok && saID != "" {
+			if sa, saErr := s.store.GetSubAgent(saID); saErr == nil && len(sa.EnabledTools) > 0 {
+				subAgentEnabledTools = sa.EnabledTools
+			}
+		}
+	}
+
 	defaultDir := strings.TrimSpace(s.config.WorkDir)
 	if defaultDir == "" {
 		defaultDir = "."
 	}
-	if workDir == defaultDir && len(disabledTools) == 0 {
+	if workDir == defaultDir && len(disabledTools) == 0 && len(subAgentEnabledTools) == 0 {
 		return s.toolManager
 	}
 
@@ -131,6 +141,24 @@ func (s *Server) toolManagerForSession(sess *session.Session) *tools.Manager {
 	for toolName := range disabledTools {
 		manager.Unregister(toolName)
 	}
+
+	// Apply sub-agent tool filtering (only keep enabled tools)
+	if len(subAgentEnabledTools) > 0 {
+		allowed := make(map[string]struct{}, len(subAgentEnabledTools))
+		for _, name := range subAgentEnabledTools {
+			allowed[strings.TrimSpace(name)] = struct{}{}
+		}
+		// Always allow essential tools
+		allowed["question"] = struct{}{}
+		allowed["session_task_progress"] = struct{}{}
+
+		for _, def := range manager.GetDefinitions() {
+			if _, ok := allowed[def.Name]; !ok {
+				manager.Unregister(def.Name)
+			}
+		}
+	}
+
 	return manager
 }
 
@@ -142,6 +170,7 @@ func (s *Server) registerServerBackedTools(manager *tools.Manager) {
 	logging.Debug("Registering server-backed tools...")
 	manager.Register(newRecurringJobsTool(s))
 	manager.Register(newMCPManageTool(s))
+	manager.Register(newDelegateToSubAgentTool(s))
 	manager.RegisterQuestionTool(s.sessionManager)
 	manager.RegisterSessionTaskProgressTool(s.sessionManager)
 	logging.Debug("Server-backed tools registered. Total tools: %d", len(manager.GetDefinitions()))
@@ -392,6 +421,20 @@ func (s *Server) setupRoutes() {
 		r.Post("/rename", s.handleRenameMindEntry)
 	})
 
+	// Sub-agents
+	r.Route("/sub-agents", func(r chi.Router) {
+		r.Get("/", s.handleListSubAgents)
+		r.Post("/", s.handleCreateSubAgent)
+		r.Post("/instruction-estimate", s.handleEstimateSubAgentInstructionsDraft)
+		r.Get("/{subAgentID}", s.handleGetSubAgent)
+		r.Put("/{subAgentID}", s.handleUpdateSubAgent)
+		r.Delete("/{subAgentID}", s.handleDeleteSubAgent)
+		r.Post("/{subAgentID}/instruction-estimate", s.handleEstimateSubAgentInstructions)
+	})
+
+	// Tool definitions (for UI tool selection in sub-agent config)
+	r.Get("/tools/definitions", s.handleListToolDefinitions)
+
 	// Skills helpers (folder selection and markdown discovery)
 	r.Route("/skills", func(r chi.Router) {
 		r.Get("/builtin", s.handleListBuiltInSkills)
@@ -436,13 +479,14 @@ func (s *Server) Run(ctx context.Context) error {
 
 // CreateSessionRequest represents a request to create a new session
 type CreateSessionRequest struct {
-	AgentID   string                `json:"agent_id"`
-	Task      string                `json:"task,omitempty"`
-	Images    []MessageImagePayload `json:"images,omitempty"`
-	Provider  string                `json:"provider,omitempty"`
-	Model     string                `json:"model,omitempty"`
-	ProjectID string                `json:"project_id,omitempty"`
-	Queued    bool                  `json:"queued,omitempty"` // If true, create session without starting it
+	AgentID    string                `json:"agent_id"`
+	Task       string                `json:"task,omitempty"`
+	Images     []MessageImagePayload `json:"images,omitempty"`
+	Provider   string                `json:"provider,omitempty"`
+	Model      string                `json:"model,omitempty"`
+	ProjectID  string                `json:"project_id,omitempty"`
+	SubAgentID string                `json:"sub_agent_id,omitempty"` // Optional sub-agent to use for this session
+	Queued     bool                  `json:"queued,omitempty"`       // If true, create session without starting it
 }
 
 // CreateSessionResponse represents a response after creating a session
@@ -645,6 +689,33 @@ type SessionListItem struct {
 }
 
 // --- Recurring Jobs Request/Response types ---
+
+// SubAgentRequest represents a request to create or update a sub-agent.
+type SubAgentRequest struct {
+	Name              string   `json:"name"`
+	Provider          string   `json:"provider"`
+	Model             string   `json:"model,omitempty"`
+	EnabledTools      []string `json:"enabled_tools,omitempty"`
+	InstructionBlocks string   `json:"instruction_blocks,omitempty"`
+}
+
+// SubAgentResponse represents a sub-agent in API responses.
+type SubAgentResponse struct {
+	ID                string   `json:"id"`
+	Name              string   `json:"name"`
+	Provider          string   `json:"provider"`
+	Model             string   `json:"model"`
+	EnabledTools      []string `json:"enabled_tools"`
+	InstructionBlocks string   `json:"instruction_blocks"`
+	CreatedAt         string   `json:"created_at"`
+	UpdatedAt         string   `json:"updated_at"`
+}
+
+// ToolDefinitionResponse is a minimal tool info for UI.
+type ToolDefinitionResponse struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
 
 // CreateJobRequest represents a request to create a recurring job
 type CreateJobRequest struct {
@@ -1479,6 +1550,24 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := s.sessionManager.Save(sess); err != nil {
 			logging.Error("Failed to save session with initial task: %v", err)
+		}
+	}
+
+	// If a sub-agent is specified, use its provider/model config
+	subAgentID := strings.TrimSpace(req.SubAgentID)
+	if subAgentID != "" {
+		sa, saErr := s.store.GetSubAgent(subAgentID)
+		if saErr != nil {
+			s.errorResponse(w, http.StatusBadRequest, "Sub-agent not found: "+saErr.Error())
+			return
+		}
+		sess.Metadata["sub_agent_id"] = sa.ID
+		sess.Metadata["sub_agent_name"] = sa.Name
+		if sa.Provider != "" {
+			req.Provider = sa.Provider
+		}
+		if sa.Model != "" && req.Model == "" {
+			req.Model = sa.Model
 		}
 	}
 
@@ -3457,6 +3546,19 @@ func (s *Server) composeSystemPromptSnapshotWithSettings(sess *session.Session, 
 		}}, resolvedBlocks...)
 	}
 
+	// Inject available sub-agents so the main agent knows what it can delegate to
+	subAgentsSection, subAgentsTokens := s.resolveSubAgentsSection()
+	if subAgentsSection != "" {
+		appendSections = append(appendSections, subAgentsSection)
+		resolvedBlocks = append(resolvedBlocks, systemPromptBlockSnapshot{
+			Type:            "sub_agents",
+			Value:           "",
+			Enabled:         true,
+			ResolvedContent: subAgentsSection,
+			EstimatedTokens: subAgentsTokens,
+		})
+	}
+
 	if len(appendSections) == 0 {
 		if appendPrompt := strings.TrimSpace(os.Getenv("AAGENT_SYSTEM_PROMPT_APPEND")); appendPrompt != "" {
 			combinedPrompt := strings.TrimSpace(basePrompt) + "\n\n" + appendPrompt
@@ -3762,6 +3864,262 @@ func (s *Server) resolveIntegrationSkillsSection(blockNumber int) (string, strin
 	}
 
 	return strings.Join(lines, "\n"), ""
+}
+
+func (s *Server) resolveSubAgentsSection() (string, int) {
+	agents, err := s.store.ListSubAgents()
+	if err != nil {
+		logging.Warn("Failed to list sub-agents for system prompt: %v", err)
+		return "", 0
+	}
+	if len(agents) == 0 {
+		return "", 0
+	}
+
+	lines := make([]string, 0, len(agents)+4)
+	lines = append(lines, "Available sub-agents for delegation:")
+	lines = append(lines, "Use the delegate_to_subagent tool to delegate tasks to these sub-agents. Each sub-agent runs in its own session with its own context window.")
+	lines = append(lines, "")
+	for _, sa := range agents {
+		providerLabel := strings.TrimSpace(sa.Provider)
+		if providerLabel == "" {
+			providerLabel = "default"
+		}
+		modelLabel := strings.TrimSpace(sa.Model)
+		if modelLabel == "" {
+			modelLabel = "default"
+		}
+		toolsLabel := "all tools"
+		if len(sa.EnabledTools) > 0 {
+			toolsLabel = fmt.Sprintf("%d tools", len(sa.EnabledTools))
+		}
+		lines = append(lines, fmt.Sprintf("- ID: %s | Name: %s | Provider: %s | Model: %s | Tools: %s",
+			sa.ID, sa.Name, providerLabel, modelLabel, toolsLabel))
+	}
+
+	section := strings.Join(lines, "\n")
+	return section, estimateTokensApprox(section)
+}
+
+// composeSubAgentSystemPromptSnapshot builds a system prompt snapshot for a
+// sub-agent using its own instruction blocks configuration. It follows the same
+// block-resolution logic as the main agent but uses a sub-agent-specific base
+// prompt and omits thinking blocks, project context, project_agents_md, and the
+// sub-agents listing (to prevent recursion).
+func (s *Server) composeSubAgentSystemPromptSnapshot(sa *storage.SubAgent, sess *session.Session) *systemPromptSnapshot {
+	rawBlocks := strings.TrimSpace(sa.InstructionBlocks)
+	blocks := []configuredInstructionBlock{}
+	if rawBlocks != "" && rawBlocks != "[]" {
+		if err := json.Unmarshal([]byte(rawBlocks), &blocks); err != nil {
+			logging.Warn("Failed to parse sub-agent instruction_blocks for %s: %v", sa.ID, err)
+			blocks = []configuredInstructionBlock{}
+		}
+	}
+
+	// If no blocks configured, default to builtin_tools only
+	if len(blocks) == 0 {
+		enabled := true
+		blocks = []configuredInstructionBlock{
+			{Type: builtInToolsInstructionBlockType, Value: "", Enabled: &enabled},
+		}
+	}
+
+	// Ensure the managed block types are present (auto-prepend missing ones as disabled)
+	hasBuiltInBlock := false
+	hasIntegrationBlock := false
+	hasExternalMarkdownBlock := false
+	hasMCPServersBlock := false
+	for _, block := range blocks {
+		switch strings.TrimSpace(block.Type) {
+		case builtInToolsInstructionBlockType:
+			hasBuiltInBlock = true
+		case integrationSkillsInstructionBlockType:
+			hasIntegrationBlock = true
+		case externalMarkdownSkillsInstructionBlockType:
+			hasExternalMarkdownBlock = true
+		case mcpServersInstructionBlockType:
+			hasMCPServersBlock = true
+		}
+	}
+	prefixedBlocks := make([]configuredInstructionBlock, 0, 4+len(blocks))
+	if !hasBuiltInBlock {
+		disabled := false
+		prefixedBlocks = append(prefixedBlocks, configuredInstructionBlock{Type: builtInToolsInstructionBlockType, Value: "", Enabled: &disabled})
+	}
+	if !hasIntegrationBlock {
+		disabled := false
+		prefixedBlocks = append(prefixedBlocks, configuredInstructionBlock{Type: integrationSkillsInstructionBlockType, Value: "", Enabled: &disabled})
+	}
+	if !hasExternalMarkdownBlock {
+		disabled := false
+		prefixedBlocks = append(prefixedBlocks, configuredInstructionBlock{Type: externalMarkdownSkillsInstructionBlockType, Value: "", Enabled: &disabled})
+	}
+	if !hasMCPServersBlock {
+		disabled := false
+		prefixedBlocks = append(prefixedBlocks, configuredInstructionBlock{Type: mcpServersInstructionBlockType, Value: "", Enabled: &disabled})
+	}
+	blocks = append(prefixedBlocks, blocks...)
+
+	// Determine whether builtin_tools is enabled
+	builtInToolsEnabled := false
+	for _, block := range blocks {
+		if strings.TrimSpace(block.Type) != builtInToolsInstructionBlockType {
+			continue
+		}
+		builtInToolsEnabled = block.Enabled == nil || *block.Enabled
+		break
+	}
+
+	// Sub-agent base prompt — identity header + optional built-in tool guidance
+	identityPrompt := fmt.Sprintf(`You are a sub-agent named "%s". You have been delegated a specific task by the main agent.
+
+Guidelines:
+- Focus exclusively on completing the delegated task
+- Be concise and efficient — your output will be returned to the main agent
+- Use available tools to accomplish the task
+- If the task is unclear, do your best to complete it based on context
+- When done, provide a clear summary of what you accomplished`, sa.Name)
+
+	var basePrompt string
+	if builtInToolsEnabled {
+		basePrompt = identityPrompt + "\n\n" + agent.DefaultSystemPrompt()
+	} else {
+		basePrompt = identityPrompt
+	}
+
+	// Resolve each block
+	resolvedBlocks := make([]systemPromptBlockSnapshot, 0, len(blocks))
+	resolvedBlocks = append(resolvedBlocks, systemPromptBlockSnapshot{
+		Type:            builtInToolsInstructionBlockType,
+		Value:           "",
+		Enabled:         builtInToolsEnabled,
+		ResolvedContent: "Controls whether built-in tool guidance is included in the base system prompt.",
+		EstimatedTokens: subAgentBuiltInToolsEstimatedTokens(builtInToolsEnabled),
+	})
+	appendSections := make([]string, 0, len(blocks))
+	sectionNumber := 0
+
+	settings, _ := s.store.GetSettings()
+	if settings == nil {
+		settings = map[string]string{}
+	}
+
+	for _, block := range blocks {
+		blockType := strings.TrimSpace(block.Type)
+		if blockType == builtInToolsInstructionBlockType {
+			continue
+		}
+		sectionNumber++
+
+		enabled := block.Enabled == nil || *block.Enabled
+		blockSnapshot := systemPromptBlockSnapshot{
+			Type:    blockType,
+			Value:   strings.TrimSpace(block.Value),
+			Enabled: enabled,
+		}
+		if !enabled {
+			resolvedBlocks = append(resolvedBlocks, blockSnapshot)
+			continue
+		}
+
+		value := blockSnapshot.Value
+		switch blockType {
+		case integrationSkillsInstructionBlockType:
+			section, resolveErr := s.resolveIntegrationSkillsSection(sectionNumber)
+			blockSnapshot.ResolvedContent = section
+			blockSnapshot.Error = resolveErr
+			if section == "" {
+				resolvedBlocks = append(resolvedBlocks, blockSnapshot)
+				continue
+			}
+			blockSnapshot.EstimatedTokens = estimateTokensApprox(section)
+			appendSections = append(appendSections, section)
+		case externalMarkdownSkillsInstructionBlockType:
+			section, estimatedTokens, resolveErr := s.resolveExternalMarkdownSkillsSection(settings, sectionNumber)
+			blockSnapshot.ResolvedContent = section
+			blockSnapshot.Error = resolveErr
+			if section == "" {
+				resolvedBlocks = append(resolvedBlocks, blockSnapshot)
+				continue
+			}
+			blockSnapshot.EstimatedTokens = estimatedTokens
+			appendSections = append(appendSections, section)
+		case mcpServersInstructionBlockType:
+			section, estimatedTokens, resolveErr := s.resolveMCPServersSection(sectionNumber)
+			blockSnapshot.ResolvedContent = section
+			blockSnapshot.Error = resolveErr
+			if section == "" {
+				resolvedBlocks = append(resolvedBlocks, blockSnapshot)
+				continue
+			}
+			blockSnapshot.EstimatedTokens = estimatedTokens
+			appendSections = append(appendSections, section)
+		case "text":
+			if value == "" {
+				resolvedBlocks = append(resolvedBlocks, blockSnapshot)
+				continue
+			}
+			blockSnapshot.ResolvedContent = value
+			rendered := fmt.Sprintf("Instruction block %d (text):\n%s", sectionNumber, blockSnapshot.ResolvedContent)
+			blockSnapshot.EstimatedTokens = estimateTokensApprox(rendered)
+			appendSections = append(appendSections, rendered)
+		case "file":
+			if value == "" {
+				resolvedBlocks = append(resolvedBlocks, blockSnapshot)
+				continue
+			}
+			blockSnapshot.SourcePath = value
+			content, readErr := s.readInstructionFileBlock(value)
+			if readErr != nil {
+				blockSnapshot.Error = readErr.Error()
+				rendered := fmt.Sprintf("Instruction block %d (file):\nUnable to load file %s: %s", sectionNumber, value, readErr.Error())
+				blockSnapshot.EstimatedTokens = estimateTokensApprox(rendered)
+				appendSections = append(appendSections, rendered)
+			} else {
+				blockSnapshot.ResolvedContent = content
+				rendered := fmt.Sprintf("Instruction block %d (file):\n%s", sectionNumber, content)
+				blockSnapshot.EstimatedTokens = estimateTokensApprox(rendered)
+				appendSections = append(appendSections, rendered)
+			}
+		default:
+			// Treat unknown block types as text
+			if value == "" {
+				resolvedBlocks = append(resolvedBlocks, blockSnapshot)
+				continue
+			}
+			blockSnapshot.Type = "text"
+			blockSnapshot.ResolvedContent = value
+			rendered := fmt.Sprintf("Instruction block %d (text):\n%s", sectionNumber, value)
+			blockSnapshot.EstimatedTokens = estimateTokensApprox(rendered)
+			appendSections = append(appendSections, rendered)
+		}
+		resolvedBlocks = append(resolvedBlocks, blockSnapshot)
+	}
+
+	// Build combined prompt
+	var combinedPrompt string
+	if len(appendSections) == 0 {
+		combinedPrompt = basePrompt
+	} else {
+		combinedPrompt = strings.TrimSpace(basePrompt) + "\n\nApply these additional instructions in order:\n\n" + strings.Join(appendSections, "\n\n")
+	}
+
+	return &systemPromptSnapshot{
+		BasePrompt:        basePrompt,
+		CombinedPrompt:    combinedPrompt,
+		BaseEstimated:     estimateTokensApprox(basePrompt),
+		CombinedEstimated: estimateTokensApprox(combinedPrompt),
+		Blocks:            resolvedBlocks,
+	}
+}
+
+// subAgentBuiltInToolsEstimatedTokens returns the estimated token cost of the
+// built-in tool guidance section for sub-agents.
+func subAgentBuiltInToolsEstimatedTokens(enabled bool) int {
+	if !enabled {
+		return 0
+	}
+	return estimateTokensApprox(agent.DefaultSystemPrompt())
 }
 
 func (s *Server) resolveMCPServersSection(blockNumber int) (string, int, string) {
@@ -5249,4 +5607,238 @@ func isChromeRunning() bool {
 	cmd := exec.Command("pgrep", "-x", "Google Chrome")
 	err := cmd.Run()
 	return err == nil
+}
+
+// --- Sub-Agent Handlers ---
+
+func (s *Server) subAgentToResponse(sa *storage.SubAgent) SubAgentResponse {
+	tools := sa.EnabledTools
+	if tools == nil {
+		tools = []string{}
+	}
+	instrBlocks := sa.InstructionBlocks
+	if instrBlocks == "" {
+		instrBlocks = "[]"
+	}
+	return SubAgentResponse{
+		ID:                sa.ID,
+		Name:              sa.Name,
+		Provider:          sa.Provider,
+		Model:             sa.Model,
+		EnabledTools:      tools,
+		InstructionBlocks: instrBlocks,
+		CreatedAt:         sa.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:         sa.UpdatedAt.Format(time.RFC3339),
+	}
+}
+
+func (s *Server) handleListSubAgents(w http.ResponseWriter, r *http.Request) {
+	agents, err := s.store.ListSubAgents()
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to list sub-agents: "+err.Error())
+		return
+	}
+
+	resp := make([]SubAgentResponse, len(agents))
+	for i, sa := range agents {
+		resp[i] = s.subAgentToResponse(sa)
+	}
+	s.jsonResponse(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleCreateSubAgent(w http.ResponseWriter, r *http.Request) {
+	var req SubAgentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	if strings.TrimSpace(req.Name) == "" {
+		s.errorResponse(w, http.StatusBadRequest, "Name is required")
+		return
+	}
+
+	now := time.Now()
+	sa := &storage.SubAgent{
+		ID:                uuid.New().String(),
+		Name:              strings.TrimSpace(req.Name),
+		Provider:          strings.TrimSpace(req.Provider),
+		Model:             strings.TrimSpace(req.Model),
+		EnabledTools:      req.EnabledTools,
+		InstructionBlocks: req.InstructionBlocks,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}
+	if sa.EnabledTools == nil {
+		sa.EnabledTools = []string{}
+	}
+
+	if err := s.store.SaveSubAgent(sa); err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to create sub-agent: "+err.Error())
+		return
+	}
+
+	s.jsonResponse(w, http.StatusCreated, s.subAgentToResponse(sa))
+}
+
+func (s *Server) handleGetSubAgent(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "subAgentID")
+	sa, err := s.store.GetSubAgent(id)
+	if err != nil {
+		s.errorResponse(w, http.StatusNotFound, "Sub-agent not found: "+err.Error())
+		return
+	}
+	s.jsonResponse(w, http.StatusOK, s.subAgentToResponse(sa))
+}
+
+func (s *Server) handleUpdateSubAgent(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "subAgentID")
+	sa, err := s.store.GetSubAgent(id)
+	if err != nil {
+		s.errorResponse(w, http.StatusNotFound, "Sub-agent not found: "+err.Error())
+		return
+	}
+
+	var req SubAgentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	if strings.TrimSpace(req.Name) == "" {
+		s.errorResponse(w, http.StatusBadRequest, "Name is required")
+		return
+	}
+
+	sa.Name = strings.TrimSpace(req.Name)
+	sa.Provider = strings.TrimSpace(req.Provider)
+	sa.Model = strings.TrimSpace(req.Model)
+	sa.EnabledTools = req.EnabledTools
+	if sa.EnabledTools == nil {
+		sa.EnabledTools = []string{}
+	}
+	sa.InstructionBlocks = req.InstructionBlocks
+	sa.UpdatedAt = time.Now()
+
+	if err := s.store.SaveSubAgent(sa); err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to update sub-agent: "+err.Error())
+		return
+	}
+
+	s.jsonResponse(w, http.StatusOK, s.subAgentToResponse(sa))
+}
+
+func (s *Server) handleDeleteSubAgent(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "subAgentID")
+	if err := s.store.DeleteSubAgent(id); err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to delete sub-agent: "+err.Error())
+		return
+	}
+	s.jsonResponse(w, http.StatusOK, map[string]bool{"deleted": true})
+}
+
+// handleEstimateSubAgentInstructions returns a system prompt snapshot for an
+// existing (saved) sub-agent, using instruction blocks from the request body.
+func (s *Server) handleEstimateSubAgentInstructions(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "subAgentID")
+	sa, err := s.store.GetSubAgent(id)
+	if err != nil {
+		s.errorResponse(w, http.StatusNotFound, "Sub-agent not found: "+err.Error())
+		return
+	}
+
+	var req struct {
+		InstructionBlocks string   `json:"instruction_blocks"`
+		Name              string   `json:"name"`
+		EnabledTools      []string `json:"enabled_tools"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	// Override the sub-agent fields with request values for estimation
+	if req.InstructionBlocks != "" {
+		sa.InstructionBlocks = req.InstructionBlocks
+	}
+	if req.Name != "" {
+		sa.Name = req.Name
+	}
+	if req.EnabledTools != nil {
+		sa.EnabledTools = req.EnabledTools
+	}
+
+	s.respondSubAgentEstimate(w, sa)
+}
+
+// handleEstimateSubAgentInstructionsDraft returns a system prompt snapshot for a
+// draft (unsaved) sub-agent.
+func (s *Server) handleEstimateSubAgentInstructionsDraft(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		InstructionBlocks string   `json:"instruction_blocks"`
+		Name              string   `json:"name"`
+		EnabledTools      []string `json:"enabled_tools"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	sa := &storage.SubAgent{
+		ID:                "draft",
+		Name:              req.Name,
+		InstructionBlocks: req.InstructionBlocks,
+		EnabledTools:      req.EnabledTools,
+	}
+	if sa.Name == "" {
+		sa.Name = "Draft Sub-Agent"
+	}
+
+	s.respondSubAgentEstimate(w, sa)
+}
+
+func (s *Server) respondSubAgentEstimate(w http.ResponseWriter, sa *storage.SubAgent) {
+	snapshot := s.composeSubAgentSystemPromptSnapshot(sa, nil)
+	if snapshot == nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to compose instruction snapshot")
+		return
+	}
+
+	blocks := make([]SystemPromptBlockSnapshotPayload, len(snapshot.Blocks))
+	for i, block := range snapshot.Blocks {
+		blocks[i] = SystemPromptBlockSnapshotPayload{
+			Type:            block.Type,
+			Value:           block.Value,
+			Enabled:         block.Enabled,
+			ResolvedContent: block.ResolvedContent,
+			SourcePath:      block.SourcePath,
+			Error:           block.Error,
+			EstimatedTokens: block.EstimatedTokens,
+		}
+	}
+
+	s.jsonResponse(w, http.StatusOK, map[string]interface{}{
+		"snapshot": SystemPromptSnapshotPayload{
+			BasePrompt:        snapshot.BasePrompt,
+			CombinedPrompt:    snapshot.CombinedPrompt,
+			BaseEstimated:     snapshot.BaseEstimated,
+			CombinedEstimated: snapshot.CombinedEstimated,
+			Blocks:            blocks,
+		},
+	})
+}
+
+func (s *Server) handleListToolDefinitions(w http.ResponseWriter, r *http.Request) {
+	defs := s.toolManager.GetDefinitions()
+	resp := make([]ToolDefinitionResponse, len(defs))
+	for i, d := range defs {
+		resp[i] = ToolDefinitionResponse{
+			Name:        d.Name,
+			Description: d.Description,
+		}
+	}
+	sort.Slice(resp, func(i, j int) bool {
+		return resp[i].Name < resp[j].Name
+	})
+	s.jsonResponse(w, http.StatusOK, resp)
 }
