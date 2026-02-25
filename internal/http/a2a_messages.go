@@ -1,8 +1,10 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
@@ -11,7 +13,13 @@ import (
 )
 
 func (s *Server) handleA2AMessageSend(w http.ResponseWriter, r *http.Request) {
-	response, err := s.processA2AMessageRequest(r)
+	rawBody, readErr := io.ReadAll(r.Body)
+	if readErr != nil {
+		s.errorResponse(w, http.StatusBadRequest, "invalid request body: "+readErr.Error())
+		return
+	}
+
+	response, err := s.processA2AMessageRequest(r.Context(), rawBody)
 	if err != nil {
 		s.errorResponse(w, http.StatusBadRequest, err.Error())
 		return
@@ -23,6 +31,12 @@ func (s *Server) handleA2AMessageSend(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleA2AMessageSendStream(w http.ResponseWriter, r *http.Request) {
+	rawBody, readErr := io.ReadAll(r.Body)
+	if readErr != nil {
+		s.errorResponse(w, http.StatusBadRequest, "invalid request body: "+readErr.Error())
+		return
+	}
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		s.errorResponse(w, http.StatusInternalServerError, "streaming not supported")
@@ -52,7 +66,7 @@ func (s *Server) handleA2AMessageSendStream(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	response, err := s.processA2AMessageRequest(r)
+	response, err := s.processA2AMessageRequest(r.Context(), rawBody)
 	if err != nil {
 		_ = writeEvent("status", map[string]interface{}{"state": "failed", "error": err.Error()})
 		return
@@ -63,9 +77,9 @@ func (s *Server) handleA2AMessageSendStream(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-func (s *Server) processA2AMessageRequest(r *http.Request) (*a2atunnel.OutboundPayload, error) {
+func (s *Server) processA2AMessageRequest(ctx context.Context, rawBody []byte) (*a2atunnel.OutboundPayload, error) {
 	var req a2atunnel.InboundPayload
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(rawBody, &req); err != nil {
 		return nil, fmt.Errorf("invalid request body: %w", err)
 	}
 	if len(req.Content) == 0 {
@@ -107,7 +121,7 @@ func (s *Server) processA2AMessageRequest(r *http.Request) (*a2atunnel.OutboundP
 		s.getA2AInboundProjectID,
 		s.getA2AInboundSubAgentID,
 	)
-	respPayload, err := handler.Handle(r.Context(), &a2atunnel.AgentRequest{
+	respPayload, err := handler.Handle(ctx, &a2atunnel.AgentRequest{
 		Kind:      a2atunnel.KindTask,
 		RequestID: req.MessageID,
 		Payload:   payload,

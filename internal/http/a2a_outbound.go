@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -62,7 +63,13 @@ func (s *Server) handleCreateA2AOutboundSession(w http.ResponseWriter, r *http.R
 
 func (s *Server) handleA2AOutboundChat(w http.ResponseWriter, r *http.Request) {
 	sessionID := chi.URLParam(r, "sessionID")
-	resp, err := s.processA2AOutboundChat(r.Context(), sessionID, r)
+	rawBody, readErr := io.ReadAll(r.Body)
+	if readErr != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid request body: "+readErr.Error())
+		return
+	}
+
+	resp, err := s.processA2AOutboundChat(r.Context(), sessionID, rawBody)
 	if err != nil {
 		s.errorResponse(w, err.status, err.message)
 		return
@@ -71,6 +78,12 @@ func (s *Server) handleA2AOutboundChat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleA2AOutboundChatStream(w http.ResponseWriter, r *http.Request) {
+	rawBody, readErr := io.ReadAll(r.Body)
+	if readErr != nil {
+		s.errorResponse(w, http.StatusBadRequest, "Invalid request body: "+readErr.Error())
+		return
+	}
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		s.errorResponse(w, http.StatusInternalServerError, "streaming not supported")
@@ -107,7 +120,7 @@ func (s *Server) handleA2AOutboundChatStream(w http.ResponseWriter, r *http.Requ
 	}
 	done := make(chan streamResult, 1)
 	go func() {
-		resp, chatErr := s.processA2AOutboundChat(r.Context(), sessionID, r)
+		resp, chatErr := s.processA2AOutboundChat(r.Context(), sessionID, rawBody)
 		done <- streamResult{resp: resp, err: chatErr}
 	}()
 
@@ -138,9 +151,9 @@ type a2aChatHTTPError struct {
 	message string
 }
 
-func (s *Server) processA2AOutboundChat(ctx context.Context, sessionID string, r *http.Request) (*ChatResponse, *a2aChatHTTPError) {
+func (s *Server) processA2AOutboundChat(ctx context.Context, sessionID string, rawBody []byte) (*ChatResponse, *a2aChatHTTPError) {
 	var req ChatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(rawBody, &req); err != nil {
 		return nil, &a2aChatHTTPError{status: http.StatusBadRequest, message: "Invalid request body: " + err.Error()}
 	}
 	message := strings.TrimSpace(req.Message)
