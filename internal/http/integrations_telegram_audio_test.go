@@ -3,6 +3,7 @@ package http
 import (
 	"testing"
 
+	"github.com/A2gent/brute/internal/session"
 	"github.com/A2gent/brute/internal/storage"
 )
 
@@ -123,5 +124,40 @@ func TestTelegramPromptFromInboundMessage_TextAndCaptionWithoutMedia(t *testing.
 	}
 	if captionPrompt == nil || captionPrompt.text != "caption only" {
 		t.Fatalf("expected caption prompt, got %#v", captionPrompt)
+	}
+}
+
+func TestTelegramBestPhotoFileID(t *testing.T) {
+	message := &telegramMessagePayload{
+		Photo: []telegramPhotoPayload{
+			{FileID: "small"},
+			{FileID: "large"},
+		},
+	}
+	got, ok := telegramBestPhotoFileID(message)
+	if !ok {
+		t.Fatal("expected photo file id to be found")
+	}
+	if got != "large" {
+		t.Fatalf("expected largest photo id, got %q", got)
+	}
+}
+
+func TestDecodeImageDataURI(t *testing.T) {
+	const payload = "data:image/png;base64,Zm9v"
+	got, err := decodeImageDataURI(payload)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "Zm9v" {
+		t.Fatalf("unexpected decoded payload: %q", got)
+	}
+}
+
+func TestSendTelegramPhotoNoDataNoURL(t *testing.T) {
+	s := &Server{}
+	err := s.sendTelegramPhoto(t.Context(), "token", "123", 0, session.ImageAttachment{})
+	if err != nil {
+		t.Fatalf("expected no-op for empty image attachment, got error: %v", err)
 	}
 }

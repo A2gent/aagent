@@ -3,6 +3,7 @@ package http
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -111,6 +112,7 @@ const telegramSyncedMessageCountMetadataKey = "telegram_synced_message_count"
 const myMindProjectName = "My Mind"
 const telegramMaxMessageRunes = 3900
 const telegramMaxInboundAudioBytes = 25 * 1024 * 1024
+const telegramMaxInboundImageBytes = 15 * 1024 * 1024
 const telegramMaxCaptionRunes = 1024
 
 var telegramBotTokenPattern = regexp.MustCompile(`bot[0-9]{5,}:[A-Za-z0-9_-]{20,}`)
@@ -120,15 +122,23 @@ type telegramMessageAuthor struct {
 }
 
 type telegramMessagePayload struct {
-	MessageID       int                   `json:"message_id"`
-	MessageThreadID int64                 `json:"message_thread_id"`
-	Text            string                `json:"text"`
-	Caption         string                `json:"caption"`
-	Voice           *telegramVoicePayload `json:"voice"`
-	Audio           *telegramAudioPayload `json:"audio"`
-	Document        *telegramAudioPayload `json:"document"`
-	Chat            telegramChatPayload   `json:"chat"`
-	From            telegramMessageAuthor `json:"from"`
+	MessageID       int                    `json:"message_id"`
+	MessageThreadID int64                  `json:"message_thread_id"`
+	Text            string                 `json:"text"`
+	Caption         string                 `json:"caption"`
+	Photo           []telegramPhotoPayload `json:"photo"`
+	Voice           *telegramVoicePayload  `json:"voice"`
+	Audio           *telegramAudioPayload  `json:"audio"`
+	Document        *telegramAudioPayload  `json:"document"`
+	Chat            telegramChatPayload    `json:"chat"`
+	From            telegramMessageAuthor  `json:"from"`
+}
+
+type telegramPhotoPayload struct {
+	FileID   string `json:"file_id"`
+	FileSize int64  `json:"file_size"`
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
 }
 
 type telegramVoicePayload struct {
@@ -693,9 +703,9 @@ func (s *Server) processTelegramDuplexIntegrations(ctx context.Context) {
 				}
 				continue
 			}
-			if strings.TrimSpace(inboundPrompt.text) == "" {
+			if strings.TrimSpace(inboundPrompt.text) == "" && len(inboundPrompt.images) == 0 {
 				logging.Debug(
-					"Telegram update skipped for integration %s: no text/caption/audio prompt (chat=%d type=%s thread=%d update=%d)",
+					"Telegram update skipped for integration %s: no text/caption/audio/photo prompt (chat=%d type=%s thread=%d update=%d)",
 					integration.ID,
 					message.Chat.ID,
 					message.Chat.Type,
@@ -721,6 +731,7 @@ func (s *Server) processTelegramDuplexIntegrations(ctx context.Context) {
 				message.Chat,
 				message.MessageThreadID,
 				inboundPrompt.text,
+				inboundPrompt.images,
 				inboundPrompt.metadata,
 			)
 			if err != nil {
@@ -801,6 +812,24 @@ func (s *Server) telegramPromptFromInboundMessage(
 	}
 
 	caption := strings.TrimSpace(message.Caption)
+	if photoFileID, ok := telegramBestPhotoFileID(message); ok {
+		image, err := s.downloadTelegramPhotoAttachment(ctx, botToken, photoFileID, message.MessageID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to download photo message: %w", err)
+		}
+		promptText := caption
+		if promptText == "" {
+			promptText = "Please analyze the attached image."
+		}
+		return &telegramInboundPrompt{
+			text:   promptText,
+			images: []session.ImageAttachment{image},
+			metadata: map[string]interface{}{
+				"inbound_channel":      "telegram",
+				"inbound_message_type": "photo",
+			},
+		}, nil
+	}
 	fileID, mediaKind := telegramAudioFileIDForMessage(message)
 	if fileID == "" {
 		return &telegramInboundPrompt{
@@ -827,7 +856,7 @@ func (s *Server) telegramPromptFromInboundMessage(
 		}, nil
 	}
 
-	audioPath, cleanup, err := s.downloadTelegramFile(ctx, botToken, fileID)
+	audioPath, cleanup, err := s.downloadTelegramFile(ctx, botToken, fileID, telegramMaxInboundAudioBytes, "audio")
 	if err != nil {
 		return nil, fmt.Errorf("failed to download %s message: %w", mediaKind, err)
 	}
@@ -898,6 +927,19 @@ func telegramAudioFileIDForMessage(message *telegramMessagePayload) (string, str
 		}
 	}
 	return "", ""
+}
+
+func telegramBestPhotoFileID(message *telegramMessagePayload) (string, bool) {
+	if message == nil || len(message.Photo) == 0 {
+		return "", false
+	}
+	for i := len(message.Photo) - 1; i >= 0; i-- {
+		fileID := strings.TrimSpace(message.Photo[i].FileID)
+		if fileID != "" {
+			return fileID, true
+		}
+	}
+	return "", false
 }
 
 func telegramVoiceTranscriptionEnabled(integration *storage.Integration) bool {
@@ -1088,6 +1130,35 @@ func (s *Server) sendTelegramConfiguredReply(
 		}
 	}
 
+	if sessionID != "" {
+		if err := s.sendLatestAssistantImagesToTelegram(ctx, sessionID, botToken, chatID, threadID); err != nil {
+			logging.Warn("Telegram assistant image reply send failed for session %s: %v", sessionID, err)
+		}
+	}
+
+	return nil
+}
+
+func (s *Server) sendLatestAssistantImagesToTelegram(
+	ctx context.Context,
+	sessionID string,
+	botToken string,
+	chatID string,
+	threadID int64,
+) error {
+	sess, err := s.sessionManager.Get(strings.TrimSpace(sessionID))
+	if err != nil || sess == nil || len(sess.Messages) == 0 {
+		return nil
+	}
+	for i := len(sess.Messages) - 1; i >= 0; i-- {
+		if sess.Messages[i].Role != "assistant" {
+			continue
+		}
+		if len(sess.Messages[i].Images) == 0 {
+			return nil
+		}
+		return s.sendTelegramImagesForSessionMessage(ctx, botToken, chatID, threadID, sess.Messages[i])
+	}
 	return nil
 }
 
@@ -1234,13 +1305,26 @@ func (s *Server) attachTelegramReplyAudioMetadata(sessionID, clipID, contentType
 	}
 }
 
-func (s *Server) downloadTelegramFile(ctx context.Context, botToken string, fileID string) (string, func(), error) {
+func (s *Server) downloadTelegramFile(
+	ctx context.Context,
+	botToken string,
+	fileID string,
+	maxBytes int64,
+	payloadKind string,
+) (string, func(), error) {
 	if strings.TrimSpace(botToken) == "" {
 		return "", func() {}, fmt.Errorf("missing bot token")
 	}
 	fileID = strings.TrimSpace(fileID)
 	if fileID == "" {
 		return "", func() {}, fmt.Errorf("missing file id")
+	}
+	if maxBytes <= 0 {
+		maxBytes = telegramMaxInboundAudioBytes
+	}
+	payloadKind = strings.TrimSpace(payloadKind)
+	if payloadKind == "" {
+		payloadKind = "file"
 	}
 
 	getFileURL := fmt.Sprintf(
@@ -1290,7 +1374,7 @@ func (s *Server) downloadTelegramFile(ctx context.Context, botToken string, file
 		return "", func() {}, fmt.Errorf("telegram file download failed: %s", downloadResp.Status)
 	}
 
-	limited := io.LimitReader(downloadResp.Body, telegramMaxInboundAudioBytes+1)
+	limited := io.LimitReader(downloadResp.Body, maxBytes+1)
 	payload, err := io.ReadAll(limited)
 	if err != nil {
 		return "", func() {}, fmt.Errorf("failed to read downloaded file: %w", err)
@@ -1298,17 +1382,17 @@ func (s *Server) downloadTelegramFile(ctx context.Context, botToken string, file
 	if len(payload) == 0 {
 		return "", func() {}, fmt.Errorf("downloaded file is empty")
 	}
-	if len(payload) > telegramMaxInboundAudioBytes {
-		return "", func() {}, fmt.Errorf("downloaded audio exceeds %d bytes", telegramMaxInboundAudioBytes)
+	if int64(len(payload)) > maxBytes {
+		return "", func() {}, fmt.Errorf("downloaded %s exceeds %d bytes", payloadKind, maxBytes)
 	}
 
 	ext := filepath.Ext(filePath)
 	if ext == "" {
-		ext = ".audio"
+		ext = "." + payloadKind
 	}
-	tmp, err := os.CreateTemp("", "a2gent-telegram-audio-*"+ext)
+	tmp, err := os.CreateTemp("", "a2gent-telegram-"+payloadKind+"-*"+ext)
 	if err != nil {
-		return "", func() {}, fmt.Errorf("failed to create temporary audio file: %w", err)
+		return "", func() {}, fmt.Errorf("failed to create temporary %s file: %w", payloadKind, err)
 	}
 	cleanup := func() {
 		_ = os.Remove(tmp.Name())
@@ -1316,13 +1400,47 @@ func (s *Server) downloadTelegramFile(ctx context.Context, botToken string, file
 	if _, err := tmp.Write(payload); err != nil {
 		_ = tmp.Close()
 		cleanup()
-		return "", func() {}, fmt.Errorf("failed to write downloaded audio file: %w", err)
+		return "", func() {}, fmt.Errorf("failed to write downloaded %s file: %w", payloadKind, err)
 	}
 	if err := tmp.Close(); err != nil {
 		cleanup()
-		return "", func() {}, fmt.Errorf("failed to close downloaded audio file: %w", err)
+		return "", func() {}, fmt.Errorf("failed to close downloaded %s file: %w", payloadKind, err)
 	}
 	return tmp.Name(), cleanup, nil
+}
+
+func (s *Server) downloadTelegramPhotoAttachment(
+	ctx context.Context,
+	botToken string,
+	fileID string,
+	messageID int,
+) (session.ImageAttachment, error) {
+	path, cleanup, err := s.downloadTelegramFile(ctx, botToken, fileID, telegramMaxInboundImageBytes, "photo")
+	if err != nil {
+		return session.ImageAttachment{}, err
+	}
+	defer cleanup()
+
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		return session.ImageAttachment{}, fmt.Errorf("failed to read downloaded photo: %w", err)
+	}
+	if len(payload) == 0 {
+		return session.ImageAttachment{}, fmt.Errorf("downloaded photo is empty")
+	}
+	mediaType := strings.TrimSpace(http.DetectContentType(payload))
+	if !strings.HasPrefix(strings.ToLower(mediaType), "image/") {
+		mediaType = "image/jpeg"
+	}
+	name := fmt.Sprintf("telegram-%d", messageID)
+	if ext := strings.TrimSpace(filepath.Ext(path)); ext != "" {
+		name += ext
+	}
+	return session.ImageAttachment{
+		Name:       name,
+		MediaType:  mediaType,
+		DataBase64: base64.StdEncoding.EncodeToString(payload),
+	}, nil
 }
 
 func convertAudioToWAVForWhisper(ctx context.Context, inputPath string) (string, func(), error) {
@@ -1474,6 +1592,7 @@ type telegramInboundResponse struct {
 
 type telegramInboundPrompt struct {
 	text     string
+	images   []session.ImageAttachment
 	metadata map[string]interface{}
 }
 
@@ -1489,6 +1608,7 @@ func (s *Server) handleTelegramInboundMessage(
 	chat telegramChatPayload,
 	threadID int64,
 	userMessage string,
+	userImages []session.ImageAttachment,
 	userMessageMetadata map[string]interface{},
 ) (*telegramInboundResponse, error) {
 	if handled, reply := handleTelegramSlashCommand(userMessage); handled {
@@ -1587,7 +1707,7 @@ func (s *Server) handleTelegramInboundMessage(
 		logging.Warn("Failed to assign project for Telegram session %s: %v", sess.ID, err)
 	}
 
-	sess.AddUserMessage(userMessage)
+	sess.AddUserMessageWithImages(userMessage, userImages)
 	if len(userMessageMetadata) > 0 && len(sess.Messages) > 0 {
 		last := len(sess.Messages) - 1
 		if sess.Messages[last].Role == "user" {
@@ -2397,6 +2517,9 @@ func (s *Server) syncSessionMessagesToTelegram(
 				}
 			}
 		}
+		if err := s.sendTelegramImagesForSessionMessage(ctx, botToken, chatID, threadID, sess.Messages[i]); err != nil {
+			return err
+		}
 		syncedCount = i + 1
 		sess.Metadata[telegramSyncedMessageCountMetadataKey] = syncedCount
 		if err := s.sessionManager.Save(sess); err != nil {
@@ -2404,6 +2527,179 @@ func (s *Server) syncSessionMessagesToTelegram(
 		}
 	}
 
+	return nil
+}
+
+func (s *Server) sendTelegramImagesForSessionMessage(
+	ctx context.Context,
+	botToken string,
+	chatID string,
+	threadID int64,
+	msg session.Message,
+) error {
+	if len(msg.Images) == 0 {
+		return nil
+	}
+	for _, img := range msg.Images {
+		if err := s.sendTelegramPhoto(ctx, botToken, chatID, threadID, img); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) sendTelegramPhoto(
+	ctx context.Context,
+	botToken string,
+	chatID string,
+	threadID int64,
+	img session.ImageAttachment,
+) error {
+	if strings.TrimSpace(img.DataBase64) != "" {
+		return s.sendTelegramPhotoBytes(ctx, botToken, chatID, threadID, strings.TrimSpace(img.Name), strings.TrimSpace(img.DataBase64))
+	}
+	rawURL := strings.TrimSpace(img.URL)
+	if rawURL == "" {
+		return nil
+	}
+	if strings.HasPrefix(strings.ToLower(rawURL), "data:") {
+		decoded, err := decodeImageDataURI(rawURL)
+		if err != nil {
+			return err
+		}
+		return s.sendTelegramPhotoBytes(ctx, botToken, chatID, threadID, strings.TrimSpace(img.Name), decoded)
+	}
+	return s.sendTelegramPhotoByURL(ctx, botToken, chatID, threadID, rawURL)
+}
+
+func decodeImageDataURI(raw string) (string, error) {
+	const marker = ";base64,"
+	idx := strings.Index(strings.ToLower(raw), marker)
+	if idx < 0 {
+		return "", fmt.Errorf("unsupported data URI image encoding")
+	}
+	encoded := strings.TrimSpace(raw[idx+len(marker):])
+	if encoded == "" {
+		return "", fmt.Errorf("empty data URI image payload")
+	}
+	return encoded, nil
+}
+
+func (s *Server) sendTelegramPhotoByURL(
+	ctx context.Context,
+	botToken string,
+	chatID string,
+	threadID int64,
+	photoURL string,
+) error {
+	payload := map[string]interface{}{
+		"chat_id": chatID,
+		"photo":   photoURL,
+	}
+	if threadID > 0 {
+		payload["message_thread_id"] = threadID
+	}
+	jsonBody, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to encode sendPhoto payload: %w", err)
+	}
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		fmt.Sprintf("https://api.telegram.org/bot%s/sendPhoto", botToken),
+		bytes.NewReader(jsonBody),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to build sendPhoto request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("sendPhoto request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result telegramBasicResponsePayload
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("failed to decode sendPhoto response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK || !result.OK {
+		msg := strings.TrimSpace(result.Description)
+		if msg == "" {
+			msg = resp.Status
+		}
+		return fmt.Errorf("telegram sendPhoto failed: %s", msg)
+	}
+	return nil
+}
+
+func (s *Server) sendTelegramPhotoBytes(
+	ctx context.Context,
+	botToken string,
+	chatID string,
+	threadID int64,
+	name string,
+	dataBase64 string,
+) error {
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(dataBase64))
+	if err != nil {
+		return fmt.Errorf("invalid photo base64 payload: %w", err)
+	}
+	if len(raw) == 0 {
+		return fmt.Errorf("empty photo payload")
+	}
+	if name == "" {
+		name = "image.jpg"
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	_ = writer.WriteField("chat_id", chatID)
+	if threadID > 0 {
+		_ = writer.WriteField("message_thread_id", strconv.FormatInt(threadID, 10))
+	}
+	part, err := writer.CreateFormFile("photo", name)
+	if err != nil {
+		return fmt.Errorf("failed to create telegram photo multipart field: %w", err)
+	}
+	if _, err := part.Write(raw); err != nil {
+		return fmt.Errorf("failed to write telegram photo payload: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("failed to finalize telegram photo multipart payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		fmt.Sprintf("https://api.telegram.org/bot%s/sendPhoto", botToken),
+		&body,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to build sendPhoto request: %w", err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("sendPhoto request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result telegramBasicResponsePayload
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("failed to decode sendPhoto response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK || !result.OK {
+		msg := strings.TrimSpace(result.Description)
+		if msg == "" {
+			msg = resp.Status
+		}
+		return fmt.Errorf("telegram sendPhoto failed: %s", msg)
+	}
 	return nil
 }
 

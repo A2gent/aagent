@@ -2786,8 +2786,14 @@ func (m Model) renderSessionsList() string {
 				current = " (current)"
 			}
 
-			entry := fmt.Sprintf("    %s  %s%s",
+			childPrefix := ""
+			if sess.ParentID != nil && strings.TrimSpace(*sess.ParentID) != "" {
+				childPrefix = "↳ "
+			}
+
+			entry := fmt.Sprintf("    %s  %s%s%s",
 				sess.CreatedAt.Format("15:04"),
+				childPrefix,
 				title,
 				current,
 			)

@@ -23,7 +23,7 @@ Works best with [A²gent/caesar](https://github.com/A2gent/caesar) as control ap
 ### 1.2 Agentic Execution
 
 - Agentic loop: task -> LLM with tools -> tool execution -> result feedback -> repeat
-- A2A basic protocol support via agent-card endpoint
+- A2A bridge support: canonical message endpoint + outbound tunnel-based chat + agent-card discovery
 
 ### 1.3 LLM Provider Support
 
@@ -232,6 +232,39 @@ Common optional variables:
 | `a2 session list` | list sessions |
 | `a2 logs` | show logs |
 | `a2 logs -f` | follow logs |
+
+## A2A Support
+
+Brute supports A2A communication in two modes:
+
+- Protocol-style HTTP endpoint for inbound A2A messages
+- Tunnel-backed outbound messaging to remote agents via Square
+
+### Agent Card
+
+- `GET /.well-known/agent-card.json`
+- `supportedInterfaces[0].url` points to `/a2a/messages/send`
+
+### Canonical A2A Endpoints (HTTP)
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/a2a/messages/send` | Handle canonical A2A message (`content[]`) and return final response |
+| `POST` | `/a2a/messages/send/stream` | SSE stream for inbound A2A message lifecycle (`accepted`, `running`, final `message`) |
+
+### Outbound A2A Session Endpoints (Web-App Flow)
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/a2a/outbound/sessions` | Create local outbound A2A session bound to target agent |
+| `POST` | `/a2a/outbound/sessions/{sessionID}/chat` | Send outbound A2A message (sync) |
+| `POST` | `/a2a/outbound/sessions/{sessionID}/chat/stream` | Send outbound A2A message (SSE progress stream) |
+
+### Payload Format
+
+- Canonical requests use `content[]` parts (`text`, `image_url`, `image_base64`)
+- Image-only and text+image requests are supported
+- For compatibility, brute still understands legacy bridge fields (`task`, `images`, `result`) used by existing tunnel/proxy flows
 
 ## 7. Session Model
 
