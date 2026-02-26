@@ -24,6 +24,7 @@ const mindRootFolderSettingKey = "AAGENT_MY_MIND_ROOT_FOLDER"
 const gitCommitProviderSettingKey = "AAGENT_GIT_COMMIT_PROVIDER"
 const gitCommitPromptTemplateSettingKey = "AAGENT_GIT_COMMIT_PROMPT_TEMPLATE"
 const defaultGitCommitPromptTemplate = "Generate one concise Git commit message in imperative mood.\nReturn only the commit message text, no quotes, no bullets, no explanation.\n\nChanged files:\n{{files}}\n\nDiff snippets:\n{{diffs}}"
+const projectSearchMaxResults = 5
 
 type MindConfigResponse struct {
 	RootFolder string `json:"root_folder"`
@@ -154,6 +155,24 @@ type ProjectGitInitResponse struct {
 	RootFolder string `json:"root_folder"`
 	HasGit     bool   `json:"has_git"`
 	RemoteURL  string `json:"remote_url,omitempty"`
+}
+
+type ProjectFileNameMatch struct {
+	Path string `json:"path"`
+	Name string `json:"name"`
+}
+
+type ProjectContentMatch struct {
+	Path    string `json:"path"`
+	Line    int    `json:"line"`
+	Preview string `json:"preview"`
+}
+
+type ProjectSearchResponse struct {
+	RootFolder      string                 `json:"root_folder"`
+	Query           string                 `json:"query"`
+	FileNameMatches []ProjectFileNameMatch `json:"filename_matches"`
+	ContentMatches  []ProjectContentMatch  `json:"content_matches"`
 }
 
 func (s *Server) handleGetMindConfig(w http.ResponseWriter, r *http.Request) {
@@ -885,6 +904,132 @@ func (s *Server) handleListProjectTree(w http.ResponseWriter, r *http.Request) {
 		RootFolder: resolvedRoot,
 		Path:       filepath.ToSlash(normalizedRelPath),
 		Entries:    respEntries,
+	})
+}
+
+func (s *Server) handleProjectSearch(w http.ResponseWriter, r *http.Request) {
+	projectID := strings.TrimSpace(r.URL.Query().Get("projectID"))
+	if projectID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "projectID is required")
+		return
+	}
+
+	query := strings.TrimSpace(r.URL.Query().Get("query"))
+	resolvedRoot, err := s.resolveProjectRootFolder(projectID)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if query == "" {
+		s.jsonResponse(w, http.StatusOK, ProjectSearchResponse{
+			RootFolder:      resolvedRoot,
+			Query:           "",
+			FileNameMatches: []ProjectFileNameMatch{},
+			ContentMatches:  []ProjectContentMatch{},
+		})
+		return
+	}
+
+	fileNameCandidates := make([]rankedFileNameMatch, 0, 32)
+	contentCandidates := make([]rankedContentMatch, 0, 32)
+	queryLower := strings.ToLower(query)
+
+	walkErr := filepath.WalkDir(resolvedRoot, func(fullPath string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") {
+			if entry.IsDir() && fullPath != resolvedRoot {
+				return filepath.SkipDir
+			}
+			if !entry.IsDir() {
+				return nil
+			}
+		}
+
+		if entry.IsDir() {
+			return nil
+		}
+
+		if !isMarkdownFile(name) {
+			return nil
+		}
+
+		relPath, relErr := filepath.Rel(resolvedRoot, fullPath)
+		if relErr != nil {
+			return nil
+		}
+		relPath = filepath.ToSlash(relPath)
+
+		if score := scoreProjectFileNameMatch(relPath, queryLower); score > 0 {
+			fileNameCandidates = append(fileNameCandidates, rankedFileNameMatch{
+				ProjectFileNameMatch: ProjectFileNameMatch{
+					Path: relPath,
+					Name: name,
+				},
+				score: score,
+			})
+		}
+
+		content, readErr := os.ReadFile(fullPath)
+		if readErr != nil {
+			return nil
+		}
+		lineNumber, lineText, score := findProjectContentMatch(content, queryLower)
+		if score > 0 {
+			contentCandidates = append(contentCandidates, rankedContentMatch{
+				ProjectContentMatch: ProjectContentMatch{
+					Path:    relPath,
+					Line:    lineNumber,
+					Preview: truncateText(strings.TrimSpace(lineText), 220),
+				},
+				score: score,
+			})
+		}
+
+		return nil
+	})
+	if walkErr != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "Failed to search project files: "+walkErr.Error())
+		return
+	}
+
+	sort.Slice(fileNameCandidates, func(i, j int) bool {
+		if fileNameCandidates[i].score != fileNameCandidates[j].score {
+			return fileNameCandidates[i].score > fileNameCandidates[j].score
+		}
+		return fileNameCandidates[i].Path < fileNameCandidates[j].Path
+	})
+	sort.Slice(contentCandidates, func(i, j int) bool {
+		if contentCandidates[i].score != contentCandidates[j].score {
+			return contentCandidates[i].score > contentCandidates[j].score
+		}
+		return contentCandidates[i].Path < contentCandidates[j].Path
+	})
+
+	fileNameMatches := make([]ProjectFileNameMatch, 0, projectSearchMaxResults)
+	for _, candidate := range fileNameCandidates {
+		fileNameMatches = append(fileNameMatches, candidate.ProjectFileNameMatch)
+		if len(fileNameMatches) >= projectSearchMaxResults {
+			break
+		}
+	}
+
+	contentMatches := make([]ProjectContentMatch, 0, projectSearchMaxResults)
+	for _, candidate := range contentCandidates {
+		contentMatches = append(contentMatches, candidate.ProjectContentMatch)
+		if len(contentMatches) >= projectSearchMaxResults {
+			break
+		}
+	}
+
+	s.jsonResponse(w, http.StatusOK, ProjectSearchResponse{
+		RootFolder:      resolvedRoot,
+		Query:           query,
+		FileNameMatches: fileNameMatches,
+		ContentMatches:  contentMatches,
 	})
 }
 
@@ -2161,6 +2306,71 @@ func buildUntrackedFilePreview(repoRoot string, relPath string) string {
 		lines[i] = "+" + line
 	}
 	return strings.Join(lines, "\n")
+}
+
+type rankedFileNameMatch struct {
+	ProjectFileNameMatch
+	score int
+}
+
+type rankedContentMatch struct {
+	ProjectContentMatch
+	score int
+}
+
+func scoreProjectFileNameMatch(relPath string, queryLower string) int {
+	baseName := strings.ToLower(filepath.Base(relPath))
+	pathLower := strings.ToLower(relPath)
+
+	score := 0
+	switch {
+	case baseName == queryLower:
+		score = 120
+	case strings.HasPrefix(baseName, queryLower):
+		score = 100
+	case strings.Contains(baseName, queryLower):
+		score = 80
+	case strings.HasPrefix(pathLower, queryLower):
+		score = 70
+	case strings.Contains(pathLower, queryLower):
+		score = 50
+	default:
+		return 0
+	}
+
+	if pathLower == queryLower {
+		score += 30
+	}
+	if len(relPath) <= 40 {
+		score += 10
+	}
+	if len(relPath) <= 16 {
+		score += 6
+	}
+
+	return score
+}
+
+func findProjectContentMatch(content []byte, queryLower string) (int, string, int) {
+	text := strings.ReplaceAll(string(content), "\r\n", "\n")
+	lines := strings.Split(text, "\n")
+	for index, line := range lines {
+		lowerLine := strings.ToLower(line)
+		matchIndex := strings.Index(lowerLine, queryLower)
+		if matchIndex < 0 {
+			continue
+		}
+		lineScore := 70 - index
+		if lineScore < 12 {
+			lineScore = 12
+		}
+		colScore := 20 - matchIndex
+		if colScore < 0 {
+			colScore = 0
+		}
+		return index + 1, line, lineScore + colScore
+	}
+	return 0, "", 0
 }
 
 func sanitizeGeneratedCommitMessage(raw string) string {
