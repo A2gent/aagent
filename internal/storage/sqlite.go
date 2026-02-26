@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -16,6 +17,8 @@ import (
 type SQLiteStore struct {
 	db       *sql.DB
 	dataPath string
+	dbPath   string
+	mu       sync.Mutex
 }
 
 // NewSQLiteStore creates a new SQLite store
@@ -24,8 +27,26 @@ func NewSQLiteStore(dataPath string) (*SQLiteStore, error) {
 	if err != nil {
 		resolvedDataPath = dataPath
 	}
+	if err := os.MkdirAll(resolvedDataPath, 0o755); err != nil {
+		return nil, fmt.Errorf("failed to create data directory: %w", err)
+	}
 	dbPath := filepath.Join(resolvedDataPath, "aagent.db")
 
+	db, err := openSQLiteConnection(dbPath)
+	if err != nil {
+		return nil, err
+	}
+
+	store := &SQLiteStore{db: db, dataPath: resolvedDataPath, dbPath: dbPath}
+	if err := store.migrate(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to migrate database: %w", err)
+	}
+
+	return store, nil
+}
+
+func openSQLiteConnection(dbPath string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
@@ -35,14 +56,37 @@ func NewSQLiteStore(dataPath string) (*SQLiteStore, error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0)
+	return db, nil
+}
 
-	store := &SQLiteStore{db: db, dataPath: resolvedDataPath}
-	if err := store.migrate(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to migrate database: %w", err)
+func isSQLiteReadonlyError(err error) bool {
+	if err == nil {
+		return false
 	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "readonly database") || strings.Contains(msg, "readonly")
+}
 
-	return store, nil
+func (s *SQLiteStore) reopenOnReadonly(writeErr error) error {
+	if !isSQLiteReadonlyError(writeErr) {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Another goroutine may have already swapped connections.
+	if !isSQLiteReadonlyError(writeErr) {
+		return nil
+	}
+	nextDB, err := openSQLiteConnection(s.dbPath)
+	if err != nil {
+		return fmt.Errorf("failed to reopen sqlite database after readonly error: %w", err)
+	}
+	prev := s.db
+	s.db = nextDB
+	if prev != nil {
+		_ = prev.Close()
+	}
+	return nil
 }
 
 // migrate runs database migrations
@@ -212,8 +256,8 @@ const (
 // These are required for the Knowledge Base and Agent session lists in the sidebar.
 func (s *SQLiteStore) seedSystemProjects() error {
 	systemProjects := []struct {
-		id   string
-		name string
+		id     string
+		name   string
 		folder *string
 	}{
 		{SystemProjectKBID, "Knowledge Base", nil},
@@ -287,51 +331,64 @@ func (s *SQLiteStore) ensureSoulProjectDefaults() error {
 
 // SaveSession saves a session to the database
 func (s *SQLiteStore) SaveSession(sess *Session) error {
-	tx, err := s.db.Begin()
-	if err != nil {
+	save := func() error {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+
+		metadata, _ := json.Marshal(sess.Metadata)
+
+		// Upsert session
+		_, err = tx.Exec(`
+			INSERT INTO sessions (id, agent_id, parent_id, job_id, project_id, title, status, metadata, task_progress, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET
+				parent_id = excluded.parent_id,
+				job_id = excluded.job_id,
+				project_id = excluded.project_id,
+				title = excluded.title,
+				status = excluded.status,
+				metadata = excluded.metadata,
+				task_progress = excluded.task_progress,
+				updated_at = excluded.updated_at
+		`, sess.ID, sess.AgentID, sess.ParentID, sess.JobID, sess.ProjectID, sess.Title, sess.Status, metadata, sess.TaskProgress, sess.CreatedAt, sess.UpdatedAt)
+		if err != nil {
+			return fmt.Errorf("failed to save session: %w", err)
+		}
+
+		// Delete existing messages and re-insert (simple approach for now)
+		_, err = tx.Exec("DELETE FROM messages WHERE session_id = ?", sess.ID)
+		if err != nil {
+			return fmt.Errorf("failed to delete messages: %w", err)
+		}
+
+		// Insert messages
+		for _, msg := range sess.Messages {
+			messageMetadata, _ := json.Marshal(msg.Metadata)
+			_, err = tx.Exec(`
+				INSERT INTO messages (id, session_id, role, content, tool_calls, tool_results, metadata, timestamp)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			`, msg.ID, sess.ID, msg.Role, msg.Content, msg.ToolCalls, msg.ToolResults, messageMetadata, msg.Timestamp)
+			if err != nil {
+				return fmt.Errorf("failed to save message: %w", err)
+			}
+		}
+
+		return tx.Commit()
+	}
+
+	if err := save(); err != nil {
+		if reopenErr := s.reopenOnReadonly(err); reopenErr != nil {
+			return reopenErr
+		}
+		if isSQLiteReadonlyError(err) {
+			return save()
+		}
 		return err
 	}
-	defer tx.Rollback()
-
-	metadata, _ := json.Marshal(sess.Metadata)
-
-	// Upsert session
-	_, err = tx.Exec(`
-		INSERT INTO sessions (id, agent_id, parent_id, job_id, project_id, title, status, metadata, task_progress, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			parent_id = excluded.parent_id,
-			job_id = excluded.job_id,
-			project_id = excluded.project_id,
-			title = excluded.title,
-			status = excluded.status,
-			metadata = excluded.metadata,
-			task_progress = excluded.task_progress,
-			updated_at = excluded.updated_at
-	`, sess.ID, sess.AgentID, sess.ParentID, sess.JobID, sess.ProjectID, sess.Title, sess.Status, metadata, sess.TaskProgress, sess.CreatedAt, sess.UpdatedAt)
-	if err != nil {
-		return fmt.Errorf("failed to save session: %w", err)
-	}
-
-	// Delete existing messages and re-insert (simple approach for now)
-	_, err = tx.Exec("DELETE FROM messages WHERE session_id = ?", sess.ID)
-	if err != nil {
-		return fmt.Errorf("failed to delete messages: %w", err)
-	}
-
-	// Insert messages
-	for _, msg := range sess.Messages {
-		messageMetadata, _ := json.Marshal(msg.Metadata)
-		_, err = tx.Exec(`
-			INSERT INTO messages (id, session_id, role, content, tool_calls, tool_results, metadata, timestamp)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		`, msg.ID, sess.ID, msg.Role, msg.Content, msg.ToolCalls, msg.ToolResults, messageMetadata, msg.Timestamp)
-		if err != nil {
-			return fmt.Errorf("failed to save message: %w", err)
-		}
-	}
-
-	return tx.Commit()
+	return nil
 }
 
 // GetSession retrieves a session by ID

@@ -29,12 +29,12 @@ import (
 )
 
 const (
-	a2aInboundProjectIDSettingKey = "A2A_INBOUND_PROJECT_ID"
+	a2aInboundProjectIDSettingKey  = "A2A_INBOUND_PROJECT_ID"
 	a2aInboundSubAgentIDSettingKey = "A2A_INBOUND_SUB_AGENT_ID"
-	a2aOutboundSessionKey         = "a2a_outbound"
-	a2aOutboundTargetAgentIDKey   = "a2a_target_agent_id"
-	a2aOutboundTargetAgentNameKey = "a2a_target_agent_name"
-	a2aConversationIDKey          = "a2a_conversation_id"
+	a2aOutboundSessionKey          = "a2a_outbound"
+	a2aOutboundTargetAgentIDKey    = "a2a_target_agent_id"
+	a2aOutboundTargetAgentNameKey  = "a2a_target_agent_name"
+	a2aConversationIDKey           = "a2a_conversation_id"
 )
 
 // tunnelState holds all mutable state for the running tunnel goroutine.
@@ -279,6 +279,39 @@ func (s *Server) handleA2ATunnelStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.jsonResponse(w, http.StatusOK, client.Status())
+}
+
+// handleA2ATunnelReconnect forces a tunnel restart/reconnect using the current
+// a2_registry integration config and returns the latest status snapshot.
+func (s *Server) handleA2ATunnelReconnect(w http.ResponseWriter, r *http.Request) {
+	s.runA2ATunnelIfConfigured()
+
+	deadline := time.Now().Add(8 * time.Second)
+	for {
+		s.tunnelMu.Lock()
+		client := s.tunnelClient
+		s.tunnelMu.Unlock()
+
+		if client == nil {
+			if time.Now().After(deadline) {
+				s.jsonResponse(w, http.StatusOK, a2atunnel.Status{
+					State:      a2atunnel.StateDisconnected,
+					SquareAddr: "",
+					Log:        nil,
+				})
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+
+		status := client.Status()
+		if status.State == a2atunnel.StateConnected || time.Now().After(deadline) {
+			s.jsonResponse(w, http.StatusOK, status)
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }
 
 // handleA2ATunnelStatusStream streams live log entries as Server-Sent Events.
