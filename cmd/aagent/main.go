@@ -41,7 +41,7 @@ var (
 
 func main() {
 	rootCmd := &cobra.Command{
-		Use:   "aagent [task]",
+		Use:   "brute [task]",
 		Short: "A2gent - Autonomous AI coding agent",
 		Long: `A2gent is a Go-based autonomous AI coding agent that executes tasks in sessions.
 Starts both the HTTP API server and the TUI interface simultaneously.`,
@@ -53,7 +53,7 @@ Starts both the HTTP API server and the TUI interface simultaneously.`,
 	rootCmd.Flags().StringVarP(&agentFlag, "agent", "a", "build", "Select agent type (build, plan)")
 	rootCmd.Flags().StringVarP(&continueFlag, "continue", "c", "", "Resume previous session by ID")
 	rootCmd.Flags().BoolVarP(&verboseFlag, "verbose", "v", false, "Verbose output")
-	rootCmd.Flags().IntVarP(&portFlag, "port", "p", 8080, "HTTP API server port")
+	rootCmd.Flags().IntVarP(&portFlag, "port", "p", 0, "HTTP API server port (0 = random available port)")
 
 	// Server mode subcommand (HTTP API only, no TUI)
 	serverCmd := &cobra.Command{
@@ -61,7 +61,7 @@ Starts both the HTTP API server and the TUI interface simultaneously.`,
 		Short: "Run HTTP API server only",
 		RunE:  runServer,
 	}
-	serverCmd.Flags().IntVarP(&portFlag, "port", "p", 8080, "HTTP API server port")
+	serverCmd.Flags().IntVarP(&portFlag, "port", "p", 0, "HTTP API server port (0 = random available port)")
 	rootCmd.AddCommand(serverCmd)
 
 	// Session management subcommand

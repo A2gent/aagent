@@ -9,51 +9,28 @@ Works best with [A²gent/caesar](https://github.com/A2gent/caesar) as control ap
 <img width="1600" height="486" alt="Screenshot 2026-02-18 at 02 28 44" src="https://github.com/user-attachments/assets/829a71f2-e5c2-4258-8fbd-74071aa52dec" />
 <img width="1415" height="483" alt="Screenshot 2026-02-16 at 01 01 04" src="https://github.com/user-attachments/assets/0b472db5-8a78-4f39-8e28-65d50211cc68" />
 
-## 1. Features
+## 1. Quick Start
 
-### 1.1 Core Agent Capabilities
+```bash
+# one-line install from GitHub (main branch)
+curl -fsSL https://raw.githubusercontent.com/A2gent/brute/main/install-from-github.sh | bash
 
-- Comprehensive tool system:
-- File operations: `read`, `write`, `edit`, `replace_lines`
-- Search: `glob`, `grep`, `find_files`
-- Execution: `bash` command execution
-- Media: screenshot capture and camera photo capture
-- Extensible architecture for custom/server-backed tools
+brute
+```
 
-### 1.2 Agentic Execution
+Then configure your provider inside the agent (`/provider`) or in the web app Providers page.
 
-- Agentic loop: task -> LLM with tools -> tool execution -> result feedback -> repeat
-- A2A bridge support: canonical message endpoint + outbound tunnel-based chat + agent-card discovery
+The installer builds from current source and installs:
+- `brute` (primary CLI)
+- `a2`, `aagent` (compatibility aliases)
 
-### 1.3 LLM Provider Support
+Manual install from a local clone is also supported:
 
-- Multi-provider support: Anthropic Claude, Kimi, Google Gemini, LM Studio, OpenAI-compatible endpoints
-- Auto-router and fallback chain support for reliability
-- In-session provider/model switching support (web app flow)
-
-### 1.4 Session and Persistence
-
-- SQLite persistence for sessions, messages, jobs, integrations, and app settings
-- Session resumption and parent/child session relationships
-- Recurring jobs and project-aware session organization
-
-### 1.5 TUI Experience
-
-- Interactive terminal UI with status bar, model display, token/context metrics, and session timer
-- Multi-line input and command palette behavior
-- Live message stream with tool call/result rendering
-
-### 1.6 HTTP API and Integrations
-
-- REST API for web-app integration
-- Session management endpoints (create/list/resume/manage)
-- Speech and integration plumbing (including Whisper-related flows)
-
-### 1.7 Reliability and Performance
-
-- Lightweight runtime footprint
-- Context window tracking and management
-- Structured logging and practical failure handling
+```bash
+git clone https://github.com/A2gent/brute.git
+cd brute
+./install.sh
+```
 
 ## 2. Prerequisites
 
@@ -67,36 +44,72 @@ Works best with [A²gent/caesar](https://github.com/A2gent/caesar) as control ap
   - `pkg-config`
   - Install on macOS: `brew install cmake ffmpeg pkg-config`
 
-## 3. Quick Start
+## 3. Features
 
-```bash
-git clone https://github.com/A2gent/brute.git
-cd brute
+### 3.1 Core Agent Capabilities
 
-# pick one provider key
-export ANTHROPIC_API_KEY=sk-ant-...
-# or
-export KIMI_API_KEY=sk-kimi-...
-# or
-export GEMINI_API_KEY=...
+- Comprehensive tool system:
+- File operations: `read`, `write`, `edit`, `replace_lines`
+- Search: `glob`, `grep`, `find_files`
+- Execution: `bash` command execution
+- Media: screenshot capture and camera photo capture
+- Extensible architecture for custom/server-backed tools
 
-just start
-```
+### 3.2 Agentic Execution
+
+- Agentic loop: task -> LLM with tools -> tool execution -> result feedback -> repeat
+- A2A bridge support: canonical message endpoint + outbound tunnel-based chat + agent-card discovery
+
+### 3.3 LLM Provider Support
+
+- Multi-provider support: Anthropic Claude, Kimi, Google Gemini, LM Studio, OpenAI-compatible endpoints
+- Auto-router and fallback chain support for reliability
+- In-session provider/model switching support (web app flow)
+
+### 3.4 Session and Persistence
+
+- SQLite persistence for sessions, messages, jobs, integrations, and app settings
+- Session resumption and parent/child session relationships
+- Recurring jobs and project-aware session organization
+
+### 3.5 TUI Experience
+
+- Interactive terminal UI with status bar, model display, token/context metrics, and session timer
+- Multi-line input and command palette behavior
+- Live message stream with tool call/result rendering
+
+### 3.6 HTTP API and Integrations
+
+- REST API for web-app integration
+- Session management endpoints (create/list/resume/manage)
+- Speech and integration plumbing (including Whisper-related flows)
+
+### 3.7 Reliability and Performance
+
+- Lightweight runtime footprint
+- Context window tracking and management
+- Structured logging and practical failure handling
 
 ## 4. Run Modes
 
 ### 4.1 Native (recommended for local TUI)
 
 ```bash
-# build + run (TUI + API)
-just start
+# install + run from any directory
+brute
 
 # build only
 just build
 
 # API only
-just server
+brute server
+
+# force a fixed API port when needed
+brute --port 8080
 ```
+
+By default, the embedded HTTP API binds to port `0`, so the OS chooses a random free port for each process.  
+The selected URL is printed on startup (for example: `HTTP API server running on http://0.0.0.0:49162`).
 
 ### 4.2 Docker
 
@@ -200,7 +213,8 @@ The app loads `.env` from:
 
 ### 5.3 Environment Variables
 
-Required (choose one for remote providers):
+Provider/API keys are usually configured inside the agent UI and persisted to local settings.
+Environment variables are optional and mainly useful for headless/server workflows.
 
 | Variable | Description |
 |---|---|
@@ -226,12 +240,13 @@ Common optional variables:
 
 | Command | Description |
 |---|---|
-| `a2` | launch TUI |
-| `a2 "<task>"` | start with an initial task |
-| `a2 --continue <session-id>` | resume session |
-| `a2 session list` | list sessions |
-| `a2 logs` | show logs |
-| `a2 logs -f` | follow logs |
+| `brute` | launch TUI |
+| `brute "<task>"` | start with an initial task |
+| `brute --continue <session-id>` | resume session |
+| `brute session list` | list sessions |
+| `brute logs` | show logs |
+| `brute logs -f` | follow logs |
+| `brute --port 8080` | run with fixed API port |
 
 ## A2A Support
 
@@ -329,7 +344,8 @@ go test -v ./internal/tools/...
 
 ### 11.1 API key missing
 
-Set one provider key:
+Configure a provider in-agent first (`/provider` in TUI or Providers in web app).
+If you run headless, set one provider key via env:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...

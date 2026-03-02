@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -482,7 +483,14 @@ func (s *Server) setupRoutes() {
 // Run starts the HTTP server
 func (s *Server) Run(ctx context.Context) error {
 	addr := fmt.Sprintf("0.0.0.0:%d", s.port)
-	logging.Info("Starting HTTP server on %s", addr)
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	if tcpAddr, ok := listener.Addr().(*net.TCPAddr); ok {
+		s.port = tcpAddr.Port
+	}
+	logging.Info("Starting HTTP server on %s", listener.Addr().String())
 	fmt.Printf("HTTP API server running on http://0.0.0.0:%d (accessible from any host)\n", s.port)
 
 	go s.runTelegramDuplexLoop(ctx)
@@ -502,7 +510,7 @@ func (s *Server) Run(ctx context.Context) error {
 		server.Shutdown(shutdownCtx)
 	}()
 
-	return server.ListenAndServe()
+	return server.Serve(listener)
 }
 
 // --- Request/Response types ---

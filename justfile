@@ -9,10 +9,14 @@ run:
 server:
     go run ./cmd/aagent server
 
+# Install the CLI to ~/.local/bin (override with AAGENT_INSTALL_DIR)
 install:
-  brew install cmake ffmpeg pkg-config
-  go install github.com/air-verse/air@latest
-  go install ./cmd/aagent
+    ./install.sh
+
+# Install optional local development dependencies
+install-dev-deps:
+    brew install cmake ffmpeg pkg-config
+    go install github.com/air-verse/air@latest
 
 build:
     go build -o {{binary}} ./cmd/aagent
@@ -24,7 +28,7 @@ dev:
 
 # Run the built binary
 start: build
-    ./{{binary}} --port 5445
+    ./{{binary}}
 
 # Clean build artifacts
 clean:
