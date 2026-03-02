@@ -398,6 +398,15 @@ func (s *Scheduler) createBaseLLMClient(providerType config.ProviderType, model 
 		modelName = s.resolveModelForProvider(providerType)
 	}
 
+	if parentProxyURL := strings.TrimSpace(os.Getenv("A2GENT_PARENT_PROXY_URL")); parentProxyURL != "" {
+		proxyBaseURL := normalizeOpenAIBaseURL(strings.TrimRight(parentProxyURL, "/") + "/providers/" + string(providerType))
+		proxyAPIKey := strings.TrimSpace(os.Getenv("A2GENT_PARENT_PROXY_KEY"))
+		if proxyAPIKey == "" {
+			proxyAPIKey = "a2gent-proxy"
+		}
+		return lmstudio.NewClient(proxyAPIKey, modelName, proxyBaseURL), nil
+	}
+
 	apiKey := strings.TrimSpace(provider.APIKey)
 	if apiKey == "" {
 		apiKey = s.apiKeyFromEnv(providerType)

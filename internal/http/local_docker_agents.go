@@ -208,6 +208,7 @@ func (s *Server) handleCreateLocalDockerAgent(w http.ResponseWriter, r *http.Req
 		args = append(args,
 			"--env", "AAGENT_PROVIDER=lmstudio",
 			"--env", "A2GENT_PARENT_PROXY_URL="+proxyBaseURL,
+			"--env", "LM_STUDIO_BASE_URL="+proxyBaseURL+"/providers/lmstudio",
 			"--env", "OPENAI_API_KEY=a2gent-proxy",
 			"--env", "OPENAI_BASE_URL="+proxyBaseURL+"/providers/openai",
 			"--env", "KIMI_API_KEY=a2gent-proxy",
@@ -216,6 +217,7 @@ func (s *Server) handleCreateLocalDockerAgent(w http.ResponseWriter, r *http.Req
 			"--env", "GOOGLE_BASE_URL="+proxyBaseURL+"/providers/google",
 			"--env", "OPENROUTER_API_KEY=a2gent-proxy",
 			"--env", "OPENROUTER_BASE_URL="+proxyBaseURL+"/providers/openrouter",
+			"--env", "ANTHROPIC_API_KEY=a2gent-proxy",
 		)
 	}
 	args = append(args, image, "server")

@@ -827,6 +827,8 @@ type ProviderConfigResponse struct {
 	HasAPIKey      bool                       `json:"has_api_key"`
 	BaseURL        string                     `json:"base_url"`
 	Model          string                     `json:"model"`
+	ProxyManaged   bool                       `json:"proxy_managed"`
+	ProxyBaseURL   string                     `json:"proxy_base_url,omitempty"`
 	FallbackChain  []config.FallbackChainNode `json:"fallback_chain,omitempty"`
 	RouterProvider string                     `json:"router_provider,omitempty"`
 	RouterModel    string                     `json:"router_model,omitempty"`
@@ -1007,6 +1009,8 @@ func (s *Server) handleEstimateInstructionPrompt(w http.ResponseWriter, r *http.
 func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 	definitions := config.SupportedProviders()
 	resp := make([]ProviderConfigResponse, 0, len(definitions)+len(s.config.FallbackAggregates))
+	proxyBaseURL := normalizeOpenAIBaseURL(strings.TrimSpace(os.Getenv("A2GENT_PARENT_PROXY_URL")))
+	proxyManaged := proxyBaseURL != ""
 
 	for _, def := range definitions {
 		existing := s.config.Providers[string(def.Type)]
@@ -1032,6 +1036,8 @@ func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 				HasAPIKey:     false,
 				BaseURL:       "",
 				Model:         "",
+				ProxyManaged:  proxyManaged,
+				ProxyBaseURL:  proxyBaseURL,
 				FallbackChain: chain,
 			})
 			continue
@@ -1050,6 +1056,8 @@ func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 				HasAPIKey:      false,
 				BaseURL:        "",
 				Model:          "",
+				ProxyManaged:   proxyManaged,
+				ProxyBaseURL:   proxyBaseURL,
 				FallbackChain:  nil,
 				RouterProvider: config.NormalizeProviderRef(existing.RouterProvider),
 				RouterModel:    strings.TrimSpace(existing.RouterModel),
@@ -1088,6 +1096,8 @@ func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 			HasAPIKey:     hasAPIKey,
 			BaseURL:       baseURL,
 			Model:         model,
+			ProxyManaged:  proxyManaged,
+			ProxyBaseURL:  proxyBaseURL,
 			FallbackChain: nil,
 		})
 	}
@@ -1107,6 +1117,8 @@ func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 			HasAPIKey:     false,
 			BaseURL:       "",
 			Model:         "",
+			ProxyManaged:  proxyManaged,
+			ProxyBaseURL:  proxyBaseURL,
 			FallbackChain: chain,
 		})
 	}
@@ -1115,6 +1127,11 @@ func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
+	if strings.TrimSpace(os.Getenv("A2GENT_PARENT_PROXY_URL")) != "" {
+		s.errorResponse(w, http.StatusForbidden, "Provider settings are managed by the parent agent in Docker safe mode")
+		return
+	}
+
 	providerType := config.ProviderType(config.NormalizeProviderRef(chi.URLParam(r, "providerType")))
 
 	var req UpdateProviderRequest
@@ -1279,6 +1296,11 @@ func (s *Server) handleSetActiveProvider(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) handleCreateFallbackAggregate(w http.ResponseWriter, r *http.Request) {
+	if strings.TrimSpace(os.Getenv("A2GENT_PARENT_PROXY_URL")) != "" {
+		s.errorResponse(w, http.StatusForbidden, "Provider settings are managed by the parent agent in Docker safe mode")
+		return
+	}
+
 	var req CreateFallbackAggregateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.errorResponse(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
@@ -1327,6 +1349,11 @@ func (s *Server) handleCreateFallbackAggregate(w http.ResponseWriter, r *http.Re
 }
 
 func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
+	if strings.TrimSpace(os.Getenv("A2GENT_PARENT_PROXY_URL")) != "" {
+		s.errorResponse(w, http.StatusForbidden, "Provider settings are managed by the parent agent in Docker safe mode")
+		return
+	}
+
 	providerRef := config.NormalizeProviderRef(chi.URLParam(r, "providerType"))
 	if providerRef != string(config.ProviderFallback) && !config.IsFallbackAggregateRef(providerRef) {
 		s.errorResponse(w, http.StatusBadRequest, "Only fallback aggregates can be deleted")
@@ -1425,6 +1452,37 @@ func (s *Server) handleListOpenRouterModels(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) handleListAnthropicModels(w http.ResponseWriter, r *http.Request) {
+	if parentProxyURL := strings.TrimSpace(os.Getenv("A2GENT_PARENT_PROXY_URL")); parentProxyURL != "" {
+		baseURL := normalizeOpenAIBaseURL(strings.TrimRight(parentProxyURL, "/") + "/providers/anthropic")
+		apiKey := strings.TrimSpace(os.Getenv("A2GENT_PARENT_PROXY_KEY"))
+		if apiKey == "" {
+			apiKey = "a2gent-proxy"
+		}
+
+		client := lmstudio.NewClient(apiKey, "", baseURL)
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+
+		models, err := client.ListModels(ctx)
+		if err != nil {
+			s.errorResponse(w, http.StatusBadGateway, "Failed to fetch models from Anthropic: "+err.Error())
+			return
+		}
+
+		modelIDs := make([]string, 0, len(models))
+		for _, model := range models {
+			modelID := strings.TrimSpace(model.ID)
+			if modelID != "" {
+				modelIDs = append(modelIDs, modelID)
+			}
+		}
+
+		s.jsonResponse(w, http.StatusOK, ListProviderModelsResponse{
+			Models: modelIDs,
+		})
+		return
+	}
+
 	provider := s.config.Providers[string(config.ProviderAnthropic)]
 	apiKey := strings.TrimSpace(provider.APIKey)
 	if apiKey == "" {
@@ -5025,6 +5083,15 @@ func (s *Server) createBaseLLMClient(providerType config.ProviderType, model str
 	modelName := strings.TrimSpace(model)
 	if modelName == "" {
 		modelName = s.resolveModelForProvider(providerType)
+	}
+
+	if parentProxyURL := strings.TrimSpace(os.Getenv("A2GENT_PARENT_PROXY_URL")); parentProxyURL != "" {
+		proxyBaseURL := normalizeOpenAIBaseURL(strings.TrimRight(parentProxyURL, "/") + "/providers/" + string(providerType))
+		proxyAPIKey := strings.TrimSpace(os.Getenv("A2GENT_PARENT_PROXY_KEY"))
+		if proxyAPIKey == "" {
+			proxyAPIKey = "a2gent-proxy"
+		}
+		return lmstudio.NewClient(proxyAPIKey, modelName, proxyBaseURL), nil
 	}
 
 	apiKey := strings.TrimSpace(provider.APIKey)
