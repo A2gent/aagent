@@ -18,7 +18,6 @@ fi
 
 INSTALL_DIR="${AAGENT_INSTALL_DIR:-$HOME/.local/bin}"
 PRIMARY_BIN="${AAGENT_PRIMARY_BIN:-brute}"
-ALIAS_BINS="${AAGENT_ALIAS_BINS:-a2 aagent}"
 TMP_BIN="$(mktemp "${TMPDIR:-/tmp}/brute-build-XXXXXX")"
 
 cleanup() {
@@ -32,19 +31,8 @@ go build -o "$TMP_BIN" ./cmd/aagent
 mkdir -p "$INSTALL_DIR"
 install -m 0755 "$TMP_BIN" "$INSTALL_DIR/$PRIMARY_BIN"
 
-for alias in $ALIAS_BINS; do
-  if [[ -n "$alias" && "$alias" != "$PRIMARY_BIN" ]]; then
-    ln -sfn "$INSTALL_DIR/$PRIMARY_BIN" "$INSTALL_DIR/$alias"
-  fi
-done
-
 echo "Installed:"
 echo "  $INSTALL_DIR/$PRIMARY_BIN"
-for alias in $ALIAS_BINS; do
-  if [[ -n "$alias" && "$alias" != "$PRIMARY_BIN" ]]; then
-    echo "  $INSTALL_DIR/$alias -> $INSTALL_DIR/$PRIMARY_BIN"
-  fi
-done
 
 case ":$PATH:" in
   *":$INSTALL_DIR:"*)

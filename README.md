@@ -22,7 +22,6 @@ Then configure your provider inside the agent (`/provider`) or in the web app Pr
 
 The installer builds from current source and installs:
 - `brute` (primary CLI)
-- `a2`, `aagent` (compatibility aliases)
 
 Manual install from a local clone is also supported:
 
