@@ -561,6 +561,11 @@ func isMarkdownFile(name string) bool {
 	return ext == ".md" || ext == ".markdown"
 }
 
+func isProjectEditableFile(name string) bool {
+	ext := strings.ToLower(filepath.Ext(name))
+	return ext == ".md" || ext == ".markdown" || ext == ".yaml" || ext == ".yml"
+}
+
 func directoryHasChildren(path string) bool {
 	entries, err := os.ReadDir(path)
 	if err != nil {
@@ -1052,8 +1057,8 @@ func (s *Server) handleGetProjectFile(w http.ResponseWriter, r *http.Request) {
 		s.errorResponse(w, http.StatusBadRequest, "File path is required")
 		return
 	}
-	if !isMarkdownFile(normalizedRelPath) {
-		s.errorResponse(w, http.StatusBadRequest, "Only markdown files can be opened")
+	if !isProjectEditableFile(normalizedRelPath) {
+		s.errorResponse(w, http.StatusBadRequest, "Only markdown and YAML files can be opened")
 		return
 	}
 
@@ -1124,8 +1129,8 @@ func (s *Server) handleUpsertProjectFile(w http.ResponseWriter, r *http.Request)
 		s.errorResponse(w, http.StatusBadRequest, "File path is required")
 		return
 	}
-	if !isMarkdownFile(normalizedRelPath) {
-		s.errorResponse(w, http.StatusBadRequest, "Only markdown files can be created or edited")
+	if !isProjectEditableFile(normalizedRelPath) {
+		s.errorResponse(w, http.StatusBadRequest, "Only markdown and YAML files can be created or edited")
 		return
 	}
 
@@ -1203,8 +1208,8 @@ func (s *Server) handleDeleteProjectFile(w http.ResponseWriter, r *http.Request)
 		s.errorResponse(w, http.StatusBadRequest, "File path is required")
 		return
 	}
-	if !isMarkdownFile(normalizedRelPath) {
-		s.errorResponse(w, http.StatusBadRequest, "Only markdown files can be deleted")
+	if !isProjectEditableFile(normalizedRelPath) {
+		s.errorResponse(w, http.StatusBadRequest, "Only markdown and YAML files can be deleted")
 		return
 	}
 
@@ -1289,8 +1294,8 @@ func (s *Server) handleMoveProjectFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	isDir := fromInfo.IsDir()
-	if !isDir && !isMarkdownFile(fromNormalized) {
-		s.errorResponse(w, http.StatusBadRequest, "Only markdown files and folders can be moved")
+	if !isDir && !isProjectEditableFile(fromNormalized) {
+		s.errorResponse(w, http.StatusBadRequest, "Only markdown/YAML files and folders can be moved")
 		return
 	}
 
@@ -1304,8 +1309,8 @@ func (s *Server) handleMoveProjectFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !isDir && !isMarkdownFile(toNormalized) {
-		s.errorResponse(w, http.StatusBadRequest, "Destination must be a markdown file")
+	if !isDir && !isProjectEditableFile(toNormalized) {
+		s.errorResponse(w, http.StatusBadRequest, "Destination must be a markdown or YAML file")
 		return
 	}
 
@@ -1481,8 +1486,8 @@ func (s *Server) handleRenameProjectEntry(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if !info.IsDir() && !isMarkdownFile(newName) {
-		s.errorResponse(w, http.StatusBadRequest, "File must have .md or .markdown extension")
+	if !info.IsDir() && !isProjectEditableFile(newName) {
+		s.errorResponse(w, http.StatusBadRequest, "File must have .md/.markdown or .yaml/.yml extension")
 		return
 	}
 
