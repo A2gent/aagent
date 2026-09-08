@@ -79,7 +79,7 @@ type openAIRequest struct {
 
 // modelRequiresMaxCompletionTokens reports whether an OpenAI model rejects the
 // legacy max_tokens parameter and requires max_completion_tokens instead. This
-// applies to the GPT-5 family and the o-series reasoning models. Router-prefixed
+// applies to GPT-5+, GPT-6, and the o-series reasoning models. Router-prefixed
 // ids (e.g. "openai/gpt-5.5") are handled by stripping the vendor segment.
 func modelRequiresMaxCompletionTokens(model string) bool {
 	m := strings.ToLower(strings.TrimSpace(model))
@@ -87,6 +87,7 @@ func modelRequiresMaxCompletionTokens(model string) bool {
 		m = m[idx+1:]
 	}
 	return strings.HasPrefix(m, "gpt-5") ||
+		strings.HasPrefix(m, "gpt-6") ||
 		strings.HasPrefix(m, "o1") ||
 		strings.HasPrefix(m, "o3") ||
 		strings.HasPrefix(m, "o4")

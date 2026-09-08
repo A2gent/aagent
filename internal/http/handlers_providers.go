@@ -13,6 +13,7 @@ import (
 	"github.com/A2gent/brute/internal/llm/gemini"
 	"github.com/A2gent/brute/internal/llm/kimicli"
 	"github.com/A2gent/brute/internal/llm/lmstudio"
+	"github.com/A2gent/brute/internal/llm/openai"
 	"github.com/A2gent/brute/internal/llm/openaicodex"
 	"github.com/go-chi/chi/v5"
 	"net/http"
@@ -523,7 +524,34 @@ func (s *Server) handleListGoogleModels(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleListOpenAIModels(w http.ResponseWriter, r *http.Request) {
-	s.handleListOpenAICompatibleModels(w, r, config.ProviderOpenAI, "OpenAI")
+	// WHY: Caesar session/provider pickers consume this list. Live /v1/models can
+	// omit newly released flagship ids (or hide them on later pages), so we merge
+	// a curated newest-first catalog with paginated discovery instead of returning
+	// the first page alone.
+	def := config.GetProviderDefinition(config.ProviderOpenAI)
+	baseURL := normalizeOpenAIBaseURL(r.URL.Query().Get("base_url"))
+	if baseURL == "" {
+		provider := s.config.Providers[string(config.ProviderOpenAI)]
+		baseURL = normalizeOpenAIBaseURL(provider.BaseURL)
+	}
+	if baseURL == "" && def != nil {
+		baseURL = normalizeOpenAIBaseURL(def.DefaultURL)
+	}
+
+	provider := s.config.Providers[string(config.ProviderOpenAI)]
+	apiKey := strings.TrimSpace(provider.APIKey)
+	if apiKey == "" {
+		apiKey = s.apiKeyFromEnv(config.ProviderOpenAI)
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	s.jsonResponse(w, http.StatusOK, ListProviderModelsResponse{
+		Models: openai.ListModelCatalog(ctx, openai.ModelCatalogOptions{
+			BaseURL: baseURL,
+			APIKey:  apiKey,
+		}),
+	})
 }
 
 func (s *Server) handleListOpenAICodexModels(w http.ResponseWriter, r *http.Request) {

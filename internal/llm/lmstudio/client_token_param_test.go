@@ -14,6 +14,8 @@ import (
 
 func TestModelRequiresMaxCompletionTokens(t *testing.T) {
 	cases := map[string]bool{
+		"gpt-6-astra":           true,
+		"openai/gpt-6-astra":    true,
 		"gpt-5.5":               true,
 		"gpt-5.3-codex":         true,
 		"openai/gpt-5.5":        true, // router-prefixed
@@ -70,6 +72,19 @@ func TestChatUsesMaxCompletionTokensForGPT5(t *testing.T) {
 	// GPT-5 family only accepts the default temperature; it must be omitted.
 	if _, ok := body["temperature"]; ok {
 		t.Errorf("gpt-5.5 request must not include temperature: %v", body)
+	}
+}
+
+func TestChatUsesMaxCompletionTokensForGPT6(t *testing.T) {
+	body := captureRequestBody(t, "gpt-6-astra")
+	if _, ok := body["max_tokens"]; ok {
+		t.Errorf("gpt-6-astra request must not include max_tokens: %v", body)
+	}
+	if got := body["max_completion_tokens"]; got != float64(1234) {
+		t.Errorf("expected max_completion_tokens=1234, got %v", body["max_completion_tokens"])
+	}
+	if _, ok := body["temperature"]; ok {
+		t.Errorf("gpt-6-astra request must not include temperature: %v", body)
 	}
 }
 

@@ -44,7 +44,10 @@ func TestListModelCatalogReturnsCuratedWithoutCredentials(t *testing.T) {
 			t.Fatalf("curated order changed at %d: want %q got %q", i, want, models[i])
 		}
 	}
-	for _, want := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
+	if models[0] != "gpt-6-astra" {
+		t.Fatalf("newest Codex/OpenAI flagship should lead the catalog, got %q", models[0])
+	}
+	for _, want := range []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
 		if !contains(models, want) {
 			t.Fatalf("verified OAuth model %q missing from curated catalog: %v", want, models)
 		}
@@ -107,7 +110,7 @@ func TestListModelCatalogDoesNotDiscoverFromOAuthUsageEndpoint(t *testing.T) {
 			t.Fatalf("unverified OAuth usage-bucket name %q must not appear, got %v", blocked, models)
 		}
 	}
-	for _, want := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
+	for _, want := range []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
 		if !contains(models, want) {
 			t.Fatalf("verified OAuth model %q missing from catalog: %v", want, models)
 		}

@@ -20,6 +20,7 @@ import (
 	"github.com/A2gent/brute/internal/llm/gemini"
 	"github.com/A2gent/brute/internal/llm/kimicli"
 	"github.com/A2gent/brute/internal/llm/lmstudio"
+	"github.com/A2gent/brute/internal/llm/openai"
 	"github.com/A2gent/brute/internal/llm/openaicodex"
 	"github.com/A2gent/brute/internal/llm/retry"
 	"github.com/A2gent/brute/internal/logging"
@@ -67,6 +68,11 @@ func (m Model) showModelsSelection() (tea.Model, tea.Cmd) {
 		return m.fetchOpenAICodexModels()
 	}
 
+	// For OpenAI API-key usage, merge the curated newest-first catalog with live /models.
+	if m.appConfig.ActiveProvider == string(config.ProviderOpenAI) {
+		return m.fetchOpenAIModels()
+	}
+
 	// For other providers, show known models
 	return m.showStaticModels()
 }
@@ -92,6 +98,36 @@ func (m Model) fetchOpenAICodexModels() (tea.Model, tea.Cmd) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	m.availableModels = openaicodex.ListModelCatalog(ctx, opts)
+
+	m.showModelsMenu = true
+	m.modelsMenuIndex = 0
+	for i, model := range m.availableModels {
+		if model == m.appConfig.DefaultModel {
+			m.modelsMenuIndex = i
+			break
+		}
+	}
+	return m, nil
+}
+
+func (m Model) fetchOpenAIModels() (tea.Model, tea.Cmd) {
+	opts := openai.ModelCatalogOptions{}
+	if provider := m.appConfig.GetActiveProvider(); provider != nil {
+		opts.BaseURL = strings.TrimSpace(provider.BaseURL)
+		opts.APIKey = strings.TrimSpace(provider.APIKey)
+	}
+	if opts.BaseURL == "" {
+		if def := config.GetProviderDefinition(config.ProviderOpenAI); def != nil {
+			opts.BaseURL = def.DefaultURL
+		}
+	}
+	if opts.APIKey == "" {
+		opts.APIKey = providerAPIKeyFromEnv(config.ProviderOpenAI)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	m.availableModels = openai.ListModelCatalog(ctx, opts)
 
 	m.showModelsMenu = true
 	m.modelsMenuIndex = 0
@@ -228,8 +264,6 @@ func (m Model) showStaticModels() (tea.Model, tea.Cmd) {
 			"gemini-2.0-flash",
 			"gemini-2.0-flash-lite",
 		}
-	case config.ProviderOpenAI:
-		m.availableModels = []string{"gpt-4.1", "gpt-4.1-mini", "gpt-4o-mini"}
 	case config.ProviderGrok:
 		m.availableModels = []string{"grok-4.5", "grok-4", "grok-3", "grok-3-mini"}
 	default:

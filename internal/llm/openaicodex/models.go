@@ -18,6 +18,7 @@ import (
 // In API-key mode ListModelCatalog augments it with models discovered live from
 // the OpenAI /models endpoint.
 var CuratedModels = []string{
+	"gpt-6-astra",
 	"gpt-5.6-sol",
 	"gpt-5.6-terra",
 	"gpt-5.6-luna",

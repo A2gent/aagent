@@ -217,3 +217,68 @@ func TestOpenRouterModelsRouteUsesOfficialCatalog(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenAIModelsRouteKeepsGPT6AstraWhenLiveOmitsIt(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/models") {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{{"id": "gpt-5.5"}},
+		})
+	}))
+	t.Cleanup(upstream.Close)
+
+	cfg := config.DefaultConfig()
+	cfg.Providers[string(config.ProviderOpenAI)] = config.Provider{
+		BaseURL: upstream.URL + "/v1",
+		APIKey:  "sk-test",
+	}
+	server := &Server{config: cfg}
+
+	req := httptest.NewRequest(http.MethodGet, "/providers/openai/models", nil)
+	rec := httptest.NewRecorder()
+	server.handleListOpenAIModels(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("OpenAI models status = %d, body: %s", rec.Code, rec.Body.String())
+	}
+	var response ListProviderModelsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to decode OpenAI models response: %v", err)
+	}
+	if len(response.Models) == 0 || response.Models[0] != "gpt-6-astra" {
+		t.Fatalf("gpt-6-astra should lead OpenAI picker even when live /models omits it, got %v", response.Models)
+	}
+	foundLive := false
+	for _, model := range response.Models {
+		if model == "gpt-5.5" {
+			foundLive = true
+			break
+		}
+	}
+	if !foundLive {
+		t.Fatalf("live /models id missing from merged catalog: %v", response.Models)
+	}
+}
+
+func TestOpenAIModelsRouteReturnsCuratedWithoutAPIKey(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Providers[string(config.ProviderOpenAI)] = config.Provider{}
+	server := &Server{config: cfg}
+
+	req := httptest.NewRequest(http.MethodGet, "/providers/openai/models", nil)
+	rec := httptest.NewRecorder()
+	server.handleListOpenAIModels(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("OpenAI models status = %d, body: %s", rec.Code, rec.Body.String())
+	}
+	var response ListProviderModelsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to decode OpenAI models response: %v", err)
+	}
+	if len(response.Models) == 0 || response.Models[0] != "gpt-6-astra" {
+		t.Fatalf("offline OpenAI catalog should still include gpt-6-astra, got %v", response.Models)
+	}
+}
